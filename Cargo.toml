@@ -1,0 +1,27 @@
+[workspace]
+resolver = "3"
+members = ["crates/datacube-core", "crates/datacube-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/franciscoparrao/datacube-rs"
+authors = ["Francisco Parra <francisco.parra.o@usach.cl>"]
+
+[workspace.dependencies]
+datacube-core = { path = "crates/datacube-core" }
+ndarray = "0.16"
+thiserror = "2"
+libm = "0.2"
+rayon = "1.10"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+criterion = "0.5"
+approx = "0.5"
+
+[profile.release]
+lto = true
+codegen-units = 1

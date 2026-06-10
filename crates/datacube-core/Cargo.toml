@@ -1,0 +1,17 @@
+[package]
+name = "datacube-core"
+description = "Temporal data cube model and per-pixel time-series statistics for remote sensing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+ndarray = { workspace = true }
+thiserror = { workspace = true }
+libm = { workspace = true }
+rayon = { workspace = true }
+
+[dev-dependencies]
+approx = { workspace = true }
