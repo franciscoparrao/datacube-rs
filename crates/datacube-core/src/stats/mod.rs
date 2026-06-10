@@ -4,11 +4,13 @@
 //! drop them (pairwise with their time coordinate) before computing, matching
 //! how `pyMannKendall` preprocesses series.
 
+mod harmonic;
 mod linear;
 mod mann_kendall;
 pub(crate) mod special;
 mod theil_sen;
 
+pub use harmonic::{HarmonicComponent, HarmonicFit, harmonic_regression};
 pub use linear::{LinearTrend, linear_trend};
 pub use mann_kendall::{MannKendallResult, Trend, mann_kendall, mann_kendall_alpha};
 pub use theil_sen::{TheilSenResult, theil_sen};

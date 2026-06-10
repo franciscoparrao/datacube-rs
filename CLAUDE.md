@@ -18,7 +18,8 @@ lo haga aprovechando STAC.
 - [x] Tendencia por píxel: regresión lineal, Theil-Sen + Mann-Kendall.
       Validado contra pyMannKendall/scipy: 85/85 checks, tol 1e-9
       (`scripts/validate_pymannkendall.py`).
-- [ ] Regresión armónica (estacionalidad/fenología).
+- [x] Regresión armónica (estacionalidad/fenología). Validada contra
+      numpy.linalg.lstsq (97/97 checks totales, tol 1e-9).
 - [ ] (v0.2) Break-point estilo BFAST; compositing temporal; gap-filling.
 
 ## Arquitectura tentativa
@@ -54,7 +55,8 @@ proj) en vez de reinventar I/O. Diferenciador: cubo Rust nativo sobre GeoZarr.
   (muestreo irregular por nubes OK — diverge a propósito de sens_slope).
 
 ## Próximos pasos al retomar
-1. Regresión armónica (estacionalidad/fenología) en `stats/`.
-2. Conectar al STAC de SurtGIS para armar un cubo Sentinel-2 real (I/O en
+1. Conectar al STAC de SurtGIS para armar un cubo Sentinel-2 real (I/O en
    crate aparte, `datacube-io`; core queda sin I/O).
-3. Benchmarks criterion para `par_map_series` sobre cubos grandes.
+2. Benchmarks criterion para `par_map_series` sobre cubos grandes.
+3. v0.2: break-points BFAST (la armónica ya da el modelo de estación),
+   compositing temporal, gap-filling.

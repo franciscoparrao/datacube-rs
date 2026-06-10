@@ -30,13 +30,58 @@ enum Command {
         #[arg(long, default_value_t = 0.05)]
         alpha: f64,
     },
+    /// Harmonic (Fourier) regression with linear trend, for seasonality
+    /// and phenology. Same CSV format as `trend`.
+    Harmonic {
+        /// Input CSV file
+        input: PathBuf,
+        /// Season length in the units of t (e.g. 1 for fractional years,
+        /// 365.25 for days, 12 for monthly indices)
+        #[arg(long)]
+        period: f64,
+        /// Number of Fourier pairs
+        #[arg(long, default_value_t = 2)]
+        harmonics: usize,
+    },
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Trend { input, alpha } => trend(&input, alpha),
+        Command::Harmonic {
+            input,
+            period,
+            harmonics,
+        } => harmonic(&input, period, harmonics),
     }
+}
+
+fn harmonic(input: &PathBuf, period: f64, harmonics: usize) -> Result<()> {
+    let raw =
+        fs::read_to_string(input).with_context(|| format!("cannot read {}", input.display()))?;
+    let (t, y) = parse_series(&raw)?;
+    let fit = stats::harmonic_regression(&t, &y, period, harmonics)
+        .context("harmonic regression failed")?;
+
+    let report = serde_json::json!({
+        "input": input.display().to_string(),
+        "n": fit.n,
+        "period": fit.period,
+        "intercept": fit.intercept,
+        "slope": fit.slope,
+        "r_squared": fit.r_squared,
+        "rmse": fit.rmse,
+        "components": fit.components.iter().map(|c| serde_json::json!({
+            "harmonic": c.harmonic,
+            "cos_coef": c.cos_coef,
+            "sin_coef": c.sin_coef,
+            "amplitude": c.amplitude,
+            "phase": c.phase,
+        })).collect::<Vec<_>>(),
+    });
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
 }
 
 fn trend(input: &PathBuf, alpha: f64) -> Result<()> {

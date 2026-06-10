@@ -18,4 +18,13 @@ pub enum CubeError {
     /// Chunk sizes must be strictly positive.
     #[error("invalid chunk size: {0}")]
     InvalidChunkSize(String),
+
+    /// A statistical parameter outside its valid domain.
+    #[error("invalid parameter: {0}")]
+    InvalidParameter(String),
+
+    /// The regression design matrix is rank-deficient (e.g. aliased
+    /// harmonics or constant time).
+    #[error("singular system: {0}")]
+    SingularSystem(String),
 }

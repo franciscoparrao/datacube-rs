@@ -44,13 +44,14 @@ wn[[3, 17, 41, 42]] = np.nan
 CASES["with_nan"] = wn
 
 
-def run_datacube(values: np.ndarray) -> dict:
+def run_datacube(values: np.ndarray, *cmd: str, t=None) -> dict:
     with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False) as f:
-        for v in values:
-            f.write("NaN\n" if np.isnan(v) else f"{v!r}\n")
+        for i, v in enumerate(values):
+            sv = "NaN" if np.isnan(v) else repr(v)
+            f.write(f"{t[i]!r},{sv}\n" if t is not None else f"{sv}\n")
         path = f.name
     out = subprocess.run(
-        ["cargo", "run", "-q", "-p", "datacube-cli", "--", "trend", path],
+        ["cargo", "run", "-q", "-p", "datacube-cli", "--", *(cmd or ["trend"]), path],
         cwd=REPO, capture_output=True, text=True, check=True,
     )
     return json.loads(out.stdout)
@@ -60,6 +61,59 @@ def close(a: float, b: float, tol: float) -> bool:
     if math.isnan(a) and math.isnan(b):
         return True
     return abs(a - b) <= tol * max(1.0, abs(a), abs(b))
+
+
+def validate_harmonic(tol: float) -> tuple[int, int]:
+    """Cross-check `datacube harmonic` against numpy.linalg.lstsq on the
+    same design matrix (intercept + trend + K Fourier pairs)."""
+    rng = np.random.default_rng(7)
+    t = np.arange(72, dtype=float) / 12.0  # 6 years, monthly, fractional years
+    y = (0.5 + 0.02 * t
+         + 0.25 * np.cos(2 * np.pi * t) + 0.1 * np.sin(2 * np.pi * t)
+         - 0.05 * np.cos(4 * np.pi * t)
+         + rng.normal(0, 0.03, t.size))
+    y[[7, 30]] = np.nan  # cloud gaps
+    n_harmonics = 2
+
+    got = run_datacube(y, "harmonic", "--period", "1.0",
+                       "--harmonics", str(n_harmonics), t=t)
+
+    mask = ~np.isnan(y)
+    tc, yc = t[mask], y[mask]
+    cols = [np.ones_like(tc), tc]
+    for k in range(1, n_harmonics + 1):
+        cols += [np.cos(2 * np.pi * k * tc), np.sin(2 * np.pi * k * tc)]
+    design = np.column_stack(cols)
+    beta, *_ = np.linalg.lstsq(design, yc, rcond=None)
+    resid = yc - design @ beta
+    ss_res = float(resid @ resid)
+    ss_tot = float(((yc - yc.mean()) ** 2).sum())
+
+    expected = {
+        "intercept": beta[0],
+        "slope": beta[1],
+        "r_squared": 1.0 - ss_res / ss_tot,
+        "rmse": math.sqrt(ss_res / len(yc)),
+    }
+    checks = failures = 0
+    for field, ref in expected.items():
+        checks += 1
+        if not close(got[field], float(ref), tol):
+            failures += 1
+            print(f"FAIL harmonic: {field} rust={got[field]!r} ref={float(ref)!r}")
+    for k in range(n_harmonics):
+        a, b = beta[2 + 2 * k], beta[3 + 2 * k]
+        comp = got["components"][k]
+        for field, ref in (("cos_coef", a), ("sin_coef", b),
+                           ("amplitude", math.hypot(a, b)),
+                           ("phase", math.atan2(b, a))):
+            checks += 1
+            if not close(comp[field], float(ref), tol):
+                failures += 1
+                print(f"FAIL harmonic k={k + 1}: {field} "
+                      f"rust={comp[field]!r} ref={float(ref)!r}")
+    print(f"ok   harmonic: n={got['n']}")
+    return checks, failures
 
 
 def main() -> int:
@@ -121,6 +175,10 @@ def main() -> int:
             print(f"FAIL {name}: trend rust={got['mann_kendall']['trend']} "
                   f"ref={ref_mk.trend}")
         print(f"ok   {name}: n={got['n']}")
+
+    hc, hf = validate_harmonic(args.tol)
+    checks += hc
+    failures += hf
 
     print(f"\n{checks - failures}/{checks} checks passed (tol={args.tol})")
     return 1 if failures else 0

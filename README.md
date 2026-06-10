@@ -1,8 +1,8 @@
 # datacube-rs
 
 Temporal data cubes for remote sensing time series in Rust — per-pixel trend
-analysis (OLS, Theil-Sen, Mann-Kendall) over `(band, y, x, time)` cubes with
-streaming, Rayon-parallel iteration.
+and seasonality analysis (OLS, Theil-Sen, Mann-Kendall, harmonic regression)
+over `(band, y, x, time)` cubes with streaming, Rayon-parallel iteration.
 
 Part of the SurtGIS family of Rust geospatial engines.
 
@@ -17,6 +17,7 @@ Part of the SurtGIS family of Rust geospatial engines.
 ```bash
 cargo test                                   # unit + doc tests
 cargo run -p datacube-cli -- trend ndvi.csv  # CSV: "value" or "t,value"
+cargo run -p datacube-cli -- harmonic ndvi.csv --period 1 --harmonics 2
 ```
 
 ```rust
@@ -35,8 +36,9 @@ correctly.
 ## Numerical parity
 
 `scripts/validate_pymannkendall.py` cross-checks every reported field against
-`pyMannKendall` (original_test, sens_slope) and `scipy.stats.linregress`
-within `1e-9` relative tolerance.
+`pyMannKendall` (original_test, sens_slope), `scipy.stats.linregress` and
+`numpy.linalg.lstsq` (harmonic design matrix) within `1e-9` relative
+tolerance.
 
 Documented divergences from the references:
 
@@ -49,7 +51,7 @@ Documented divergences from the references:
 
 - [x] Cube model + streaming per-pixel/chunk iterators
 - [x] OLS linear trend, Theil-Sen, Mann-Kendall (tie-corrected)
-- [ ] Harmonic regression (seasonality/phenology)
+- [x] Harmonic regression with trend (seasonality/phenology, amplitude/phase)
 - [ ] STAC/COG temporal stacking (via SurtGIS STAC client)
 - [ ] BFAST-style break detection, temporal compositing, gap-filling
 
