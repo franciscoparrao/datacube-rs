@@ -9,8 +9,13 @@ Part of the SurtGIS family of Rust geospatial engines.
 ## Workspace
 
 - `crates/datacube-core` — cube model and statistics (no I/O).
+- `crates/datacube-io` — STAC/COG temporal stacking into cubes. Reuses the
+  SurtGIS cloud stack (STAC client, COG reader, SAS signing, UTM
+  reprojection), so it requires a **sibling checkout of `surtgis`** next to
+  this repository.
 - `crates/datacube-cli` — `datacube` binary; `datacube trend series.csv`
-  reports all three estimators as JSON.
+  reports all three estimators as JSON. Build with `--features stac` to
+  enable `datacube stack`.
 
 ## Quick start
 
@@ -18,6 +23,13 @@ Part of the SurtGIS family of Rust geospatial engines.
 cargo test                                   # unit + doc tests
 cargo run -p datacube-cli -- trend ndvi.csv  # CSV: "value" or "t,value"
 cargo run -p datacube-cli -- harmonic ndvi.csv --period 1 --harmonics 2
+
+# Sentinel-2 trend map straight from Planetary Computer (needs --features stac)
+cargo run -p datacube-cli --features stac -- stack \
+  --collection sentinel-2-l2a --assets B04 \
+  --bbox -70.70,-33.50,-70.68,-33.48 --datetime 2024-01-01/2024-06-30 \
+  --max-cloud 30 --overview 3 \
+  --output slope.tif --pvalue-output pvalue.tif
 ```
 
 ```rust
@@ -52,8 +64,11 @@ Documented divergences from the references:
 - [x] Cube model + streaming per-pixel/chunk iterators
 - [x] OLS linear trend, Theil-Sen, Mann-Kendall (tie-corrected)
 - [x] Harmonic regression with trend (seasonality/phenology, amplitude/phase)
-- [ ] STAC/COG temporal stacking (via SurtGIS STAC client)
+- [x] STAC/COG temporal stacking (Planetary Computer / Earth Search, via
+  SurtGIS): cloud filter, grid alignment, fractional-year time axis,
+  GeoTIFF trend maps
 - [ ] BFAST-style break detection, temporal compositing, gap-filling
+- [ ] Cross-UTM-zone mosaicking; same-date tile compositing
 
 ## License
 

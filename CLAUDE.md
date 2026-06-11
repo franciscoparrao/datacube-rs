@@ -14,7 +14,9 @@ SurtGIS es **mono-temporal**. El análisis temporal de data cubes vive en
 lo haga aprovechando STAC.
 
 ## Alcance MVP (v0.1)
-- [ ] Apilado temporal desde STAC/COG (reusa el cliente STAC de SurtGIS).
+- [x] Apilado temporal desde STAC/COG (reusa el cliente STAC de SurtGIS).
+      `datacube-io::stack()` probado end-to-end contra Planetary Computer
+      (Sentinel-2 Santiago, UTM 19S, filtro de nubes, GeoTIFF de salida).
 - [x] Tendencia por píxel: regresión lineal, Theil-Sen + Mann-Kendall.
       Validado contra pyMannKendall/scipy: 85/85 checks, tol 1e-9
       (`scripts/validate_pymannkendall.py`).
@@ -54,9 +56,20 @@ proj) en vez de reinventar I/O. Diferenciador: cubo Rust nativo sobre GeoZarr.
 - NaN = nodata, filtrado pairwise; Theil-Sen/OLS usan coordenadas t reales
   (muestreo irregular por nubes OK — diverge a propósito de sens_slope).
 
+## datacube-io (2026-06-11)
+- Depende de surtgis-core/surtgis-cloud por **path** (`../surtgis` sibling
+  checkout obligatorio). API blocking (feature `native` de surtgis-cloud).
+- `stack(StackConfig)` → `StackedCube { cube, slices, skipped, transform, epsg }`:
+  busca STAC (pc/es/URL), filtra nubes, firma SAS de PC, lee COG por bbox
+  (overview opcional), alinea con `resample_to_grid`, nodata→NaN, tiempo en
+  años fraccionales (`fractional_year`, sin chrono).
+- Limitaciones v0.1: escenas con EPSG distinto al de referencia se saltan;
+  tiles del mismo instante quedan como slices separados (compositing v0.2);
+  valores raw DN (sin scale/offset).
+- CLI: `datacube stack` tras `--features stac` (CLI default sigue standalone).
+
 ## Próximos pasos al retomar
-1. Conectar al STAC de SurtGIS para armar un cubo Sentinel-2 real (I/O en
-   crate aparte, `datacube-io`; core queda sin I/O).
-2. Benchmarks criterion para `par_map_series` sobre cubos grandes.
-3. v0.2: break-points BFAST (la armónica ya da el modelo de estación),
-   compositing temporal, gap-filling.
+1. Benchmarks criterion para `par_map_series` sobre cubos grandes.
+2. v0.2: break-points BFAST (la armónica ya da el modelo de estación),
+   compositing temporal (mismo instante / mediana mensual), gap-filling.
+3. Scale/offset de reflectancia (S2 L2A: DN*1e-4, offset -1000 post-2022).

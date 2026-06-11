@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/datacube-core", "crates/datacube-cli"]
+members = ["crates/datacube-core", "crates/datacube-cli", "crates/datacube-io"]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,6 +11,11 @@ authors = ["Francisco Parra <francisco.parra.o@usach.cl>"]
 
 [workspace.dependencies]
 datacube-core = { path = "crates/datacube-core" }
+datacube-io = { path = "crates/datacube-io" }
+# Reuses the SurtGIS STAC client + COG reader (sibling checkout required:
+# ~/proyectos/surtgis next to this repo)
+surtgis-core = { path = "../surtgis/crates/core" }
+surtgis-cloud = { path = "../surtgis/crates/cloud" }
 ndarray = "0.16"
 thiserror = "2"
 libm = "0.2"

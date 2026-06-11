@@ -5,6 +5,9 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use datacube_core::stats;
 
+#[cfg(feature = "stac")]
+mod stack_cmd;
+
 #[derive(Parser)]
 #[command(
     name = "datacube",
@@ -43,6 +46,10 @@ enum Command {
         #[arg(long, default_value_t = 2)]
         harmonics: usize,
     },
+    /// Stack STAC/COG scenes into a temporal cube and compute trend maps
+    /// (requires building with `--features stac`).
+    #[cfg(feature = "stac")]
+    Stack(stack_cmd::StackArgs),
 }
 
 fn main() -> Result<()> {
@@ -54,6 +61,8 @@ fn main() -> Result<()> {
             period,
             harmonics,
         } => harmonic(&input, period, harmonics),
+        #[cfg(feature = "stac")]
+        Command::Stack(args) => stack_cmd::run(&args),
     }
 }
 
