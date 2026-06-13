@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""Cross-validate datacube-rs statistics against pyMannKendall and scipy.
+"""Cross-validate datacube-rs statistics against reference implementations.
 
 Generates deterministic test series, runs the reference implementations
-(pymannkendall.original_test, pymannkendall.sens_slope,
-scipy.stats.linregress), runs `datacube trend` on the same series, and
-compares every reported field within tolerance.
+(pymannkendall.original_test/sens_slope, scipy.stats.linregress,
+numpy.linalg.lstsq for harmonics, statsmodels breaks_cusumolsresid for the
+structural-break CUSUM test), runs the matching `datacube` subcommand on the
+same series, and compares every reported field within tolerance.
 
-Usage: python3 scripts/validate_pymannkendall.py [--tol 1e-9]
+Requires the validation venv (statsmodels needs pandas < 3 compatibility):
+    python3 -m venv .venv-validate
+    .venv-validate/bin/pip install numpy scipy pymannkendall statsmodels
+    .venv-validate/bin/python scripts/validate_pymannkendall.py
 """
 
 import argparse
@@ -20,6 +24,7 @@ from pathlib import Path
 import numpy as np
 import pymannkendall as mk
 import scipy.stats as st
+from statsmodels.stats.diagnostic import breaks_cusumolsresid
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -45,10 +50,12 @@ CASES["with_nan"] = wn
 
 
 def run_datacube(values: np.ndarray, *cmd: str, t=None) -> dict:
+    # NB: numpy 2.x repr() of scalars is "np.float64(...)" which the CSV
+    # parser rejects; force plain Python floats with repr(float(...)).
     with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False) as f:
         for i, v in enumerate(values):
-            sv = "NaN" if np.isnan(v) else repr(v)
-            f.write(f"{t[i]!r},{sv}\n" if t is not None else f"{sv}\n")
+            sv = "NaN" if np.isnan(v) else repr(float(v))
+            f.write(f"{float(t[i])!r},{sv}\n" if t is not None else f"{sv}\n")
         path = f.name
     out = subprocess.run(
         ["cargo", "run", "-q", "-p", "datacube-cli", "--", *(cmd or ["trend"]), path],
@@ -116,6 +123,62 @@ def validate_harmonic(tol: float) -> tuple[int, int]:
     return checks, failures
 
 
+def _ols_cusum_reference(t, y, n_harmonics, period):
+    """Full-series OLS-CUSUM statistic + p-value, computed the way
+    `datacube breaks` does, via statsmodels.breaks_cusumolsresid.
+
+    With ddof = nparams, statsmodels divides Σe² by (n - nparams)·n, which
+    matches the Rust scale σ̂·√n with σ̂² = SSE/(n - nparams). Its p-value is
+    stats.kstwobign.sf — the same Brownian-bridge series the Rust uses.
+    """
+    n = len(t)
+    nparams = 2 + 2 * n_harmonics
+    cols = [np.ones(n), t - t.mean()]
+    for k in range(1, n_harmonics + 1):
+        cols += [np.cos(2 * np.pi * k * t / period),
+                 np.sin(2 * np.pi * k * t / period)]
+    design = np.column_stack(cols)
+    beta, *_ = np.linalg.lstsq(design, y, rcond=None)
+    resid = y - design @ beta
+    stat, pval, _ = breaks_cusumolsresid(resid, ddof=nparams)
+    return float(stat), float(pval)
+
+
+def validate_breaks(tol: float) -> tuple[int, int]:
+    """Cross-check the full-series CUSUM statistic + p-value of
+    `datacube breaks` against statsmodels.breaks_cusumolsresid."""
+    rng = np.random.default_rng(11)
+    checks = failures = 0
+    cases = []
+
+    # trend-only model (harmonics=0): stable and single-shift series
+    t1 = np.arange(80, dtype=float)
+    cases.append(("stable", t1, 2.0 + 0.05 * t1 + rng.normal(0, 0.3, t1.size), 0, 1.0))
+    t2 = np.arange(60, dtype=float)
+    shift = np.where(t2 < 30, 1.0, 6.0)
+    cases.append(("shift", t2, shift + rng.normal(0, 0.25, t2.size), 0, 1.0))
+
+    # seasonal model (harmonics=1): annual cycle + level shift
+    t3 = np.arange(72, dtype=float) / 12.0
+    seasonal = 1.0 + 0.8 * np.sin(2 * np.pi * t3) + np.where(
+        np.arange(72) >= 36, 2.0, 0.0) + rng.normal(0, 0.1, t3.size)
+    cases.append(("seasonal", t3, seasonal, 1, 1.0))
+
+    for name, t, y, nh, period in cases:
+        got = run_datacube(
+            y, "breaks", "--harmonics", str(nh), "--period", repr(period), t=t)
+        ref_stat, ref_p = _ols_cusum_reference(t, y, nh, period)
+        for field, ref in (("statistic", ref_stat), ("p_value", ref_p)):
+            checks += 1
+            if not close(got[field], ref, tol):
+                failures += 1
+                print(f"FAIL breaks/{name}: {field} "
+                      f"rust={got[field]!r} ref={ref!r}")
+        print(f"ok   breaks/{name}: n={got['n']} "
+              f"breaks={len(got['breaks'])} stat={got['statistic']:.4f}")
+    return checks, failures
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--tol", type=float, default=1e-9)
@@ -179,6 +242,10 @@ def main() -> int:
     hc, hf = validate_harmonic(args.tol)
     checks += hc
     failures += hf
+
+    bc, bf = validate_breaks(args.tol)
+    checks += bc
+    failures += bf
 
     print(f"\n{checks - failures}/{checks} checks passed (tol={args.tol})")
     return 1 if failures else 0

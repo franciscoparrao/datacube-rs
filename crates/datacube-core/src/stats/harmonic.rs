@@ -174,7 +174,10 @@ pub fn harmonic_regression(
 
 /// Solves a symmetric positive (semi-)definite system by Gaussian
 /// elimination with partial pivoting; errors on rank deficiency.
-fn solve_symmetric(mut a: Vec<Vec<f64>>, mut b: Vec<f64>) -> Result<Vec<f64>, CubeError> {
+pub(super) fn solve_symmetric(
+    mut a: Vec<Vec<f64>>,
+    mut b: Vec<f64>,
+) -> Result<Vec<f64>, CubeError> {
     let p = b.len();
     let scale: f64 = a
         .iter()

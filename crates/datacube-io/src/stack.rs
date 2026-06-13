@@ -33,6 +33,12 @@ pub struct StackConfig {
     pub overview: Option<usize>,
     /// How scenes are aligned to the reference grid.
     pub resample: ResampleMethod,
+    /// Multiplicative factor applied to every value after nodata masking
+    /// (e.g. `1e-4` for Sentinel-2 L2A DN → reflectance).
+    pub scale: f64,
+    /// Additive offset applied after `scale` (e.g. `-0.1` for Sentinel-2
+    /// L2A processing baseline ≥ 04.00).
+    pub offset: f64,
 }
 
 impl StackConfig {
@@ -47,6 +53,8 @@ impl StackConfig {
             max_cloud_cover: None,
             overview: None,
             resample: ResampleMethod::NearestNeighbor,
+            scale: 1.0,
+            offset: 0.0,
         }
     }
 
@@ -72,6 +80,15 @@ impl StackConfig {
 
     pub fn overview(mut self, level: Option<usize>) -> Self {
         self.overview = level;
+        self
+    }
+
+    /// Linear value transform `v·scale + offset`, applied after nodata
+    /// masking (e.g. `.scaling(1e-4, -0.1)` for Sentinel-2 L2A reflectance,
+    /// processing baseline ≥ 04.00).
+    pub fn scaling(mut self, scale: f64, offset: f64) -> Self {
+        self.scale = scale;
+        self.offset = offset;
         self
     }
 
@@ -125,9 +142,9 @@ pub struct StackedCube {
 ///
 /// The first successfully-read scene defines the reference grid; every other
 /// scene is resampled onto it (`cfg.resample`). Scenes in a different CRS
-/// than the reference are skipped (cross-UTM-zone mosaicking is out of scope
-/// for v0.1) and reported in [`StackedCube::skipped`]. Asset values are kept
-/// raw (e.g. Sentinel-2 L2A DN, scale 1e-4); nodata becomes `NaN`.
+/// than the reference are skipped (cross-UTM-zone mosaicking is out of
+/// scope) and reported in [`StackedCube::skipped`]. Nodata becomes `NaN`;
+/// values stay raw unless [`StackConfig::scaling`] is set.
 pub fn stack(cfg: &StackConfig) -> Result<StackedCube, StackError> {
     cfg.validate()?;
 
@@ -273,6 +290,10 @@ fn read_scene(
         let read_bbox = resolve_read_bbox(wgs_bbox, item, &reader);
         let mut raster: Raster<f64> = reader.read_bbox(&read_bbox, cfg.overview)?;
         nodata_to_nan(&mut raster);
+        if cfg.scale != 1.0 || cfg.offset != 0.0 {
+            let (scale, offset) = (cfg.scale, cfg.offset);
+            raster.data_mut().mapv_inplace(|v| v * scale + offset);
+        }
 
         // first asset of the first scene defines the grid; everything else
         // (other bands at other resolutions, later scenes) aligns to it

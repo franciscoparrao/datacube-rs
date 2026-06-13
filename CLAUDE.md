@@ -1,6 +1,6 @@
 # datacube-rs — Data cubes temporales de teledetección en Rust ("gdalcubes moderno")
 
-> **Estado:** EN DESARROLLO (workspace v0.1 con core + CLI funcionales). Creado 2026-06-10.
+> **Estado:** EN DESARROLLO (v0.2: core+io+CLI, breaks/compositing/gapfill). Creado 2026-06-10.
 > Familia de motores Rust del autor: SurtGIS, Hydroflux, Smelt, Anvil, Cantus, Criterium.
 > Doc madre: `~/proyectos/ideas-motores-rust.md` (idea C1; también extensión SurtGIS #1).
 
@@ -21,8 +21,12 @@ lo haga aprovechando STAC.
       Validado contra pyMannKendall/scipy: 85/85 checks, tol 1e-9
       (`scripts/validate_pymannkendall.py`).
 - [x] Regresión armónica (estacionalidad/fenología). Validada contra
-      numpy.linalg.lstsq (97/97 checks totales, tol 1e-9).
-- [ ] (v0.2) Break-point estilo BFAST; compositing temporal; gap-filling.
+      numpy.linalg.lstsq (tol 1e-9).
+- [x] (v0.2) Break-point estilo BFAST (OLS-CUSUM + binary segmentation,
+      `stats::detect_breaks`); compositing temporal (`Cube::composite`);
+      gap-filling lineal (`Cube::gapfill_linear`); scale/offset en stack.
+      Validación total 103/103 checks tol 1e-9, breaks vs
+      statsmodels.breaks_cusumolsresid.
 
 ## Arquitectura tentativa
 - `datacube-core`: modelo de cubo (x,y,t,band), iteradores streaming por píxel/chunk.
@@ -52,9 +56,13 @@ proj) en vez de reinventar I/O. Diferenciador: cubo Rust nativo sobre GeoZarr.
   stats: OLS + Theil-Sen + Mann-Kendall tie-corrected estilo pyMannKendall,
   funciones especiales propias con libm) + `crates/datacube-cli`
   (`datacube trend serie.csv` → JSON).
-- 30 tests + 4 doctests; clippy -D warnings limpio.
 - NaN = nodata, filtrado pairwise; Theil-Sen/OLS usan coordenadas t reales
   (muestreo irregular por nubes OK — diverge a propósito de sens_slope).
+- v0.2 añade en core: `stats::detect_breaks` (BFAST-style OLS-CUSUM, p-value
+  Brownian bridge = kstwobign.sf, binary segmentation; modelo de segmento
+  trend+armónicos reusa `solve_symmetric`) y `temporal.rs`
+  (`Cube::composite` SameTime/Period × median/mean/min/max,
+  `Cube::gapfill_linear` con max_gap y sin extrapolar bordes).
 
 ## datacube-io (2026-06-11)
 - Depende de surtgis-core/surtgis-cloud por **path** (`../surtgis` sibling
@@ -63,13 +71,22 @@ proj) en vez de reinventar I/O. Diferenciador: cubo Rust nativo sobre GeoZarr.
   busca STAC (pc/es/URL), filtra nubes, firma SAS de PC, lee COG por bbox
   (overview opcional), alinea con `resample_to_grid`, nodata→NaN, tiempo en
   años fraccionales (`fractional_year`, sin chrono).
-- Limitaciones v0.1: escenas con EPSG distinto al de referencia se saltan;
-  tiles del mismo instante quedan como slices separados (compositing v0.2);
-  valores raw DN (sin scale/offset).
+- v0.2: `StackConfig::scaling(scale, offset)` aplica transform lineal post-
+  máscara (S2 L2A: 1e-4, -0.1 baseline ≥04.00). CLI stack acepta --scale
+  --offset --composite (same-time|monthly) --composite-method --gapfill.
+- Limitaciones: escenas con EPSG distinto al de referencia se saltan; mosaico
+  cross-UTM-zone pendiente.
 - CLI: `datacube stack` tras `--features stac` (CLI default sigue standalone).
 
+## Validación (venv obligatorio para statsmodels)
+- `.venv-validate/` (gitignored): numpy/scipy/pymannkendall/statsmodels.
+  statsmodels del sistema roto por pandas 3.0 (`deprecate_kwarg`); el venv usa
+  statsmodels 0.14.6 que sí importa. Correr con
+  `.venv-validate/bin/python scripts/validate_pymannkendall.py` → 103/103.
+- OJO numpy 2.x: `repr(np.float64)` da "np.float64(0.0)"; el script castea a
+  float() antes de escribir CSV.
+
 ## Próximos pasos al retomar
-1. Benchmarks criterion para `par_map_series` sobre cubos grandes.
-2. v0.2: break-points BFAST (la armónica ya da el modelo de estación),
-   compositing temporal (mismo instante / mediana mensual), gap-filling.
-3. Scale/offset de reflectancia (S2 L2A: DN*1e-4, offset -1000 post-2022).
+1. Mapa de breaks por píxel sobre un cubo (hoy detect_breaks es por-serie + CLI).
+2. Benchmarks criterion para `par_map_series` sobre cubos grandes.
+3. Mosaico cross-UTM-zone; bindings PyO3 / WASM demo.

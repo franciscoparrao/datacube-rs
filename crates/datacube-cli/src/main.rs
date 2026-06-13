@@ -46,10 +46,28 @@ enum Command {
         #[arg(long, default_value_t = 2)]
         harmonics: usize,
     },
+    /// BFAST-style structural break detection (OLS-CUSUM + binary
+    /// segmentation). Same CSV format as `trend`.
+    Breaks {
+        /// Input CSV file
+        input: PathBuf,
+        /// Significance level for the CUSUM test
+        #[arg(long, default_value_t = 0.05)]
+        alpha: f64,
+        /// Fourier pairs in the segment model (0 = trend only)
+        #[arg(long, default_value_t = 0)]
+        harmonics: usize,
+        /// Season length in the units of t (used when --harmonics > 0)
+        #[arg(long, default_value_t = 1.0)]
+        period: f64,
+        /// Minimum observations per segment
+        #[arg(long, default_value_t = 12)]
+        min_segment: usize,
+    },
     /// Stack STAC/COG scenes into a temporal cube and compute trend maps
     /// (requires building with `--features stac`).
     #[cfg(feature = "stac")]
-    Stack(stack_cmd::StackArgs),
+    Stack(Box<stack_cmd::StackArgs>),
 }
 
 fn main() -> Result<()> {
@@ -61,9 +79,51 @@ fn main() -> Result<()> {
             period,
             harmonics,
         } => harmonic(&input, period, harmonics),
+        Command::Breaks {
+            input,
+            alpha,
+            harmonics,
+            period,
+            min_segment,
+        } => breaks(&input, alpha, harmonics, period, min_segment),
         #[cfg(feature = "stac")]
         Command::Stack(args) => stack_cmd::run(&args),
     }
+}
+
+fn breaks(
+    input: &PathBuf,
+    alpha: f64,
+    harmonics: usize,
+    period: f64,
+    min_segment: usize,
+) -> Result<()> {
+    let raw =
+        fs::read_to_string(input).with_context(|| format!("cannot read {}", input.display()))?;
+    let (t, y) = parse_series(&raw)?;
+    let opts = stats::BreakOptions {
+        alpha,
+        n_harmonics: harmonics,
+        period,
+        min_segment,
+    };
+    let result = stats::detect_breaks(&t, &y, &opts).context("break detection failed")?;
+
+    let report = serde_json::json!({
+        "input": input.display().to_string(),
+        "n": result.n,
+        "statistic": result.statistic,
+        "p_value": result.p_value,
+        "alpha": alpha,
+        "breaks": result.breaks.iter().map(|b| serde_json::json!({
+            "index": b.index,
+            "time": b.time,
+            "statistic": b.statistic,
+            "p_value": b.p_value,
+        })).collect::<Vec<_>>(),
+    });
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
 }
 
 fn harmonic(input: &PathBuf, period: f64, harmonics: usize) -> Result<()> {

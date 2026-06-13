@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use datacube_core::stats;
+use datacube_core::{CompositeMethod, CompositeWindow, stats};
 use datacube_io::{StackConfig, StackedCube, stack};
 use surtgis_core::io::write_geotiff;
 use surtgis_core::{CRS, Raster};
@@ -34,6 +34,22 @@ pub struct StackArgs {
     /// COG overview level (higher = coarser & faster; omit for full res)
     #[arg(long)]
     overview: Option<usize>,
+    /// Multiply values by this factor (e.g. 0.0001 for S2 L2A reflectance)
+    #[arg(long, default_value_t = 1.0)]
+    scale: f64,
+    /// Add this offset after --scale (e.g. -0.1 for S2 baseline >= 04.00)
+    #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+    offset: f64,
+    /// Composite slices before analysis
+    #[arg(long, value_enum)]
+    composite: Option<CompositeKind>,
+    /// Aggregation for --composite
+    #[arg(long, value_enum, default_value_t = CompositeAgg::Median)]
+    composite_method: CompositeAgg,
+    /// Fill temporal NaN gaps by linear interpolation, skipping gaps wider
+    /// than this many time units (in fractional years; 0 = no limit)
+    #[arg(long)]
+    gapfill: Option<f64>,
     /// Band (asset key) for the trend statistic
     #[arg(long)]
     band: Option<String>,
@@ -55,6 +71,22 @@ pub enum TrendStat {
     Ols,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum CompositeKind {
+    /// Merge tiles acquired at the same instant
+    SameTime,
+    /// Monthly bins (1/12 of a fractional year)
+    Monthly,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum CompositeAgg {
+    Median,
+    Mean,
+    Min,
+    Max,
+}
+
 pub fn run(args: &StackArgs) -> Result<()> {
     if args.bbox.len() != 4 {
         bail!("--bbox needs west,south,east,north");
@@ -64,30 +96,55 @@ pub fn run(args: &StackArgs) -> Result<()> {
         .bbox(args.bbox[0], args.bbox[1], args.bbox[2], args.bbox[3])
         .datetime(&args.datetime)
         .max_items(args.limit)
-        .overview(args.overview);
+        .overview(args.overview)
+        .scaling(args.scale, args.offset);
     if let Some(mc) = args.max_cloud {
         cfg = cfg.max_cloud_cover(mc);
     }
 
     eprintln!("searching {} in {} ...", args.collection, args.catalog);
     let stacked = stack(&cfg).context("stacking failed")?;
-    let (nb, ny, nx, nt) = stacked.cube.dims();
-    eprintln!(
-        "stacked {nt} scenes ({nb} bands, {ny}x{nx} px), {} skipped",
-        stacked.skipped.len()
-    );
+    {
+        let (nb, ny, nx, nt) = stacked.cube.dims();
+        eprintln!(
+            "stacked {nt} scenes ({nb} bands, {ny}x{nx} px), {} skipped",
+            stacked.skipped.len()
+        );
+    }
+
+    let mut cube = stacked.cube.clone();
+    if let Some(kind) = args.composite {
+        let window = match kind {
+            CompositeKind::SameTime => CompositeWindow::SameTime,
+            CompositeKind::Monthly => CompositeWindow::Period(1.0 / 12.0),
+        };
+        let method = match args.composite_method {
+            CompositeAgg::Median => CompositeMethod::Median,
+            CompositeAgg::Mean => CompositeMethod::Mean,
+            CompositeAgg::Min => CompositeMethod::Min,
+            CompositeAgg::Max => CompositeMethod::Max,
+        };
+        cube = cube
+            .composite(window, method)
+            .context("compositing failed")?;
+        eprintln!("composited to {} slices", cube.dims().3);
+    }
+    if let Some(mg) = args.gapfill {
+        let max_gap = if mg > 0.0 { Some(mg) } else { None };
+        cube = cube.gapfill_linear(max_gap).context("gap-filling failed")?;
+    }
+    let (nb, ny, nx, nt) = cube.dims();
 
     let mut maps_written = Vec::new();
     if args.output.is_some() || args.pvalue_output.is_some() {
         let band_key = args.band.as_deref().unwrap_or(&args.assets[0]);
-        let band = stacked
-            .cube
+        let band = cube
             .bands()
             .iter()
             .position(|b| b == band_key)
             .with_context(|| format!("band '{band_key}' is not in the stacked assets"))?;
 
-        let (slope, pvalue) = trend_maps(&stacked, band, args.stat)?;
+        let (slope, pvalue) = trend_maps(&cube, band, args.stat)?;
         if let Some(path) = &args.output {
             write_map(&slope, &stacked, path)?;
             maps_written.push(path.display().to_string());
@@ -107,8 +164,8 @@ pub fn run(args: &StackArgs) -> Result<()> {
         })).collect::<Vec<_>>(),
         "skipped": stacked.skipped,
         "dims": { "bands": nb, "height": ny, "width": nx, "times": nt },
-        "bands": stacked.cube.bands(),
-        "time_range": [stacked.cube.time().first(), stacked.cube.time().last()],
+        "bands": cube.bands(),
+        "time_range": [cube.time().first(), cube.time().last()],
         "epsg": stacked.epsg,
         "maps_written": maps_written,
     });
@@ -118,12 +175,11 @@ pub fn run(args: &StackArgs) -> Result<()> {
 
 /// Per-pixel slope and p-value grids for the selected band.
 fn trend_maps(
-    stacked: &StackedCube,
+    cube: &datacube_core::Cube,
     band: usize,
     stat: TrendStat,
 ) -> Result<(ndarray::Array2<f64>, ndarray::Array2<f64>)> {
-    let results = stacked
-        .cube
+    let results = cube
         .par_map_series(band, |t, y| match stat {
             TrendStat::TheilSen => {
                 let slope = stats::theil_sen(t, y).map(|r| r.slope).unwrap_or(f64::NAN);

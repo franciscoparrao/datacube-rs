@@ -27,6 +27,8 @@
 mod cube;
 mod error;
 pub mod stats;
+mod temporal;
 
 pub use cube::{Cube, CubeChunk, PixelSeries};
 pub use error::CubeError;
+pub use temporal::{CompositeMethod, CompositeWindow};

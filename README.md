@@ -1,8 +1,10 @@
 # datacube-rs
 
-Temporal data cubes for remote sensing time series in Rust — per-pixel trend
-and seasonality analysis (OLS, Theil-Sen, Mann-Kendall, harmonic regression)
-over `(band, y, x, time)` cubes with streaming, Rayon-parallel iteration.
+Temporal data cubes for remote sensing time series in Rust — per-pixel trend,
+seasonality and structural-break analysis (OLS, Theil-Sen, Mann-Kendall,
+harmonic regression, BFAST-style CUSUM breaks) over `(band, y, x, time)`
+cubes with streaming, Rayon-parallel iteration, temporal compositing and
+gap-filling.
 
 Part of the SurtGIS family of Rust geospatial engines.
 
@@ -23,12 +25,15 @@ Part of the SurtGIS family of Rust geospatial engines.
 cargo test                                   # unit + doc tests
 cargo run -p datacube-cli -- trend ndvi.csv  # CSV: "value" or "t,value"
 cargo run -p datacube-cli -- harmonic ndvi.csv --period 1 --harmonics 2
+cargo run -p datacube-cli -- breaks ndvi.csv --harmonics 1 --period 1
 
-# Sentinel-2 trend map straight from Planetary Computer (needs --features stac)
+# Sentinel-2 trend map straight from Planetary Computer (needs --features stac).
+# Optional: monthly median composite + gap-fill + reflectance scaling.
 cargo run -p datacube-cli --features stac -- stack \
   --collection sentinel-2-l2a --assets B04 \
   --bbox -70.70,-33.50,-70.68,-33.48 --datetime 2024-01-01/2024-06-30 \
-  --max-cloud 30 --overview 3 \
+  --max-cloud 30 --overview 3 --scale 0.0001 --offset -0.1 \
+  --composite monthly --composite-method median --gapfill 0.25 \
   --output slope.tif --pvalue-output pvalue.tif
 ```
 
@@ -48,9 +53,19 @@ correctly.
 ## Numerical parity
 
 `scripts/validate_pymannkendall.py` cross-checks every reported field against
-`pyMannKendall` (original_test, sens_slope), `scipy.stats.linregress` and
-`numpy.linalg.lstsq` (harmonic design matrix) within `1e-9` relative
-tolerance.
+`pyMannKendall` (original_test, sens_slope), `scipy.stats.linregress`,
+`numpy.linalg.lstsq` (harmonic design matrix) and
+`statsmodels.breaks_cusumolsresid` (OLS-CUSUM break statistic) within `1e-9`
+relative tolerance — 103 checks total.
+
+statsmodels needs a pandas-compatible environment, so the script runs in a
+dedicated venv:
+
+```bash
+python3 -m venv .venv-validate
+.venv-validate/bin/pip install numpy scipy pymannkendall statsmodels
+.venv-validate/bin/python scripts/validate_pymannkendall.py
+```
 
 Documented divergences from the references:
 
@@ -59,16 +74,19 @@ Documented divergences from the references:
 - `pymannkendall.sens_slope` assumes unit spacing after dropping NaN; we keep
   the true time gaps.
 
-## Roadmap (v0.1 → v0.2)
+## Roadmap
 
 - [x] Cube model + streaming per-pixel/chunk iterators
 - [x] OLS linear trend, Theil-Sen, Mann-Kendall (tie-corrected)
 - [x] Harmonic regression with trend (seasonality/phenology, amplitude/phase)
 - [x] STAC/COG temporal stacking (Planetary Computer / Earth Search, via
   SurtGIS): cloud filter, grid alignment, fractional-year time axis,
-  GeoTIFF trend maps
-- [ ] BFAST-style break detection, temporal compositing, gap-filling
-- [ ] Cross-UTM-zone mosaicking; same-date tile compositing
+  reflectance scaling, GeoTIFF trend maps
+- [x] BFAST-style break detection (OLS-CUSUM + binary segmentation)
+- [x] Temporal compositing (same-time / period, median·mean·min·max) and
+  linear gap-filling
+- [ ] Per-pixel break maps over a cube (currently per-series + CLI)
+- [ ] Cross-UTM-zone mosaicking; multi-band per-pixel break stacking
 
 ## License
 
