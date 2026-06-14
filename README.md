@@ -34,7 +34,8 @@ cargo run -p datacube-cli --features stac -- stack \
   --bbox -70.70,-33.50,-70.68,-33.48 --datetime 2024-01-01/2024-06-30 \
   --max-cloud 30 --overview 3 --scale 0.0001 --offset -0.1 \
   --composite monthly --composite-method median --gapfill 0.25 \
-  --output slope.tif --pvalue-output pvalue.tif
+  --output slope.tif --pvalue-output pvalue.tif \
+  --breaks-output nbreaks.tif --first-break-output firstbreak.tif
 ```
 
 ```rust
@@ -82,11 +83,13 @@ Documented divergences from the references:
 - [x] STAC/COG temporal stacking (Planetary Computer / Earth Search, via
   SurtGIS): cloud filter, grid alignment, fractional-year time axis,
   reflectance scaling, GeoTIFF trend maps
-- [x] BFAST-style break detection (OLS-CUSUM + binary segmentation)
+- [x] BFAST-style break detection (OLS-CUSUM + binary segmentation), as a
+  per-series stat and as per-pixel break-count / first-break-time maps over
+  a stacked cube
 - [x] Temporal compositing (same-time / period, median·mean·min·max) and
   linear gap-filling
-- [ ] Per-pixel break maps over a cube (currently per-series + CLI)
-- [ ] Cross-UTM-zone mosaicking; multi-band per-pixel break stacking
+- [ ] Cross-UTM-zone mosaicking
+- [ ] PyO3 bindings; WASM time-series demo
 
 ## License
 

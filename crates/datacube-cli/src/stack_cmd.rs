@@ -63,6 +63,20 @@ pub struct StackArgs {
     /// for ols) to this GeoTIFF
     #[arg(long)]
     pvalue_output: Option<PathBuf>,
+    /// Write a per-pixel break-count map (BFAST-style) to this GeoTIFF.
+    /// Uses --band, --harmonics and --break-alpha.
+    #[arg(long)]
+    breaks_output: Option<PathBuf>,
+    /// Write a per-pixel map of the first break time (fractional years; NaN
+    /// where no break) to this GeoTIFF
+    #[arg(long)]
+    first_break_output: Option<PathBuf>,
+    /// Fourier pairs in the per-pixel break model (0 = trend only)
+    #[arg(long, default_value_t = 1)]
+    break_harmonics: usize,
+    /// Significance level for per-pixel break detection
+    #[arg(long, default_value_t = 0.05)]
+    break_alpha: f64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -135,8 +149,11 @@ pub fn run(args: &StackArgs) -> Result<()> {
     }
     let (nb, ny, nx, nt) = cube.dims();
 
+    let wants_trend = args.output.is_some() || args.pvalue_output.is_some();
+    let wants_breaks = args.breaks_output.is_some() || args.first_break_output.is_some();
+
     let mut maps_written = Vec::new();
-    if args.output.is_some() || args.pvalue_output.is_some() {
+    if wants_trend || wants_breaks {
         let band_key = args.band.as_deref().unwrap_or(&args.assets[0]);
         let band = cube
             .bands()
@@ -144,14 +161,27 @@ pub fn run(args: &StackArgs) -> Result<()> {
             .position(|b| b == band_key)
             .with_context(|| format!("band '{band_key}' is not in the stacked assets"))?;
 
-        let (slope, pvalue) = trend_maps(&cube, band, args.stat)?;
-        if let Some(path) = &args.output {
-            write_map(&slope, &stacked, path)?;
-            maps_written.push(path.display().to_string());
+        if wants_trend {
+            let (slope, pvalue) = trend_maps(&cube, band, args.stat)?;
+            if let Some(path) = &args.output {
+                write_map(&slope, &stacked, path)?;
+                maps_written.push(path.display().to_string());
+            }
+            if let Some(path) = &args.pvalue_output {
+                write_map(&pvalue, &stacked, path)?;
+                maps_written.push(path.display().to_string());
+            }
         }
-        if let Some(path) = &args.pvalue_output {
-            write_map(&pvalue, &stacked, path)?;
-            maps_written.push(path.display().to_string());
+        if wants_breaks {
+            let (count, first) = break_maps(&cube, band, args.break_harmonics, args.break_alpha)?;
+            if let Some(path) = &args.breaks_output {
+                write_map(&count, &stacked, path)?;
+                maps_written.push(path.display().to_string());
+            }
+            if let Some(path) = &args.first_break_output {
+                write_map(&first, &stacked, path)?;
+                maps_written.push(path.display().to_string());
+            }
         }
     }
 
@@ -196,6 +226,37 @@ fn trend_maps(
     let slope = results.mapv(|(s, _)| s);
     let pvalue = results.mapv(|(_, p)| p);
     Ok((slope, pvalue))
+}
+
+/// Per-pixel break-count and first-break-time grids (BFAST-style).
+/// Pixels with too few finite observations yield `NaN`.
+fn break_maps(
+    cube: &datacube_core::Cube,
+    band: usize,
+    harmonics: usize,
+    alpha: f64,
+) -> Result<(ndarray::Array2<f64>, ndarray::Array2<f64>)> {
+    let opts = stats::BreakOptions {
+        alpha,
+        n_harmonics: harmonics,
+        period: 1.0,
+        min_segment: stats::BreakOptions::default()
+            .min_segment
+            .max(2 * harmonics + 4),
+    };
+    let results = cube
+        .par_map_series(band, |t, y| match stats::detect_breaks(t, y, &opts) {
+            Ok(r) => {
+                let first = r.breaks.first().map(|b| b.time).unwrap_or(f64::NAN);
+                (r.breaks.len() as f64, first)
+            }
+            // too few observations / degenerate series → no break info
+            Err(_) => (f64::NAN, f64::NAN),
+        })
+        .context("per-pixel break detection failed")?;
+    let count = results.mapv(|(c, _)| c);
+    let first = results.mapv(|(_, f)| f);
+    Ok((count, first))
 }
 
 /// Writes a float map on the stack's grid as GeoTIFF (f32, NaN nodata).

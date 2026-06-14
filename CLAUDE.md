@@ -86,7 +86,15 @@ proj) en vez de reinventar I/O. Diferenciador: cubo Rust nativo sobre GeoZarr.
 - OJO numpy 2.x: `repr(np.float64)` da "np.float64(0.0)"; el script castea a
   float() antes de escribir CSV.
 
+## Mapas de breaks por píxel (2026-06-13)
+- `datacube stack --breaks-output N.tif --first-break-output T.tif`
+  (`--break-harmonics`, `--break-alpha`): corre `detect_breaks` por píxel vía
+  `par_map_series` → GeoTIFF de conteo de breaks y de tiempo del primer break
+  (NaN donde hay pocas obs). min_segment se sube a max(12, 2*K+4).
+- Verificado end-to-end contra PC (Santiago); con pocos composites el mapa
+  queda NaN como corresponde (algoritmo validado aparte 103/103).
+
 ## Próximos pasos al retomar
-1. Mapa de breaks por píxel sobre un cubo (hoy detect_breaks es por-serie + CLI).
-2. Benchmarks criterion para `par_map_series` sobre cubos grandes.
-3. Mosaico cross-UTM-zone; bindings PyO3 / WASM demo.
+1. Benchmarks criterion para `par_map_series` sobre cubos grandes.
+2. Mosaico cross-UTM-zone.
+3. Bindings PyO3 / WASM demo de series.
