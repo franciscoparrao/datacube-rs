@@ -4,6 +4,7 @@
 //! time axis must be sorted ascending (as produced by stacking).
 
 use ndarray::Array4;
+use rayon::prelude::*;
 
 use crate::cube::Cube;
 use crate::error::CubeError;
@@ -57,29 +58,33 @@ impl Cube {
         method: CompositeMethod,
     ) -> Result<Cube, CubeError> {
         let groups = group_times(self.time(), window)?;
-        let (nb, ny, nx, _) = self.dims();
+        let (nb, ny, nx, nt) = self.dims();
+        let ng = groups.len();
         let src = self.data();
+        let src = src
+            .as_slice()
+            .expect("cube data is standard layout (enforced by Cube::new)");
 
-        let mut data = Array4::from_elem((nb, ny, nx, groups.len()), f64::NAN);
-        let mut times = Vec::with_capacity(groups.len());
-        let mut values = Vec::new();
-        for (gi, group) in groups.iter().enumerate() {
-            times.push(group.iter().map(|&i| self.time()[i]).sum::<f64>() / group.len() as f64);
-            for b in 0..nb {
-                for y in 0..ny {
-                    for x in 0..nx {
-                        values.clear();
-                        values.extend(
-                            group
-                                .iter()
-                                .map(|&ti| src[[b, y, x, ti]])
-                                .filter(|v| v.is_finite()),
-                        );
-                        data[[b, y, x, gi]] = reduce(&mut values, method);
-                    }
-                }
+        let times: Vec<f64> = groups
+            .iter()
+            .map(|g| g.iter().map(|&i| self.time()[i]).sum::<f64>() / g.len() as f64)
+            .collect();
+
+        // every pixel reduces its own series independently — parallelize over
+        // pixels (the source and output pixel series are both contiguous).
+        let mut out = vec![f64::NAN; nb * ny * nx * ng];
+        out.par_chunks_mut(ng).enumerate().for_each(|(pp, dst)| {
+            let series = &src[pp * nt..(pp + 1) * nt];
+            let mut values = Vec::new();
+            for (gi, group) in groups.iter().enumerate() {
+                values.clear();
+                values.extend(group.iter().map(|&ti| series[ti]).filter(|v| v.is_finite()));
+                dst[gi] = reduce(&mut values, method);
             }
-        }
+        });
+
+        let data = Array4::from_shape_vec((nb, ny, nx, ng), out)
+            .map_err(|e| CubeError::DimensionMismatch(e.to_string()))?;
         Cube::new(data, times, self.bands().to_vec())
     }
 
@@ -96,36 +101,36 @@ impl Cube {
                 "gapfill_linear requires an ascending time axis".into(),
             ));
         }
-        let (nb, ny, nx, nt) = self.dims();
+        let (_, _, _, nt) = self.dims();
         let mut data = self.data().to_owned();
+        let flat = data
+            .as_slice_mut()
+            .expect("cube data is standard layout (enforced by Cube::new)");
 
-        for b in 0..nb {
-            for y in 0..ny {
-                for x in 0..nx {
-                    let mut prev: Option<usize> = None;
-                    let mut i = 0;
-                    while i < nt {
-                        if data[[b, y, x, i]].is_finite() {
-                            // close a gap (prev, i) if one was open
-                            if let Some(p) = prev
-                                && i > p + 1
-                            {
-                                let dt = time[i] - time[p];
-                                if max_gap.is_none_or(|mg| dt <= mg) && dt > 0.0 {
-                                    let (v0, v1) = (data[[b, y, x, p]], data[[b, y, x, i]]);
-                                    for k in (p + 1)..i {
-                                        let f = (time[k] - time[p]) / dt;
-                                        data[[b, y, x, k]] = v0 + f * (v1 - v0);
-                                    }
-                                }
-                            }
-                            prev = Some(i);
+        // each pixel's series is a contiguous nt-slice; fill them in parallel.
+        flat.par_chunks_mut(nt).for_each(|series| {
+            let mut prev: Option<usize> = None;
+            for i in 0..nt {
+                if !series[i].is_finite() {
+                    continue;
+                }
+                // close a gap (prev, i) if one was open
+                if let Some(p) = prev
+                    && i > p + 1
+                {
+                    let dt = time[i] - time[p];
+                    if max_gap.is_none_or(|mg| dt <= mg) && dt > 0.0 {
+                        let (v0, v1) = (series[p], series[i]);
+                        for k in (p + 1)..i {
+                            let f = (time[k] - time[p]) / dt;
+                            series[k] = v0 + f * (v1 - v0);
                         }
-                        i += 1;
                     }
                 }
+                prev = Some(i);
             }
-        }
+        });
+
         Cube::new(data, time.to_vec(), self.bands().to_vec())
     }
 }

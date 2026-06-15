@@ -89,7 +89,7 @@ Documented divergences from the references:
 - [x] Temporal compositing (same-time / period, median·mean·min·max) and
   linear gap-filling
 - [x] Criterion benchmarks (`BENCHMARKS.md`)
-- [ ] Parallelize compositing / gap-filling (currently single-threaded)
+- [x] Rayon-parallel compositing / gap-filling
 - [ ] Cross-UTM-zone mosaicking
 - [ ] PyO3 bindings; WASM time-series demo
 

@@ -52,13 +52,16 @@ overhead, sets the time. A full Sentinel-2 tile (≈10 980²) is ~17× a 256²
 chunk, so a Theil-Sen + Mann-Kendall trend map of one tile/year is ~minutes
 on this laptop, seconds on a many-core server.
 
-Temporal transforms over a `(1, 128, 128, 120)` cube — currently
-**single-threaded** sequential loops:
+Temporal transforms over a `(1, 128, 128, 120)` cube, Rayon-parallel over
+pixels:
 
-| op                           | time  | throughput |
-|------------------------------|-------|------------|
-| `composite` (monthly median) | 43 ms | ~380 Kpx/s |
-| `gapfill_linear`             | 12 ms | ~1.4 Mpx/s |
+| op                           | time   | vs serial | note                  |
+|------------------------------|--------|-----------|-----------------------|
+| `composite` (monthly median) | 11 ms  | ~4× faster| compute-bound (median)|
+| `gapfill_linear`             | 12 ms  | ~unchanged| bandwidth-bound       |
 
-Compositing and gap-filling are not yet parallelized — a natural next target,
-since both are embarrassingly parallel per pixel.
+`composite` parallelizes well — the per-group median selection is real
+per-pixel work. `gapfill_linear` barely moves: it does little arithmetic per
+element and is dominated by cloning the cube (~16 MB here) and memory
+traffic, so it is memory-bandwidth bound rather than CPU bound; the parallel
+fill still helps on wider (multi-band) cubes where the copy amortizes.
