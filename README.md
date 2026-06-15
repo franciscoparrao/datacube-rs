@@ -88,8 +88,16 @@ Documented divergences from the references:
   a stacked cube
 - [x] Temporal compositing (same-time / period, median·mean·min·max) and
   linear gap-filling
+- [x] Criterion benchmarks (`BENCHMARKS.md`)
+- [ ] Parallelize compositing / gap-filling (currently single-threaded)
 - [ ] Cross-UTM-zone mosaicking
 - [ ] PyO3 bindings; WASM time-series demo
+
+## Performance
+
+See [`BENCHMARKS.md`](BENCHMARKS.md). `par_map_series` scales linearly with
+pixel count across the Rayon pool; Theil-Sen and Mann-Kendall are O(n²) per
+pixel and dominate long records.
 
 ## License
 
