@@ -2,3 +2,7 @@
 Cargo.lock
 __pycache__/
 .venv-validate/
+.venv/
+*.so
+.pytest_cache/
+*.egg-info/

@@ -1,0 +1,24 @@
+[build-system]
+requires = ["maturin>=1.5,<2"]
+build-backend = "maturin"
+
+[project]
+name = "datacube-rs"
+description = "Temporal data cubes for remote sensing: trend, seasonality and break statistics (Rust core)"
+requires-python = ">=3.9"
+license = { text = "MIT OR Apache-2.0" }
+authors = [{ name = "Francisco Parra", email = "francisco.parra.o@usach.cl" }]
+classifiers = [
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: GIS",
+]
+dependencies = ["numpy>=1.21"]
+dynamic = ["version"]
+
+[project.urls]
+Repository = "https://github.com/franciscoparrao/datacube-rs"
+
+[tool.maturin]
+# build only the extension module, with the pyo3 extension-module feature
+features = ["extension-module"]
+module-name = "datacube_rs"

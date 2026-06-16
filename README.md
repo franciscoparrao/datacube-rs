@@ -18,6 +18,9 @@ Part of the SurtGIS family of Rust geospatial engines.
 - `crates/datacube-cli` — `datacube` binary; `datacube trend series.csv`
   reports all three estimators as JSON. Build with `--features stac` to
   enable `datacube stack`.
+- `crates/datacube-python` — PyO3 bindings (`datacube_rs` module): the cube
+  model and statistics over NumPy arrays. See its
+  [README](crates/datacube-python/README.md).
 
 ## Quick start
 
@@ -92,7 +95,8 @@ Documented divergences from the references:
 - [x] Rayon-parallel compositing / gap-filling
 - [x] Cross-UTM-zone mosaicking (reproject neighbouring-zone scenes onto the
   reference grid instead of skipping them)
-- [ ] PyO3 bindings; WASM time-series demo
+- [x] PyO3 bindings (`datacube_rs` module: cube + statistics over NumPy)
+- [ ] WASM time-series demo
 
 ## Performance
 

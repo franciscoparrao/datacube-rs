@@ -83,6 +83,20 @@ proj) en vez de reinventar I/O. Diferenciador: cubo Rust nativo sobre GeoZarr.
   a EPSG 32719).
 - CLI: `datacube stack` tras `--features stac` (CLI default sigue standalone).
 
+## datacube-python (PyO3, 2026-06-16)
+- Crate `crates/datacube-python`, módulo `datacube_rs`. pyo3 0.29 + numpy 0.29
+  (abi3-py39). crate-type `["cdylib","rlib"]` + feature `extension-module`
+  (off para `cargo test --workspace`, on para maturin) → no rompe los tests.
+- Expone: `linear_trend`, `theil_sen`, `mann_kendall`, `harmonic_regression`,
+  `detect_breaks` (toman np.ndarray 1-D) y clase `Cube` (data 4-D + time +
+  bands) con `.dims/.bands/.time/.to_numpy()`, `.trend_map(band, method)` →
+  (slope, pvalue) 2-D, `.composite(window, method)`, `.gapfill(max_gap)`.
+- par_map_series corre Rayon a través del binding (los hilos no tocan objetos
+  Python → GIL no estorba); trend_map 256x256x60 ~780ms desde Python.
+- Build: `VIRTUAL_ENV=.venv-validate maturin develop --release` desde el crate.
+  Tests: `.venv-validate/bin/python -m pytest crates/datacube-python/tests`
+  (10 tests). datacube-io NO se expone aún (pulls surtgis/red).
+
 ## Validación (venv obligatorio para statsmodels)
 - `.venv-validate/` (gitignored): numpy/scipy/pymannkendall/statsmodels.
   statsmodels del sistema roto por pandas 3.0 (`deprecate_kwarg`); el venv usa

@@ -1,0 +1,25 @@
+[package]
+name = "datacube-python"
+description = "Python bindings for datacube-rs (temporal cube model + trend/seasonality/break statistics)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+name = "datacube_rs"
+# cdylib for the Python extension module; rlib so the workspace can still
+# `cargo test`/`cargo build` the crate without an interpreter to link.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+datacube-core = { workspace = true }
+ndarray = { workspace = true }
+pyo3 = { version = "0.29", features = ["abi3-py39"] }
+numpy = "0.29"
+
+[features]
+# maturin enables this so the extension module does not link libpython;
+# left off for `cargo test --workspace`, which links against the dev lib.
+extension-module = ["pyo3/extension-module"]
