@@ -74,8 +74,13 @@ proj) en vez de reinventar I/O. Diferenciador: cubo Rust nativo sobre GeoZarr.
 - v0.2: `StackConfig::scaling(scale, offset)` aplica transform lineal post-
   máscara (S2 L2A: 1e-4, -0.1 baseline ≥04.00). CLI stack acepta --scale
   --offset --composite (same-time|monthly) --composite-method --gapfill.
-- Limitaciones: escenas con EPSG distinto al de referencia se saltan; mosaico
-  cross-UTM-zone pendiente.
+- v0.3: mosaico **cross-UTM-zone**. `StackConfig::cross_zone_mosaic` (default
+  on): escenas en otra zona UTM se reproyectan a la zona de referencia con
+  `reproject::reproject_raster_utm` (UTM↔UTM bilineal de surtgis-cloud) antes
+  de `resample_to_grid`. Non-UTM → StackError::Reproject → skip con razón.
+  CLI: `--no-cross-zone` para volver al comportamiento anterior. Probado en
+  frontera zona 18/19 (-72° Chile): 15→31 escenas (16 tiles T18 reproyectadas
+  a EPSG 32719).
 - CLI: `datacube stack` tras `--features stac` (CLI default sigue standalone).
 
 ## Validación (venv obligatorio para statsmodels)

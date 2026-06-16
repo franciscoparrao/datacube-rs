@@ -54,6 +54,11 @@ pub enum StackError {
     #[error("invalid configuration: {0}")]
     Config(String),
 
+    /// A scene could not be reprojected onto the reference grid (e.g. a
+    /// non-UTM CRS, which the UTM↔UTM mosaicker does not handle).
+    #[error("reprojection failed: {0}")]
+    Reproject(String),
+
     /// The search returned no items, or none survived the filters.
     #[error("no usable scenes: {0}")]
     Empty(String),

@@ -90,7 +90,8 @@ Documented divergences from the references:
   linear gap-filling
 - [x] Criterion benchmarks (`BENCHMARKS.md`)
 - [x] Rayon-parallel compositing / gap-filling
-- [ ] Cross-UTM-zone mosaicking
+- [x] Cross-UTM-zone mosaicking (reproject neighbouring-zone scenes onto the
+  reference grid instead of skipping them)
 - [ ] PyO3 bindings; WASM time-series demo
 
 ## Performance

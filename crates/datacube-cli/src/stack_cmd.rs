@@ -40,6 +40,10 @@ pub struct StackArgs {
     /// Add this offset after --scale (e.g. -0.1 for S2 baseline >= 04.00)
     #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
     offset: f64,
+    /// Skip scenes from other UTM zones instead of reprojecting them onto the
+    /// reference grid (cross-zone mosaicking is on by default)
+    #[arg(long)]
+    no_cross_zone: bool,
     /// Composite slices before analysis
     #[arg(long, value_enum)]
     composite: Option<CompositeKind>,
@@ -111,7 +115,8 @@ pub fn run(args: &StackArgs) -> Result<()> {
         .datetime(&args.datetime)
         .max_items(args.limit)
         .overview(args.overview)
-        .scaling(args.scale, args.offset);
+        .scaling(args.scale, args.offset)
+        .cross_zone_mosaic(!args.no_cross_zone);
     if let Some(mc) = args.max_cloud {
         cfg = cfg.max_cloud_cover(mc);
     }

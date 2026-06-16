@@ -39,6 +39,10 @@ pub struct StackConfig {
     /// Additive offset applied after `scale` (e.g. `-0.1` for Sentinel-2
     /// L2A processing baseline ≥ 04.00).
     pub offset: f64,
+    /// Mosaic scenes from other UTM zones onto the reference grid by UTM↔UTM
+    /// reprojection (default `true`). When `false`, scenes whose CRS differs
+    /// from the reference are skipped instead.
+    pub cross_zone_mosaic: bool,
 }
 
 impl StackConfig {
@@ -55,6 +59,7 @@ impl StackConfig {
             resample: ResampleMethod::NearestNeighbor,
             scale: 1.0,
             offset: 0.0,
+            cross_zone_mosaic: true,
         }
     }
 
@@ -89,6 +94,13 @@ impl StackConfig {
     pub fn scaling(mut self, scale: f64, offset: f64) -> Self {
         self.scale = scale;
         self.offset = offset;
+        self
+    }
+
+    /// Whether to mosaic scenes from other UTM zones onto the reference grid
+    /// (default `true`). Set `false` to skip cross-zone scenes instead.
+    pub fn cross_zone_mosaic(mut self, on: bool) -> Self {
+        self.cross_zone_mosaic = on;
         self
     }
 
@@ -141,10 +153,12 @@ pub struct StackedCube {
 /// Searches the catalog and stacks the matching scenes into a cube.
 ///
 /// The first successfully-read scene defines the reference grid; every other
-/// scene is resampled onto it (`cfg.resample`). Scenes in a different CRS
-/// than the reference are skipped (cross-UTM-zone mosaicking is out of
-/// scope) and reported in [`StackedCube::skipped`]. Nodata becomes `NaN`;
-/// values stay raw unless [`StackConfig::scaling`] is set.
+/// scene is resampled onto it (`cfg.resample`). Scenes in a different UTM
+/// zone are reprojected onto the reference zone first (UTM↔UTM mosaicking,
+/// unless [`StackConfig::cross_zone_mosaic`] is off); scenes that still
+/// cannot be reprojected (non-UTM CRS) are skipped and reported in
+/// [`StackedCube::skipped`]. Nodata becomes `NaN`; values stay raw unless
+/// [`StackConfig::scaling`] is set.
 pub fn stack(cfg: &StackConfig) -> Result<StackedCube, StackError> {
     cfg.validate()?;
 
@@ -191,11 +205,14 @@ pub fn stack(cfg: &StackConfig) -> Result<StackedCube, StackError> {
             skipped.push(format!("{}: cloud cover {cc:.0}% > {max:.0}%", item.id));
             continue;
         }
-        if let (Some(re), Some(ie)) = (ref_epsg, item.epsg())
+        // when cross-zone mosaicking is off, keep the old behaviour: scenes
+        // in a different CRS than the reference are skipped.
+        if !cfg.cross_zone_mosaic
+            && let (Some(re), Some(ie)) = (ref_epsg, item.epsg())
             && re != ie
         {
             skipped.push(format!(
-                "{}: EPSG {ie} differs from reference EPSG {re}",
+                "{}: EPSG {ie} differs from reference EPSG {re} (cross-zone mosaic off)",
                 item.id
             ));
             continue;
@@ -208,6 +225,7 @@ pub fn stack(cfg: &StackConfig) -> Result<StackedCube, StackError> {
             &wgs_bbox,
             needs_signing,
             reference.as_ref(),
+            ref_epsg,
         ) {
             Ok(rasters) => {
                 if reference.is_none() {
@@ -272,6 +290,7 @@ fn read_scene(
     wgs_bbox: &BBox,
     needs_signing: bool,
     reference: Option<&Raster<f64>>,
+    ref_epsg: Option<u32>,
 ) -> Result<Vec<Raster<f64>>, StackError> {
     let collection = item.collection.as_deref().unwrap_or(&cfg.collection);
     let mut rasters: Vec<Raster<f64>> = Vec::with_capacity(cfg.assets.len());
@@ -295,8 +314,30 @@ fn read_scene(
             raster.data_mut().mapv_inplace(|v| v * scale + offset);
         }
 
+        // cross-UTM-zone mosaicking: if this scene sits in a different zone
+        // than the reference, reproject it onto the reference zone (UTM↔UTM,
+        // bilinear) before grid alignment. NaN nodata is preserved.
+        if cfg.cross_zone_mosaic
+            && let Some(ref_epsg) = ref_epsg
+        {
+            let scene_epsg = item
+                .epsg()
+                .or_else(|| reader.metadata().crs.as_ref().and_then(|c| c.epsg()));
+            if let Some(scene_epsg) = scene_epsg
+                && scene_epsg != ref_epsg
+            {
+                raster = reproject::reproject_raster_utm(&raster, scene_epsg, ref_epsg)
+                    .ok_or_else(|| {
+                        StackError::Reproject(format!(
+                            "EPSG {scene_epsg} -> {ref_epsg} (non-UTM or degenerate extent)"
+                        ))
+                    })?;
+            }
+        }
+
         // first asset of the first scene defines the grid; everything else
-        // (other bands at other resolutions, later scenes) aligns to it
+        // (other bands at other resolutions, later scenes, reprojected tiles)
+        // aligns to it
         let target = reference.or(rasters.first());
         if let Some(target) = target
             && needs_resample(&raster, target)
@@ -363,6 +404,13 @@ mod tests {
             .bbox(-70.0, -34.0, -69.0, -33.0)
             .datetime("2024-01-01/2024-12-31");
         assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn cross_zone_default_on_and_toggle() {
+        let cfg = StackConfig::new("pc", "sentinel-2-l2a", &["B04"]);
+        assert!(cfg.cross_zone_mosaic, "mosaicking should default to on");
+        assert!(!cfg.cross_zone_mosaic(false).cross_zone_mosaic);
     }
 
     /// End-to-end against the real Planetary Computer (network):
