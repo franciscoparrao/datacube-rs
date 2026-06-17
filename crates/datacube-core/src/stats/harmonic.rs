@@ -1,6 +1,7 @@
 use crate::error::CubeError;
 
 use super::filter_finite_pairs;
+use super::lstsq::HarmonicModel;
 
 /// One fitted harmonic term `a·cos(ωkt) + b·sin(ωkt)`, also expressed as
 /// amplitude/phase: `A·cos(ωkt − φ)` with `A = √(a² + b²)`, `φ = atan2(b, a)`.
@@ -95,48 +96,14 @@ pub fn harmonic_regression(
         });
     }
 
-    let omega = 2.0 * core::f64::consts::PI / period;
-    let mean_t = t.iter().sum::<f64>() / n as f64;
-
-    // design row: [1, t - t̄, cos(ωt), sin(ωt), cos(2ωt), sin(2ωt), ...]
-    let row = |ti: f64| {
-        let mut r = Vec::with_capacity(p);
-        r.push(1.0);
-        r.push(ti - mean_t);
-        for k in 1..=n_harmonics {
-            let kt = omega * k as f64 * ti;
-            r.push(kt.cos());
-            r.push(kt.sin());
-        }
-        r
-    };
-
-    // normal equations X'X β = X'y
-    let mut xtx = vec![vec![0.0; p]; p];
-    let mut xty = vec![0.0; p];
-    for (ti, yi) in t.iter().zip(&y) {
-        let r = row(*ti);
-        for i in 0..p {
-            xty[i] += r[i] * yi;
-            for (x, rj) in xtx[i][i..].iter_mut().zip(&r[i..]) {
-                *x += r[i] * rj;
-            }
-        }
-    }
-    // mirror the upper triangle
-    for i in 1..p {
-        let (head, tail) = xtx.split_at_mut(i);
-        for (j, row) in head.iter().enumerate() {
-            tail[0][j] = row[i];
-        }
-    }
-    let beta = solve_symmetric(xtx, xty)?;
+    let model = HarmonicModel::fit(&t, &y, n_harmonics, period)?;
+    let beta = &model.beta;
 
     let mean_y = y.iter().sum::<f64>() / n as f64;
     let mut ss_res = 0.0;
     let mut ss_yy = 0.0;
     for (ti, yi) in t.iter().zip(&y) {
-        let pred: f64 = row(*ti).iter().zip(&beta).map(|(xi, bi)| xi * bi).sum();
+        let pred = model.predict(*ti);
         ss_res += (yi - pred) * (yi - pred);
         ss_yy += (yi - mean_y) * (yi - mean_y);
     }
@@ -147,7 +114,7 @@ pub fn harmonic_regression(
     };
 
     let slope = beta[1];
-    let intercept = beta[0] - slope * mean_t; // undo the centering
+    let intercept = beta[0] - slope * model.mean_t; // undo the centering
     let components = (1..=n_harmonics)
         .map(|k| {
             let (a, b) = (beta[2 * k], beta[2 * k + 1]);
@@ -170,51 +137,6 @@ pub fn harmonic_regression(
         rmse: (ss_res / n as f64).sqrt(),
         n,
     })
-}
-
-/// Solves a symmetric positive (semi-)definite system by Gaussian
-/// elimination with partial pivoting; errors on rank deficiency.
-pub(super) fn solve_symmetric(
-    mut a: Vec<Vec<f64>>,
-    mut b: Vec<f64>,
-) -> Result<Vec<f64>, CubeError> {
-    let p = b.len();
-    let scale: f64 = a
-        .iter()
-        .flat_map(|r| r.iter())
-        .fold(0.0_f64, |m, v| m.max(v.abs()));
-    let tol = scale * 1e-12 * p as f64;
-    for col in 0..p {
-        let pivot_row = (col..p)
-            .max_by(|&i, &j| a[i][col].abs().total_cmp(&a[j][col].abs()))
-            .unwrap_or(col);
-        if a[pivot_row][col].abs() <= tol {
-            return Err(CubeError::SingularSystem(
-                "design matrix is rank-deficient (aliased harmonic or constant time?)".into(),
-            ));
-        }
-        a.swap(col, pivot_row);
-        b.swap(col, pivot_row);
-        let (pivot_rows, rest) = a.split_at_mut(col + 1);
-        let pivot = &pivot_rows[col];
-        for (i, row) in rest.iter_mut().enumerate() {
-            let f = row[col] / pivot[col];
-            if f != 0.0 {
-                for (rj, pj) in row[col..].iter_mut().zip(&pivot[col..]) {
-                    *rj -= f * pj;
-                }
-                b[col + 1 + i] -= f * b[col];
-            }
-        }
-    }
-    for col in (0..p).rev() {
-        let mut s = b[col];
-        for j in (col + 1)..p {
-            s -= a[col][j] * b[j];
-        }
-        b[col] = s / a[col][col];
-    }
-    Ok(b)
 }
 
 #[cfg(test)]

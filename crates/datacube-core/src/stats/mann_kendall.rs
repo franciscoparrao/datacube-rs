@@ -71,8 +71,9 @@ pub fn mann_kendall_alpha(values: &[f64], alpha: f64) -> Result<MannKendallResul
         }
     }
 
-    // tie correction over groups of equal values
-    let mut sorted = y.clone();
+    // tie correction over groups of equal values (y is no longer needed,
+    // so reuse it as the scratch buffer instead of cloning)
+    let mut sorted = y;
     sorted.sort_unstable_by(f64::total_cmp);
     let mut tie_term = 0.0;
     let mut run = 1.0_f64;

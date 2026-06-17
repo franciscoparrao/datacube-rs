@@ -156,10 +156,8 @@ impl Cube {
         }
         let (_, ny, nx, _) = self.dims();
         let data = &self.data;
-        let xs: Vec<usize> = (0..nx).step_by(chunk_x).collect();
         Ok((0..ny).step_by(chunk_y).flat_map(move |y0| {
-            let xs = xs.clone();
-            xs.into_iter().map(move |x0| {
+            (0..nx).step_by(chunk_x).map(move |x0| {
                 let y1 = (y0 + chunk_y).min(ny);
                 let x1 = (x0 + chunk_x).min(nx);
                 CubeChunk {
@@ -191,8 +189,7 @@ mod tests {
     fn ramp_cube(ny: usize, nx: usize, nt: usize) -> Cube {
         // value = t * (1 + y + x) so every pixel has a distinct linear trend
         let mut data = Array4::zeros((1, ny, nx, nt));
-        for ((b, y, x, t), v) in data.indexed_iter_mut() {
-            let _ = b;
+        for ((_, y, x, t), v) in data.indexed_iter_mut() {
             *v = t as f64 * (1.0 + y as f64 + x as f64);
         }
         Cube::new(data, (0..nt).map(|t| t as f64).collect(), vec!["b1".into()]).unwrap()

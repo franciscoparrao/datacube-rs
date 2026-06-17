@@ -7,6 +7,7 @@
 mod breaks;
 mod harmonic;
 mod linear;
+mod lstsq;
 mod mann_kendall;
 pub(crate) mod special;
 mod theil_sen;

@@ -20,7 +20,8 @@ Part of the SurtGIS family of Rust geospatial engines.
   enable `datacube stack`.
 - `crates/datacube-python` — PyO3 bindings (`datacube_rs` module): the cube
   model and statistics over NumPy arrays. See its
-  [README](crates/datacube-python/README.md).
+  [README](crates/datacube-python/README.md). I/O stacking is not exposed to
+  Python yet — use the CLI (`datacube stack`) for STAC/COG ingestion.
 
 ## Quick start
 
@@ -56,7 +57,7 @@ correctly.
 
 ## Numerical parity
 
-`scripts/validate_pymannkendall.py` cross-checks every reported field against
+`scripts/validate_stats.py` cross-checks every reported field against
 `pyMannKendall` (original_test, sens_slope), `scipy.stats.linregress`,
 `numpy.linalg.lstsq` (harmonic design matrix) and
 `statsmodels.breaks_cusumolsresid` (OLS-CUSUM break statistic) within `1e-9`
@@ -68,7 +69,7 @@ dedicated venv:
 ```bash
 python3 -m venv .venv-validate
 .venv-validate/bin/pip install numpy scipy pymannkendall statsmodels
-.venv-validate/bin/python scripts/validate_pymannkendall.py
+.venv-validate/bin/python scripts/validate_stats.py
 ```
 
 Documented divergences from the references:

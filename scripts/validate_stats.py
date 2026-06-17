@@ -10,7 +10,7 @@ same series, and compares every reported field within tolerance.
 Requires the validation venv (statsmodels needs pandas < 3 compatibility):
     python3 -m venv .venv-validate
     .venv-validate/bin/pip install numpy scipy pymannkendall statsmodels
-    .venv-validate/bin/python scripts/validate_pymannkendall.py
+    .venv-validate/bin/python scripts/validate_stats.py
 """
 
 import argparse

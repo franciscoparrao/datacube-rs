@@ -19,7 +19,7 @@ lo haga aprovechando STAC.
       (Sentinel-2 Santiago, UTM 19S, filtro de nubes, GeoTIFF de salida).
 - [x] Tendencia por píxel: regresión lineal, Theil-Sen + Mann-Kendall.
       Validado contra pyMannKendall/scipy: 85/85 checks, tol 1e-9
-      (`scripts/validate_pymannkendall.py`).
+      (`scripts/validate_stats.py`).
 - [x] Regresión armónica (estacionalidad/fenología). Validada contra
       numpy.linalg.lstsq (tol 1e-9).
 - [x] (v0.2) Break-point estilo BFAST (OLS-CUSUM + binary segmentation,
@@ -59,10 +59,12 @@ proj) en vez de reinventar I/O. Diferenciador: cubo Rust nativo sobre GeoZarr.
 - NaN = nodata, filtrado pairwise; Theil-Sen/OLS usan coordenadas t reales
   (muestreo irregular por nubes OK — diverge a propósito de sens_slope).
 - v0.2 añade en core: `stats::detect_breaks` (BFAST-style OLS-CUSUM, p-value
-  Brownian bridge = kstwobign.sf, binary segmentation; modelo de segmento
-  trend+armónicos reusa `solve_symmetric`) y `temporal.rs`
+  Brownian bridge = kstwobign.sf, binary segmentation) y `temporal.rs`
   (`Cube::composite` SameTime/Period × median/mean/min/max,
   `Cube::gapfill_linear` con max_gap y sin extrapolar bordes).
+- El modelo trend+armónicos (lstsq por ecuaciones normales + solver con
+  pivoteo) vive en `stats/lstsq.rs` (`HarmonicModel::fit`/`predict`),
+  compartido por `harmonic_regression` y el modelo de segmento de breaks.
 
 ## datacube-io (2026-06-11)
 - Depende de surtgis-core/surtgis-cloud por **path** (`../surtgis` sibling
@@ -101,7 +103,7 @@ proj) en vez de reinventar I/O. Diferenciador: cubo Rust nativo sobre GeoZarr.
 - `.venv-validate/` (gitignored): numpy/scipy/pymannkendall/statsmodels.
   statsmodels del sistema roto por pandas 3.0 (`deprecate_kwarg`); el venv usa
   statsmodels 0.14.6 que sí importa. Correr con
-  `.venv-validate/bin/python scripts/validate_pymannkendall.py` → 103/103.
+  `.venv-validate/bin/python scripts/validate_stats.py` → 103/103.
 - OJO numpy 2.x: `repr(np.float64)` da "np.float64(0.0)"; el script castea a
   float() antes de escribir CSV.
 
@@ -113,7 +115,13 @@ proj) en vez de reinventar I/O. Diferenciador: cubo Rust nativo sobre GeoZarr.
 - Verificado end-to-end contra PC (Santiago); con pocos composites el mapa
   queda NaN como corresponde (algoritmo validado aparte 103/103).
 
+## Estado (2026-06-17)
+Roadmap MVP→v0.3 completo: core (stats + temporal), io (stack STAC/COG +
+mosaico cross-zone), CLI, PyO3, benchmarks. Cleanup general hecho (lstsq
+compartido, clones removidos, docs al día). 4 targets de 5 (falta WASM).
+
 ## Próximos pasos al retomar
-1. Benchmarks criterion para `par_map_series` sobre cubos grandes.
-2. Mosaico cross-UTM-zone.
-3. Bindings PyO3 / WASM demo de series.
+1. WASM demo de series temporales (target wasm-bindgen) — único item del
+   roadmap pendiente.
+2. Opcional: exponer datacube-io (stack STAC) a Python.
+3. Pensar el paper (venue: Computers & Geosciences o EMS).

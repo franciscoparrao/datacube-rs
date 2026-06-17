@@ -9,7 +9,7 @@
 use crate::error::CubeError;
 
 use super::filter_finite_pairs;
-use super::harmonic::solve_symmetric;
+use super::lstsq::HarmonicModel;
 
 /// Options for [`detect_breaks`].
 #[derive(Debug, Clone, Copy)]
@@ -196,53 +196,13 @@ fn cusum_test(
     Ok((sup, sup_brownian_bridge_pvalue(sup), w))
 }
 
-/// Least-squares residuals of `intercept + slope·(t − t̄) + K Fourier pairs`.
+/// Least-squares residuals of the segment model
+/// `intercept + slope·(t − t̄) + K Fourier pairs`.
 fn fit_residuals(t: &[f64], y: &[f64], opts: &BreakOptions) -> Result<Vec<f64>, CubeError> {
-    let n = t.len();
-    let p = 2 + 2 * opts.n_harmonics;
-    let mean_t = t.iter().sum::<f64>() / n as f64;
-    let omega = 2.0 * core::f64::consts::PI / opts.period;
-
-    let row = |ti: f64| {
-        let mut r = Vec::with_capacity(p);
-        r.push(1.0);
-        r.push(ti - mean_t);
-        for k in 1..=opts.n_harmonics {
-            let kt = omega * k as f64 * ti;
-            r.push(kt.cos());
-            r.push(kt.sin());
-        }
-        r
-    };
-
-    let mut xtx = vec![vec![0.0; p]; p];
-    let mut xty = vec![0.0; p];
-    for (ti, yi) in t.iter().zip(y) {
-        let r = row(*ti);
-        for i in 0..p {
-            xty[i] += r[i] * yi;
-            for (x, rj) in xtx[i][i..].iter_mut().zip(&r[i..]) {
-                *x += r[i] * rj;
-            }
-        }
-    }
-    for i in 1..p {
-        let (head, tail) = xtx.split_at_mut(i);
-        for (j, row) in head.iter().enumerate() {
-            tail[0][j] = row[i];
-        }
-    }
-    let beta = solve_symmetric(xtx, xty)?;
-
+    let model = HarmonicModel::fit(t, y, opts.n_harmonics, opts.period)?;
     Ok(t.iter()
         .zip(y)
-        .map(|(ti, yi)| {
-            yi - row(*ti)
-                .iter()
-                .zip(&beta)
-                .map(|(xi, bi)| xi * bi)
-                .sum::<f64>()
-        })
+        .map(|(ti, yi)| yi - model.predict(*ti))
         .collect())
 }
 
