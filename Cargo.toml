@@ -5,6 +5,7 @@ members = [
     "crates/datacube-cli",
     "crates/datacube-io",
     "crates/datacube-python",
+    "crates/datacube-wasm",
 ]
 
 [workspace.package]

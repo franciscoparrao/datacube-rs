@@ -22,6 +22,9 @@ Part of the SurtGIS family of Rust geospatial engines.
   model and statistics over NumPy arrays. See its
   [README](crates/datacube-python/README.md). I/O stacking is not exposed to
   Python yet — use the CLI (`datacube stack`) for STAC/COG ingestion.
+- `crates/datacube-wasm` — WebAssembly bindings + a browser demo that fits
+  harmonics and detects breaks live. See its
+  [README](crates/datacube-wasm/README.md).
 
 ## Quick start
 
@@ -97,7 +100,7 @@ Documented divergences from the references:
 - [x] Cross-UTM-zone mosaicking (reproject neighbouring-zone scenes onto the
   reference grid instead of skipping them)
 - [x] PyO3 bindings (`datacube_rs` module: cube + statistics over NumPy)
-- [ ] WASM time-series demo
+- [x] WASM bindings + browser time-series demo (harmonic fit + live breaks)
 
 ## Performance
 

@@ -115,13 +115,22 @@ proj) en vez de reinventar I/O. Diferenciador: cubo Rust nativo sobre GeoZarr.
 - Verificado end-to-end contra PC (Santiago); con pocos composites el mapa
   queda NaN como corresponde (algoritmo validado aparte 103/103).
 
-## Estado (2026-06-17)
-Roadmap MVP→v0.3 completo: core (stats + temporal), io (stack STAC/COG +
-mosaico cross-zone), CLI, PyO3, benchmarks. Cleanup general hecho (lstsq
-compartido, clones removidos, docs al día). 4 targets de 5 (falta WASM).
+## datacube-wasm (2026-06-18)
+- Crate `crates/datacube-wasm`, wasm-bindgen 0.2 + serde-wasm-bindgen. Expone
+  las stats por-serie (linear_trend, theil_sen, mann_kendall,
+  harmonic_regression, detect_breaks) sobre Float64Array → objetos JS.
+- crate-type cdylib+rlib; `tests/web.rs` con `#![cfg(target_arch="wasm32")]`
+  para no romper `cargo test --workspace` en host. wasm-pack test --node: 3 ok.
+- Demo `web/index.html` (canvas vanilla, sin deps): serie NDVI sintética con
+  break inyectado + gaps; ajuste armónico + breaks en vivo con sliders.
+  Verificada con screenshot headless (break detectado donde cae el nivel).
+  Build: `wasm-pack build --target web --out-dir web/pkg` (pkg/ gitignored).
+
+## Estado (2026-06-18) — ROADMAP COMPLETO
+5 targets: core (stats+temporal), io (STAC/COG + cross-zone), CLI, PyO3, WASM.
+Validación 103/103 a 1e-9. cargo test --workspace 10 suites verdes.
 
 ## Próximos pasos al retomar
-1. WASM demo de series temporales (target wasm-bindgen) — único item del
-   roadmap pendiente.
-2. Opcional: exponer datacube-io (stack STAC) a Python.
-3. Pensar el paper (venue: Computers & Geosciences o EMS).
+1. Pensar el paper (venue: Computers & Geosciences o EMS). Material listo:
+   paridad numérica documentada, benchmarks, 5 targets, demo web.
+2. Opcional: exponer datacube-io (stack STAC) a Python; GeoZarr backing store.

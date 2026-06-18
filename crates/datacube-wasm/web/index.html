@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>datacube-rs — time-series demo</title>
+<style>
+  :root { --bg:#0f1419; --fg:#e6e6e6; --muted:#8b9398; --obs:#5ac8fa;
+          --fit:#ffb454; --brk:#ff5370; --grid:#1e2630; --accent:#7ec699; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; }
+  header { padding:1.2rem 1.5rem .4rem; }
+  h1 { margin:0; font-size:1.1rem; font-weight:600; }
+  h1 small { color:var(--muted); font-weight:400; }
+  .wrap { max-width:920px; margin:0 auto; padding:0 1.5rem 2rem; }
+  canvas { width:100%; height:auto; background:#0b0f14; border:1px solid var(--grid);
+           border-radius:8px; display:block; margin-top:.8rem; }
+  .controls { display:flex; flex-wrap:wrap; gap:1rem 1.6rem; align-items:center;
+              margin-top:1rem; }
+  .controls label { color:var(--muted); display:flex; align-items:center; gap:.5rem; }
+  input[type=range] { accent-color:var(--accent); }
+  button { background:var(--accent); color:#0b0f14; border:0; border-radius:6px;
+           padding:.45rem .9rem; font:inherit; font-weight:600; cursor:pointer; }
+  .stats { margin-top:1.1rem; display:grid; gap:.5rem 1.4rem;
+           grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); }
+  .card { background:#11161d; border:1px solid var(--grid); border-radius:8px; padding:.7rem .9rem; }
+  .card b { color:var(--accent); }
+  .legend { display:flex; gap:1.2rem; color:var(--muted); margin-top:.5rem; font-size:.85rem; }
+  .legend i { display:inline-block; width:12px; height:3px; vertical-align:middle; margin-right:.4rem; }
+  .err { color:var(--brk); }
+</style>
+</head>
+<body>
+<header class="wrap">
+  <h1>datacube-rs <small>— per-pixel time-series statistics, in your browser via WebAssembly</small></h1>
+</header>
+<div class="wrap">
+  <div class="legend">
+    <span><i style="background:var(--obs)"></i>observations</span>
+    <span><i style="background:var(--fit)"></i>harmonic + trend fit</span>
+    <span><i style="background:var(--brk)"></i>detected break</span>
+  </div>
+  <canvas id="plot" width="880" height="360"></canvas>
+  <div class="controls">
+    <label>harmonics <input id="harm" type="range" min="0" max="3" step="1" value="2"><span id="harmv">2</span></label>
+    <label>noise <input id="noise" type="range" min="0" max="0.15" step="0.01" value="0.04"><span id="noisev">0.04</span></label>
+    <label>trend <input id="trend" type="range" min="-0.05" max="0.05" step="0.005" value="0.01"><span id="trendv">0.010</span></label>
+    <label><input id="brk" type="checkbox" checked> inject a break</label>
+    <button id="regen">regenerate</button>
+  </div>
+  <div class="stats" id="stats"></div>
+</div>
+
+<script type="module">
+import init, { harmonic_regression, detect_breaks, mann_kendall, theil_sen }
+  from "./pkg/datacube_wasm.js";
+
+const YEARS = 6, PER_YEAR = 23;          // ~Sentinel-2 revisit
+const N = YEARS * PER_YEAR;
+const $ = id => document.getElementById(id);
+let seed = 1;
+const rng = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
+
+function makeSeries() {
+  const trend = +$("trend").value, noise = +$("noise").value, withBreak = $("brk").checked;
+  const t = [], y = [];
+  const shiftAt = Math.floor(N * 0.55);
+  for (let i = 0; i < N; i++) {
+    const ti = i / PER_YEAR;
+    let v = 0.45 + trend * ti
+          + 0.20 * Math.cos(2 * Math.PI * ti)
+          + 0.05 * Math.cos(4 * Math.PI * ti)
+          + (rng() - 0.5) * 2 * noise;
+    if (withBreak && i >= shiftAt) v -= 0.18;     // abrupt level drop (e.g. disturbance)
+    t.push(ti);
+    y.push(i % 10 === 7 ? NaN : v);                // ~10% cloud gaps
+  }
+  return { t, y };
+}
+
+function evalHarmonic(fit, ti) {
+  let v = fit.intercept + fit.slope * ti;
+  for (const c of fit.components) {
+    const kt = 2 * Math.PI * c.harmonic * ti / fit.period;
+    v += c.cos_coef * Math.cos(kt) + c.sin_coef * Math.sin(kt);
+  }
+  return v;
+}
+
+function draw(t, y, fit, breaks) {
+  const cv = $("plot"), ctx = cv.getContext("2d");
+  const W = cv.width, H = cv.height, pad = 38;
+  ctx.clearRect(0, 0, W, H);
+  const fin = y.filter(Number.isFinite);
+  const ymin = Math.min(...fin) - 0.05, ymax = Math.max(...fin) + 0.05;
+  const tx = ti => pad + (ti - t[0]) / (t[N - 1] - t[0]) * (W - 2 * pad);
+  const ty = v => H - pad - (v - ymin) / (ymax - ymin) * (H - 2 * pad);
+
+  ctx.strokeStyle = "#1e2630"; ctx.fillStyle = "#8b9398"; ctx.lineWidth = 1;
+  ctx.font = "11px monospace";
+  for (let yr = 0; yr <= YEARS; yr++) {
+    const x = tx(yr); ctx.beginPath(); ctx.moveTo(x, pad); ctx.lineTo(x, H - pad); ctx.stroke();
+    ctx.fillText("yr " + yr, x - 8, H - pad + 14);
+  }
+
+  // break lines
+  ctx.strokeStyle = "#ff5370"; ctx.lineWidth = 2; ctx.setLineDash([5, 4]);
+  for (const b of breaks) {
+    const x = tx(b.time);
+    ctx.beginPath(); ctx.moveTo(x, pad); ctx.lineTo(x, H - pad); ctx.stroke();
+  }
+  ctx.setLineDash([]);
+
+  // observations
+  ctx.fillStyle = "#5ac8fa";
+  for (let i = 0; i < N; i++) if (Number.isFinite(y[i])) {
+    ctx.beginPath(); ctx.arc(tx(t[i]), ty(y[i]), 2.4, 0, 2 * Math.PI); ctx.fill();
+  }
+
+  // fitted curve
+  if (fit) {
+    ctx.strokeStyle = "#ffb454"; ctx.lineWidth = 2; ctx.beginPath();
+    for (let k = 0; k <= 400; k++) {
+      const ti = t[0] + k / 400 * (t[N - 1] - t[0]);
+      const x = tx(ti), yy = ty(evalHarmonic(fit, ti));
+      k ? ctx.lineTo(x, yy) : ctx.moveTo(x, yy);
+    }
+    ctx.stroke();
+  }
+}
+
+function fmt(x, d = 3) { return Number.isFinite(x) ? x.toFixed(d) : "—"; }
+
+function run() {
+  $("harmv").textContent = $("harm").value;
+  $("noisev").textContent = (+$("noise").value).toFixed(2);
+  $("trendv").textContent = (+$("trend").value).toFixed(3);
+  const { t, y } = makeSeries();
+  const nh = +$("harm").value;
+  const stats = $("stats");
+  try {
+    const fit = nh > 0 ? harmonic_regression(t, y, 1.0, nh) : null;
+    const mk = mann_kendall(y, 0.05);
+    const ts = theil_sen(t, y);
+    const minSeg = Math.max(12, 2 * nh + 4);
+    const br = detect_breaks(t, y, 0.05, nh, 1.0, minSeg);
+    draw(t, y, fit, br.breaks);
+    stats.innerHTML = `
+      <div class="card">Mann-Kendall: <b>${mk.trend}</b><br>τ=${fmt(mk.tau)} · p=${fmt(mk.p_value)} · n=${mk.n}</div>
+      <div class="card">Theil-Sen slope<br><b>${fmt(ts.slope)}</b> / yr</div>
+      ${fit ? `<div class="card">Harmonic fit (K=${nh})<br>R²=${fmt(fit.r_squared)} · RMSE=${fmt(fit.rmse)}<br>amp₁=${fmt(fit.components[0].amplitude)}</div>` : ""}
+      <div class="card">Breaks: <b>${br.breaks.length}</b><br>${br.breaks.map(b => "yr " + fmt(b.time, 2) + " (p=" + fmt(b.p_value) + ")").join("<br>") || "none"}</div>`;
+  } catch (e) {
+    stats.innerHTML = `<div class="card err">error: ${e.message || e}</div>`;
+    draw(t, y, null, []);
+  }
+}
+
+await init();
+for (const id of ["harm", "noise", "trend", "brk"]) $(id).addEventListener("input", run);
+$("regen").addEventListener("click", () => { seed = (Math.random() * 1e9) | 0; run(); });
+run();
+</script>
+</body>
+</html>

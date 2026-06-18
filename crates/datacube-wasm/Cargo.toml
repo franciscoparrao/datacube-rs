@@ -1,0 +1,25 @@
+[package]
+name = "datacube-wasm"
+description = "WebAssembly bindings for datacube-rs per-series statistics (browser time-series demo)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+datacube-core = { workspace = true }
+wasm-bindgen = "0.2"
+serde = { workspace = true }
+serde-wasm-bindgen = "0.6"
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
+js-sys = "0.3"
+
+[lints.rust]
+# wasm-bindgen 0.2 emits this lint on generated glue under newer rustc
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(wasm_bindgen_unstable_test_coverage)'] }
