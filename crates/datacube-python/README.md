@@ -30,7 +30,7 @@ dc.linear_trend(t, y)                          # {slope, intercept, r_squared, .
 dc.theil_sen(t, y)                             # robust slope
 dc.mann_kendall(y, alpha=0.05)                 # {trend, tau, p_value, ...}
 dc.harmonic_regression(t, y, period=1.0, n_harmonics=2)
-dc.detect_breaks(t, y, n_harmonics=1)          # BFAST-style structural breaks
+dc.detect_breaks(t, y, n_harmonics=1)          # OLS-CUSUM structural breaks
 
 # --- cube operations ((band, y, x, time) array) ---
 cube = dc.Cube(data, time, ["ndvi"])           # data: 4-D float64, NaN = nodata

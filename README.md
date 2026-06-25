@@ -2,7 +2,7 @@
 
 Temporal data cubes for remote sensing time series in Rust — per-pixel trend,
 seasonality and structural-break analysis (OLS, Theil-Sen, Mann-Kendall,
-harmonic regression, BFAST-style CUSUM breaks) over `(band, y, x, time)`
+harmonic regression, OLS-CUSUM structural breaks) over `(band, y, x, time)`
 cubes with streaming, Rayon-parallel iteration, temporal compositing and
 gap-filling.
 
@@ -90,9 +90,9 @@ Documented divergences from the references:
 - [x] STAC/COG temporal stacking (Planetary Computer / Earth Search, via
   SurtGIS): cloud filter, grid alignment, fractional-year time axis,
   reflectance scaling, GeoTIFF trend maps
-- [x] BFAST-style break detection (OLS-CUSUM + binary segmentation), as a
-  per-series stat and as per-pixel break-count / first-break-time maps over
-  a stacked cube
+- [x] Structural break detection (OLS-CUSUM + binary segmentation, in the
+  spirit of BFAST), as a per-series stat and as per-pixel break-count /
+  first-break-time maps over a stacked cube
 - [x] Temporal compositing (same-time / period, median·mean·min·max) and
   linear gap-filling
 - [x] Criterion benchmarks (`BENCHMARKS.md`)

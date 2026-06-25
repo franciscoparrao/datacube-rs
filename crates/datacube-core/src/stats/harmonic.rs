@@ -48,8 +48,8 @@ impl HarmonicFit {
 }
 
 /// Harmonic (Fourier) regression with linear trend, the standard model for
-/// seasonality and phenology in remote sensing time series (and the season
-/// model inside BFAST).
+/// seasonality and phenology in remote sensing time series (the season model
+/// used by BFAST and CCDC, Zhu & Woodcock 2014).
 ///
 /// `period` is the length of one season in the units of `t` (e.g. `1.0` for
 /// fractional years, `365.25` for days); `n_harmonics` is the number of

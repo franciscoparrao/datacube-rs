@@ -1,10 +1,13 @@
-//! BFAST-style structural break detection.
+//! Structural break detection by OLS-CUSUM and binary segmentation.
 //!
-//! Fits a trend (+ optional harmonic season) model per segment, tests its
-//! OLS residuals with the OLS-CUSUM statistic (`sup |W|`, asymptotically the
-//! supremum of a Brownian bridge — the same test as
-//! `statsmodels.stats.diagnostic.breaks_cusumolsresid`), and locates breaks
-//! by recursive binary segmentation.
+//! Detects regime shifts in the spirit of BFAST (Verbesselt et al. 2010) —
+//! fit a trend (+ optional harmonic season) model, then test its residuals
+//! for instability — but with a *different* test than BFAST's: here the
+//! OLS-CUSUM statistic (`sup |W|`, asymptotically the supremum of a Brownian
+//! bridge, numerically identical to
+//! `statsmodels.stats.diagnostic.breaks_cusumolsresid`), whereas BFAST uses
+//! OLS-MOSUM with Bai-Perron breakpoint selection. Breaks are located by
+//! recursive binary segmentation.
 
 use crate::error::CubeError;
 

@@ -22,8 +22,10 @@ lo haga aprovechando STAC.
       (`scripts/validate_stats.py`).
 - [x] Regresión armónica (estacionalidad/fenología). Validada contra
       numpy.linalg.lstsq (tol 1e-9).
-- [x] (v0.2) Break-point estilo BFAST (OLS-CUSUM + binary segmentation,
-      `stats::detect_breaks`); compositing temporal (`Cube::composite`);
+- [x] (v0.2) Detección de quiebres OLS-CUSUM + binary segmentation
+      (`stats::detect_breaks`, inspirado en BFAST pero NO el test de BFAST:
+      BFAST usa OLS-MOSUM + Bai-Perron; validado vs statsmodels, no vs R bfast);
+      compositing temporal (`Cube::composite`);
       gap-filling lineal (`Cube::gapfill_linear`); scale/offset en stack.
       Validación total 103/103 checks tol 1e-9, breaks vs
       statsmodels.breaks_cusumolsresid.
@@ -58,8 +60,9 @@ proj) en vez de reinventar I/O. Diferenciador: cubo Rust nativo sobre GeoZarr.
   (`datacube trend serie.csv` → JSON).
 - NaN = nodata, filtrado pairwise; Theil-Sen/OLS usan coordenadas t reales
   (muestreo irregular por nubes OK — diverge a propósito de sens_slope).
-- v0.2 añade en core: `stats::detect_breaks` (BFAST-style OLS-CUSUM, p-value
-  Brownian bridge = kstwobign.sf, binary segmentation) y `temporal.rs`
+- v0.2 añade en core: `stats::detect_breaks` (OLS-CUSUM, p-value Brownian
+  bridge = kstwobign.sf, binary segmentation; inspirado en BFAST, ver nota
+  de fidelidad arriba) y `temporal.rs`
   (`Cube::composite` SameTime/Period × median/mean/min/max,
   `Cube::gapfill_linear` con max_gap y sin extrapolar bordes).
 - El modelo trend+armónicos (lstsq por ecuaciones normales + solver con

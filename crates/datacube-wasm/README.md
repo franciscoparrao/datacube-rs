@@ -5,7 +5,7 @@ WebAssembly bindings for the per-series statistics of
 seasonality and structural-break estimators in the browser, with the same Rust
 core (and the same 1e-9 numerical parity) as the native build.
 
-The `web/` demo fits a harmonic+trend model and detects BFAST-style breaks on a
+The `web/` demo fits a harmonic+trend model and detects OLS-CUSUM breaks on a
 synthetic NDVI series, live as you move the sliders — no server-side compute.
 
 ## Build & run the demo

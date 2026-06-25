@@ -113,7 +113,7 @@ fn harmonic_regression<'py>(
     Ok(d)
 }
 
-/// BFAST-style break detection → dict(statistic, p_value, n,
+/// Structural break detection (OLS-CUSUM) → dict(statistic, p_value, n,
 /// breaks=[dict(index, time, statistic, p_value), ...]).
 #[pyfunction]
 #[pyo3(signature = (t, y, alpha=0.05, n_harmonics=0, period=1.0, min_segment=12))]

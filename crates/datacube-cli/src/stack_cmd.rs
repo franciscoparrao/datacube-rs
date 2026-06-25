@@ -67,7 +67,7 @@ pub struct StackArgs {
     /// for ols) to this GeoTIFF
     #[arg(long)]
     pvalue_output: Option<PathBuf>,
-    /// Write a per-pixel break-count map (BFAST-style) to this GeoTIFF.
+    /// Write a per-pixel break-count map (OLS-CUSUM) to this GeoTIFF.
     /// Uses --band, --harmonics and --break-alpha.
     #[arg(long)]
     breaks_output: Option<PathBuf>,
@@ -233,7 +233,7 @@ fn trend_maps(
     Ok((slope, pvalue))
 }
 
-/// Per-pixel break-count and first-break-time grids (BFAST-style).
+/// Per-pixel break-count and first-break-time grids (OLS-CUSUM).
 /// Pixels with too few finite observations yield `NaN`.
 fn break_maps(
     cube: &datacube_core::Cube,

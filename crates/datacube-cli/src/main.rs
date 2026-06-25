@@ -46,8 +46,8 @@ enum Command {
         #[arg(long, default_value_t = 2)]
         harmonics: usize,
     },
-    /// BFAST-style structural break detection (OLS-CUSUM + binary
-    /// segmentation). Same CSV format as `trend`.
+    /// Structural break detection (OLS-CUSUM + binary segmentation, in the
+    /// spirit of BFAST). Same CSV format as `trend`.
     Breaks {
         /// Input CSV file
         input: PathBuf,

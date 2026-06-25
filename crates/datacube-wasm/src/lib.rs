@@ -156,7 +156,7 @@ struct BreakResult {
     breaks: Vec<BreakPoint>,
 }
 
-/// BFAST-style structural break detection.
+/// Structural break detection (OLS-CUSUM + binary segmentation).
 #[wasm_bindgen]
 pub fn detect_breaks(
     t: &[f64],
