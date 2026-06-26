@@ -1,0 +1,219 @@
+%% datacube-rs — Computers & Geosciences software paper
+%% Elsevier elsarticle template. Compile: latexmk -pdf datacube-rs.tex
+%%   (or: pdflatex; bibtex datacube-rs; pdflatex; pdflatex)
+\documentclass[review]{elsarticle}
+
+\usepackage{lineno,hyperref}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\modulolinenumbers[5]
+
+\journal{Computers \& Geosciences}
+
+%% Numbered reference style (C&G)
+\bibliographystyle{elsarticle-num}
+
+\begin{document}
+
+\begin{frontmatter}
+
+\title{datacube-rs: An open-source Rust engine for streaming temporal
+analysis of remote-sensing data cubes}
+
+\author[usach]{Francisco Parra}
+\ead{francisco.parra.o@usach.cl}
+\address[usach]{Universidad de Santiago de Chile (USACH), Santiago, Chile}
+
+\begin{abstract}
+Open satellite archives have made remote sensing a temporal discipline, but the
+tools that assemble image collections into space--time data cubes ship only
+generic reducers, leaving trend, phenology and structural-break analysis to
+separate single-purpose packages in different languages. We present
+\texttt{datacube-rs}, an open-source engine written in Rust that unifies
+temporal data-cube analysis with a validated set of per-pixel temporal
+estimators in a single, portable artifact. It models a cube on the
+$(\text{band}, y, x, \text{time})$ axes with the time dimension innermost,
+enabling zero-copy per-pixel and per-chunk streaming parallelised with Rayon;
+ingests satellite time series directly from STAC catalogues and Cloud-Optimized
+GeoTIFF assets with cross-UTM-zone mosaicking; and provides ordinary-least-squares
+trend, the Theil--Sen slope and tie-corrected Mann--Kendall test, harmonic
+regression for seasonality, and OLS-CUSUM structural-break detection. Every
+estimator is cross-validated to numerical parity against established reference
+implementations (pyMannKendall, SciPy and statsmodels), passing 103 of 103
+checks at a relative tolerance of $10^{-9}$. The same compiled core is delivered
+as a native Rust library, a command-line tool, a Python extension (PyO3) and a
+WebAssembly module that runs in the browser. We report parallel-scaling
+benchmarks and a multiannual Sentinel-2 case study.
+\end{abstract}
+
+\begin{keyword}
+Data cube \sep Satellite image time series \sep Rust \sep STAC \sep
+Mann--Kendall \sep Phenology \sep Structural breaks
+\end{keyword}
+
+\end{frontmatter}
+
+\linenumbers
+
+\section{Introduction}
+\label{sec:intro}
+
+Open satellite archives have turned remote sensing into a fundamentally temporal
+discipline. The full Landsat record and the Sentinel missions are now
+distributed as free, analysis-ready data (ARD) through cloud object storage, and
+a single study area may be covered by hundreds of observations per year. The
+scientific questions that follow are, correspondingly, questions about time: is a
+pixel's vegetation index trending up or down, and is that trend significant; when
+does the growing season start and how is its amplitude changing; and where and
+when does an abrupt disturbance---a fire, a clear-cut, a landslide---break the
+expected seasonal signal. Answering them at scale requires both an efficient way
+to assemble irregularly sampled, cloud-masked image collections into a regular
+space--time cube, and a set of per-pixel statistical estimators applied along the
+temporal axis.
+
+A mature ecosystem addresses the first need. The \emph{gdalcubes} library
+\citep{appel2019gdalcubes} builds on-demand regular data cubes from image
+collections through GDAL, and endorses Cloud-Optimized GeoTIFF (COG) for
+efficient partial reads. The Open Data Cube \citep{lewis2017agdc} provides a
+Python framework for indexing and managing petabyte-scale ARD archives,
+demonstrated on national high-performance infrastructure. The \emph{openEO} API
+\citep{schramm2021openeo} harmonises heterogeneous cloud back-ends behind a
+single, STAC-aligned virtual data-cube interface. \emph{xarray}
+\citep{hoyer2017xarray} supplies the labeled $N$-dimensional array model that
+underpins much of the scientific Python stack, and Google Earth Engine
+\citep{gorelick2017gee} offers planetary-scale analysis to anyone with a browser.
+Together these tools have made cube construction, ARD management and cloud access
+broadly available.
+
+The second need---temporal statistical analysis---is comparatively fragmented.
+Cube engines expose generic reducers and aggregations (mean, median, percentile,
+moving windows) but leave domain estimators to the user: gdalcubes, the Open Data
+Cube, openEO and xarray ship no built-in monotonic-trend test, robust slope,
+harmonic phenology model or structural-break detector, deferring these to
+user-defined functions or external libraries. Google Earth Engine is a partial
+exception---it provides Sen's slope and linear/robust regression reducers---but
+it is a proprietary service whose computation cannot run offline and into whose
+API existing workflows must be rewritten. Among cube tools, FORCE
+\citep{frantz2019force} goes furthest, adding land-surface phenology and linear
+trend analysis to a local ARD store, but it is a heavy C/C++ and
+high-performance-computing stack that writes to a bespoke local grid rather than
+streaming from cloud-native catalogues. Meanwhile the reference temporal methods
+themselves live in separate, single-purpose packages and languages: the
+Mann--Kendall trend-test family and Theil--Sen slope in \emph{pyMannKendall}
+\citep{hussain2019pymannkendall}; the harmonic-plus-trend seasonality model in
+Continuous Change Detection and Classification (CCDC; \citealp{zhu2014ccdc}); and
+breakpoint detection on decomposed series in BFAST \citep{verbesselt2010bfast}. A
+researcher who wants a significance-tested trend map, a phenology fit and a
+disturbance-timing map from the same cube must therefore cross several tools,
+languages and runtimes, and must trust that each per-pixel estimator is correctly
+implemented.
+
+Here we present \texttt{datacube-rs}, an open-source engine, written in Rust,
+that unifies temporal data-cube analysis and a validated set of per-pixel
+temporal estimators in a single, portable artifact. \texttt{datacube-rs} models a
+cube on the $(\text{band}, y, x, \text{time})$ axes with the time dimension
+innermost, so that each pixel's series is a contiguous slice and can be
+streamed---per pixel or by spatial chunk---without copying; per-pixel computation
+is parallelised across cores with Rayon. It ingests scenes directly from STAC
+catalogues and COG assets (reusing the cloud stack of the SurtGIS engine),
+mosaicking across UTM zones onto a common grid. On top of the cube it provides
+ordinary-least-squares trend, the Theil--Sen robust slope and the tie-corrected
+Mann--Kendall test, harmonic (Fourier) regression for seasonality and phenology,
+and structural-break detection by an OLS-CUSUM test with recursive binary
+segmentation---the latter inspired by BFAST's decompose-then-detect strategy,
+though it deliberately uses a different test (OLS-CUSUM rather than BFAST's
+OLS-MOSUM with Bai--Perron selection; see Section~\ref{sec:methods}). Every
+estimator treats missing values as \texttt{NaN} and drops them pairwise, and
+every reported quantity is cross-validated to numerical parity against
+established reference implementations---pyMannKendall, SciPy and
+statsmodels---passing 103 of 103 checks at a relative tolerance of
+$10^{-9}$. The same compiled core is exposed as a native Rust library, a
+command-line tool, a Python extension (via PyO3) and a WebAssembly module that
+runs the estimators in the browser.
+
+The contributions of this paper are:
+\begin{itemize}
+  \item a streaming $(\text{band}, y, x, \text{time})$ cube model whose
+  contiguous time axis enables zero-copy per-pixel and per-chunk iteration,
+  parallelised with Rayon;
+  \item a set of per-pixel temporal estimators---OLS trend, Theil--Sen,
+  tie-corrected Mann--Kendall, harmonic regression and OLS-CUSUM structural
+  breaks---implemented natively and validated to $10^{-9}$ numerical parity
+  against pyMannKendall, SciPy and statsmodels;
+  \item direct ingestion of satellite time series from STAC/COG with
+  cross-UTM-zone mosaicking, plus temporal compositing and gap-filling on the
+  cube;
+  \item a single dependency-light Rust core delivered as four deployment
+  targets---library, CLI, Python and in-browser WebAssembly---with reproducible
+  benchmarks of its parallel scaling.
+\end{itemize}
+
+The remainder of the paper is organised as follows.
+Section~\ref{sec:methods} states the temporal estimators and their reference
+implementations. Section~\ref{sec:engine} describes the \texttt{datacube-rs}
+engine: the cube data model, the streaming iterator and chunking, STAC/COG
+ingestion and the deployment targets. Section~\ref{sec:validation} reports the
+numerical-parity validation, performance benchmarks and a real Sentinel-2 case
+study. Section~\ref{sec:discussion} discusses how \texttt{datacube-rs} relates to
+existing tools and its current limitations, and Section~\ref{sec:conclusions}
+concludes.
+
+\section{Temporal estimators}
+\label{sec:methods}
+% TODO: OLS trend; Theil-Sen + tie-corrected Mann-Kendall (Var(S) formula,
+% cite Kendall 1975 / Mann 1945); harmonic regression (CCDC model, Eq. 3);
+% OLS-CUSUM break test (Brownian-bridge p-value) + binary segmentation.
+% State the OLS-MOSUM (BFAST) vs OLS-CUSUM distinction explicitly.
+
+\section{The datacube-rs engine}
+\label{sec:engine}
+% TODO: Fig. 1 architecture. 3.1 cube model; 3.2 streaming iterator + chunking
+% (Rayon); 3.3 STAC/COG ingest + cross-zone mosaic; 3.4 deployment targets.
+
+\section{Validation and benchmarking}
+\label{sec:validation}
+% TODO: 4.1 numerical parity (103/103, table); 4.2 criterion benchmarks
+% (scaling); 4.3 Sentinel-2 case study (Santiago / UTM 18-19 boundary).
+
+\section{Discussion}
+\label{sec:discussion}
+% TODO: positioning vs gdalcubes/ODC/openEO/GEE/FORCE; what Rust single-binary
+% + WASM buys; limitations + roadmap (GeoZarr backing, compositing).
+
+\section{Conclusions}
+\label{sec:conclusions}
+% TODO
+
+%% --- Back-matter (Elsevier / C&G order) ---
+\section*{CRediT authorship contribution statement}
+\textbf{Francisco Parra:} Conceptualization, Methodology, Software, Validation,
+Writing -- original draft.
+
+\section*{Code availability section}
+\noindent
+Name of the code/library: \texttt{datacube-rs}\\
+Contact: Francisco Parra, francisco.parra.o@usach.cl\\
+Hardware requirements: any x86-64/ARM64 machine; benchmarks on a 16-core laptop\\
+Program language: Rust (with Python bindings via PyO3 and a WebAssembly target)\\
+Software required: Rust toolchain ($\geq$1.94, edition 2024)\\
+Program size: TODO\\
+Source code: \url{https://github.com/franciscoparrao/datacube-rs}\\
+License: MIT OR Apache-2.0\\
+Archived version: TODO (Zenodo DOI)
+
+\section*{Data availability}
+The Sentinel-2 case study uses freely available data from the Microsoft
+Planetary Computer STAC catalogue. The synthetic series and scripts used for the
+numerical-parity validation are included in the source repository.
+
+\section*{Declaration of competing interest}
+The author declares no competing interests.
+
+\section*{Acknowledgements}
+% TODO
+
+\bibliography{refs}
+
+\end{document}

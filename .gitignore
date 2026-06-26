@@ -7,3 +7,14 @@ __pycache__/
 .pytest_cache/
 *.egg-info/
 crates/datacube-wasm/web/pkg/
+papers/draft/*.aux
+papers/draft/*.bbl
+papers/draft/*.blg
+papers/draft/*.log
+papers/draft/*.out
+papers/draft/*.synctex.gz
+papers/draft/*.fdb_latexmk
+papers/draft/*.fls
+papers/draft/*.pdf
+papers/*.pdf
+papers/draft/*.spl
