@@ -162,10 +162,144 @@ concludes.
 
 \section{Temporal estimators}
 \label{sec:methods}
-% TODO: OLS trend; Theil-Sen + tie-corrected Mann-Kendall (Var(S) formula,
-% cite Kendall 1975 / Mann 1945); harmonic regression (CCDC model, Eq. 3);
-% OLS-CUSUM break test (Brownian-bridge p-value) + binary segmentation.
-% State the OLS-MOSUM (BFAST) vs OLS-CUSUM distinction explicitly.
+
+\texttt{datacube-rs} operates on the time series of a single pixel and band,
+$\{(t_i, y_i)\}_{i=1}^{n}$, where $t_i$ is a numeric time coordinate (e.g.\
+fractional years) and $y_i$ the observed value. Cloud-masked or otherwise
+missing observations are encoded as \texttt{NaN}; every estimator first drops
+the non-finite pairs and operates on the remaining finite observations, so that
+the irregular sampling produced by cloud screening is handled without
+interpolation. Because $t_i$ enters the estimators explicitly, unevenly spaced
+series are treated correctly. The estimators reproduce established methods; the
+contribution of this paper is their unified, validated native implementation
+(Section~\ref{sec:engine}--\ref{sec:validation}), not the methods themselves.
+
+\subsection{Linear trend (ordinary least squares)}
+\label{sec:ols}
+The least-squares line $y = a + b\,t$ has slope and intercept
+\begin{equation}
+b = \frac{\sum_i (t_i - \bar t)(y_i - \bar y)}{\sum_i (t_i - \bar t)^2},
+\qquad
+a = \bar y - b\,\bar t,
+\end{equation}
+with $\bar t, \bar y$ the means. We report the coefficient of determination
+$R^2 = 1 - \mathrm{SS_{res}}/\mathrm{SS_{tot}}$, the standard error of the slope
+$\mathrm{se}(b) = \sqrt{\mathrm{SS_{res}}/(n-2)\big/\sum_i (t_i-\bar t)^2}$, and a
+two-sided $p$-value for $H_0\!: b = 0$ from Student's $t$ statistic
+$b/\mathrm{se}(b)$ with $n-2$ degrees of freedom. The OLS slope is efficient but
+sensitive to outliers, which motivates the robust estimators below.
+
+\subsection{Theil--Sen robust slope}
+\label{sec:theilsen}
+The Theil--Sen estimator \citep{theil1950,sen1968} is the median of the slopes
+of all observation pairs,
+\begin{equation}
+b_{\mathrm{TS}} = \operatorname*{median}_{\,t_i \neq t_j}
+  \frac{y_j - y_i}{t_j - t_i},
+\qquad
+a_{\mathrm{TS}} = \operatorname{median}(y) - b_{\mathrm{TS}}\,\operatorname{median}(t),
+\end{equation}
+evaluated over the $\binom{n}{2}$ pairs with distinct time coordinates. It has a
+breakdown point of about $29\%$ and is the slope estimator conventionally paired
+with the Mann--Kendall test.
+
+\subsection{Mann--Kendall trend test}
+\label{sec:mk}
+The Mann--Kendall test \citep{mann1945,kendall1975} assesses the presence of a
+monotonic trend through the statistic
+\begin{equation}
+S = \sum_{i<j} \operatorname{sgn}(y_j - y_i),
+\end{equation}
+where $\operatorname{sgn}$ returns $-1,0,+1$ (ties contribute $0$). For $n$
+observations containing tie groups of sizes $t_p$, the tie-corrected variance is
+\begin{equation}
+\label{eq:varS}
+\operatorname{Var}(S) = \frac{1}{18}\!\left[ n(n-1)(2n+5)
+  - \sum_{p} t_p (t_p - 1)(2 t_p + 5) \right],
+\end{equation}
+and the continuity-corrected standard normal score is
+\begin{equation}
+Z =
+\begin{cases}
+(S-1)/\sqrt{\operatorname{Var}(S)}, & S > 0,\\[2pt]
+0, & S = 0,\\[2pt]
+(S+1)/\sqrt{\operatorname{Var}(S)}, & S < 0.
+\end{cases}
+\end{equation}
+We report Kendall's $\tau = S/\binom{n}{2}$ and the two-sided $p$-value
+$p = 2\,[1-\Phi(|Z|)]$, with $\Phi$ the standard normal CDF; at significance
+level $\alpha$ the trend is declared increasing ($Z>0$) or decreasing ($Z<0$)
+when $p<\alpha$, and absent otherwise. This is the ``original'' tie-corrected
+test as implemented in \texttt{pyMannKendall} \citep{hussain2019pymannkendall},
+against which our implementation is validated to numerical parity
+(Section~\ref{sec:validation}); we note that the variance formula
+\eqref{eq:varS} originates with \citet{mann1945,kendall1975}, the JOSS note being
+the parity target rather than the source of the equations.
+
+\subsection{Harmonic regression}
+\label{sec:harmonic}
+Seasonality and phenology are described by a Fourier-series model with a linear
+trend term,
+\begin{equation}
+\label{eq:harmonic}
+\hat y(t) = a + b\,t
+  + \sum_{k=1}^{K} \Big[ \alpha_k \cos\!\Big(\tfrac{2\pi k t}{P}\Big)
+                       + \beta_k  \sin\!\Big(\tfrac{2\pi k t}{P}\Big) \Big],
+\end{equation}
+where $P$ is the season length (e.g.\ one year) and $K$ the number of harmonics.
+The coefficients are obtained by ordinary least squares, solving the normal
+equations $X^{\!\top}\!X\,\boldsymbol\beta = X^{\!\top} y$; the linear term is
+centred on $\bar t$ for numerical conditioning, and the design matrix is
+checked for rank deficiency (e.g.\ a harmonic aliased by the sampling). Each
+harmonic is summarised by its amplitude and phase,
+\begin{equation}
+A_k = \sqrt{\alpha_k^2 + \beta_k^2}, \qquad
+\varphi_k = \operatorname{atan2}(\beta_k, \alpha_k),
+\end{equation}
+so that the $k$-th component peaks at $t = P\varphi_k/(2\pi k)$ within its
+period---directly interpretable as phenological timing and magnitude. The single
+annual harmonic ($K=1$) with a linear inter-annual term is the seasonality model
+of CCDC \citep{zhu2014ccdc}.
+
+\subsection{Structural break detection}
+\label{sec:breaks}
+Abrupt changes are detected in the spirit of BFAST
+\citep{verbesselt2010bfast}---fit a trend-plus-season model, then test its
+residuals for instability---but with a different test. For a candidate segment we
+fit the model \eqref{eq:harmonic} (optionally trend-only, $K=0$) by OLS, obtain
+residuals $e_i$, and form the OLS-CUSUM process \citep{brown1975,ploberger1992}
+\begin{equation}
+W_k = \frac{1}{\hat\sigma \sqrt{n}} \sum_{i=1}^{k} e_i,
+\qquad
+\hat\sigma^2 = \frac{1}{n-p}\sum_{i=1}^{n} e_i^2,
+\qquad k = 1,\dots,n,
+\end{equation}
+with $p = 2 + 2K$ the number of fitted parameters. The test statistic is the
+supremum $M = \max_k |W_k|$. Under the null of parameter constancy, $W$ converges
+to a standard Brownian bridge, whose supremum has the Kolmogorov distribution,
+giving the $p$-value
+\begin{equation}
+\label{eq:bb}
+\Pr\!\big(\sup|W| > M\big)
+  = 2 \sum_{j=1}^{\infty} (-1)^{j+1} \exp(-2 j^2 M^2),
+\end{equation}
+identical to \texttt{scipy.stats.kstwobign} and to
+\texttt{statsmodels} \texttt{breaks\_cusumolsresid}, against which it is validated
+(Section~\ref{sec:validation}). When a segment tests significant at level
+$\alpha$, a break is placed at $\arg\max_k |W_k|$, constrained so that both sides
+retain at least a minimum number of observations, and the procedure recurses on
+each sub-segment (binary segmentation), yielding the set of break times.
+
+This differs deliberately from BFAST in two respects, which we state explicitly
+because readers familiar with BFAST will expect them. First, BFAST tests for
+instability with an OLS-MOSUM (moving-sum) statistic rather than the OLS-CUSUM
+used here. Second, BFAST estimates the number and position of breaks by the
+dynamic-programming procedure of \citet{baiperron2003} with the number of breaks
+chosen by an information criterion, whereas \texttt{datacube-rs} uses greedy
+binary segmentation. Our choice yields a single, closed-form $p$-value per
+segment \eqref{eq:bb} and an $O(n)$ test that suits per-pixel evaluation over
+large cubes; it is validated against the OLS-CUSUM reference implementation, not
+against the R \texttt{bfast} package.
 
 \section{The datacube-rs engine}
 \label{sec:engine}
