@@ -1,0 +1,32 @@
+cff-version: 1.2.0
+title: "datacube-rs: an open-source Rust engine for streaming temporal analysis of remote-sensing data cubes"
+message: "If you use this software, please cite it using the metadata below."
+type: software
+authors:
+  - given-names: Francisco
+    family-names: Parra
+    affiliation: "Departamento de Ingeniería Informática, Universidad de Santiago de Chile, Santiago, Chile"
+    email: francisco.parra.o@usach.cl
+    # orcid: "https://orcid.org/TODO"   # add the real ORCID before release
+repository-code: "https://github.com/franciscoparrao/datacube-rs"
+license: "MIT OR Apache-2.0"
+version: 0.1.0
+keywords:
+  - data cube
+  - satellite image time series
+  - Rust
+  - STAC
+  - Mann-Kendall
+  - phenology
+  - structural breaks
+  - WebAssembly
+  - remote sensing
+# preferred-citation:   # uncomment and fill once the C&G paper has a DOI
+#   type: article
+#   title: "datacube-rs: An open-source Rust engine for streaming temporal analysis of remote-sensing data cubes"
+#   journal: "Computers & Geosciences"
+#   authors:
+#     - given-names: Francisco
+#       family-names: Parra
+#   year: 2026
+#   doi: "TODO"

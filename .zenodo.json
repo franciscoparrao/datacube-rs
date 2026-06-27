@@ -1,0 +1,36 @@
+{
+  "title": "datacube-rs: an open-source Rust engine for streaming temporal analysis of remote-sensing data cubes",
+  "description": "datacube-rs assembles satellite image time series from STAC/Cloud-Optimized GeoTIFF into a (band, y, x, time) cube and applies per-pixel temporal estimators (OLS and Theil-Sen trend, tie-corrected Mann-Kendall, harmonic regression, OLS-CUSUM structural breaks) as validated native operators. The same Rust core is exposed as a library, a command-line tool, a Python extension (PyO3), and a WebAssembly module. Estimators are cross-validated to 1e-9 numerical parity against pyMannKendall, SciPy, NumPy and statsmodels. Dual-licensed MIT OR Apache-2.0.",
+  "upload_type": "software",
+  "access_right": "open",
+  "license": "MIT",
+  "language": "eng",
+  "creators": [
+    {
+      "name": "Parra, Francisco",
+      "affiliation": "Department of Informatics Engineering, Universidad de Santiago de Chile (USACH), Santiago, Chile",
+      "orcid": "TODO: real ORCID"
+    }
+  ],
+  "keywords": [
+    "data cube",
+    "satellite image time series",
+    "Rust",
+    "STAC",
+    "Cloud-Optimized GeoTIFF",
+    "Mann-Kendall",
+    "Theil-Sen",
+    "phenology",
+    "structural breaks",
+    "WebAssembly",
+    "remote sensing"
+  ],
+  "communities": [],
+  "related_identifiers": [
+    {
+      "identifier": "https://github.com/franciscoparrao/datacube-rs",
+      "relation": "isSupplementTo",
+      "scheme": "url"
+    }
+  ]
+}

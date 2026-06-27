@@ -108,6 +108,13 @@ See [`BENCHMARKS.md`](BENCHMARKS.md). `par_map_series` scales linearly with
 pixel count across the Rayon pool; Theil-Sen and Mann-Kendall are O(n²) per
 pixel and dominate long records.
 
+## Citation
+
+If you use datacube-rs, please cite it via [`CITATION.cff`](CITATION.cff)
+(GitHub's "Cite this repository"). An archived, DOI-bearing version is deposited
+on Zenodo (see `.zenodo.json`).
+
 ## License
 
-MIT OR Apache-2.0
+Dual-licensed under [MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE), at your
+option.
