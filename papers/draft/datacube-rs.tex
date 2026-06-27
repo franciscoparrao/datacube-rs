@@ -435,8 +435,137 @@ or in a browser is computed by identical code.
 
 \section{Validation and benchmarking}
 \label{sec:validation}
-% TODO: 4.1 numerical parity (103/103, table); 4.2 criterion benchmarks
-% (scaling); 4.3 Sentinel-2 case study (Santiago / UTM 18-19 boundary).
+
+We validate \texttt{datacube-rs} in three ways: numerical agreement with
+established reference implementations of each estimator, performance benchmarks
+of the per-pixel estimators and the parallel iterator, and an end-to-end case
+study on a real Sentinel-2 cube.
+
+\subsection{Numerical parity}
+\label{sec:parity}
+Because the estimators reproduce known methods, correctness is established by
+agreement with their reference implementations rather than against a ground
+truth. A validation harness generates deterministic test series---monotonic,
+tied, constant, noisy, seasonal, and gap-containing---and compares every
+reported quantity of \texttt{datacube-rs} against the corresponding value from a
+reference. Trend and slope are checked against \texttt{pyMannKendall}
+\citep{hussain2019pymannkendall} and \texttt{scipy.stats.linregress}; the
+harmonic fit against \texttt{numpy.linalg.lstsq} on the same design matrix; and
+the OLS-CUSUM break statistic and $p$-value against
+\texttt{statsmodels} \texttt{breaks\_cusumolsresid}. Table~\ref{tab:parity}
+summarises the result: all 103 checks agree to within a relative tolerance of
+$10^{-9}$.
+
+\begin{table}[t]
+\centering
+\caption{Numerical-parity validation. Each estimator is compared to its
+reference implementation over deterministic test series; every reported field
+(coefficients, statistics and $p$-values) is one check. All agree to a relative
+tolerance of $10^{-9}$.}
+\label{tab:parity}
+\small
+\begin{tabular}{@{}llcc@{}}
+\toprule
+Estimator & Reference & Series & Checks \\
+\midrule
+Mann--Kendall      & \texttt{pyMannKendall.original\_test} & 7 & 42 \\
+Theil--Sen         & \texttt{pyMannKendall.sens\_slope}    & 7 & 13 \\
+OLS trend          & \texttt{scipy.stats.linregress}       & 6 & 30 \\
+Harmonic regression& \texttt{numpy.linalg.lstsq}           & 1 & 12 \\
+OLS-CUSUM breaks   & \texttt{statsmodels.breaks\_cusumolsresid} & 3 & 6 \\
+\midrule
+\textbf{Total}     &                                       &   & \textbf{103} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Two intentional divergences from the references are worth noting, as they would
+otherwise read as discrepancies. For a constant series \texttt{scipy} returns
+\texttt{NaN} for the coefficient of determination, standard error and $p$-value
+of the regression, where \texttt{datacube-rs} defines the (degenerate) perfect
+fit $R^2 = 1$, $p = 1$; and \texttt{pyMannKendall}'s Sen-slope assumes unit time
+spacing after dropping missing values, whereas \texttt{datacube-rs} retains the
+true time gaps, so for the gap-containing series the Theil--Sen slope is compared
+against the median of pairwise slopes computed on the real coordinates.
+
+\subsection{Performance}
+\label{sec:perf}
+Benchmarks were run with Criterion on a 12th-generation Intel Core i7-1270P
+(16~logical cores) under Rust~1.94. Absolute timings are machine-dependent; the
+relevant quantities are the scaling with series length and with pixel count.
+Table~\ref{tab:perseries} reports the per-series cost of each estimator for
+series of $50$, $230$ and $1000$ observations, spanning roughly two years of
+Sentinel-2 revisit to a dense daily record. The linear and harmonic fits are
+$O(n)$ and remain in the microsecond range; Theil--Sen and Mann--Kendall are
+$O(n^2)$ in the number of finite observations, as expected from the pairwise
+construction, and dominate for long records.
+
+\begin{table}[t]
+\centering
+\caption{Per-series estimator cost (median) for $n = 50$, $230$ and $1000$
+observations.}
+\label{tab:perseries}
+\small
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Estimator & $n{=}50$ & $n{=}230$ & $n{=}1000$ \\
+\midrule
+OLS trend            & $1.4\,\mu$s & $3.8\,\mu$s & $13\,\mu$s \\
+Mann--Kendall        & $3.4\,\mu$s & $51\,\mu$s  & $1.0\,$ms \\
+Theil--Sen           & $26\,\mu$s  & $120\,\mu$s & $5.2\,$ms \\
+Harmonic ($K{=}2$)   & $13\,\mu$s  & $188\,\mu$s & $440\,\mu$s \\
+OLS-CUSUM breaks     & $16\,\mu$s  & $234\,\mu$s & $412\,\mu$s \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+At the cube level, the \texttt{par\_map\_series} primitive was benchmarked on
+cubes of $64^2$, $128^2$ and $256^2$ pixels over $60$ time steps
+(Table~\ref{tab:scaling}). Wall-clock time grows in proportion to the pixel
+count---throughput stays within the same band as the grid grows sixteen-fold,
+from $4$k to $65$k pixels---confirming that the iterator scales linearly with
+the Rayon pool and that the cost is set by the per-pixel estimator rather than by
+parallel overhead. A Theil--Sen-plus-Mann--Kendall trend map of a $256^2$ cube
+completes in about $0.6$\,s on this laptop. The temporal transforms over a
+$128^2\times120$ cube take $11$\,ms (median monthly composite) and $12$\,ms
+(linear gap-fill); compositing parallelises well, whereas gap-filling is
+memory-bandwidth bound and gains little from threading.
+
+\begin{table}[t]
+\centering
+\caption{Wall-clock time of \texttt{par\_map\_series} over $(1, n_y, n_x, 60)$
+cubes, Rayon-parallel across 16 cores.}
+\label{tab:scaling}
+\small
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Estimator & $64^2$ & $128^2$ & $256^2$ \\
+\midrule
+Theil--Sen     & $44\,$ms & $116\,$ms & $581\,$ms \\
+Mann--Kendall  & $33\,$ms & $70\,$ms  & $326\,$ms \\
+Harmonic ($K{=}2$) & $51\,$ms & $140\,$ms & $808\,$ms \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Case study: a cross-zone Sentinel-2 cube}
+\label{sec:casestudy}
+To exercise the full ingestion-to-analysis path we built a cube over a small
+area on the boundary between UTM zones 18S and 19S near Santiago, Chile
+($-72^\circ$ longitude), from the Sentinel-2 L2A collection on the Microsoft
+Planetary Computer. Querying the red band over the first half of 2024 with a
+$50\%$ cloud-cover threshold returns scenes tiled in both zones. With cross-zone
+mosaicking enabled, \texttt{datacube-rs} reprojects the neighbouring-zone tiles
+onto the reference grid and assembles $31$ usable time slices ($15$ from zone~19
+and $16$ reprojected from zone~18); with mosaicking disabled the same query
+yields only $15$ slices, the zone-18 tiles being skipped. Cross-zone mosaicking
+thus doubles the usable temporal depth for an area that straddles a zone
+boundary---a common situation for study areas that are not chosen to fit the
+satellite tiling. From the resulting cube, per-pixel Theil--Sen slope,
+Mann--Kendall significance and OLS-CUSUM break maps are produced and written as
+georeferenced GeoTIFFs in a single command. This is a demonstration of the
+workflow rather than a domain study; the estimators it applies are those
+validated in Section~\ref{sec:parity}.
 
 \section{Discussion}
 \label{sec:discussion}
