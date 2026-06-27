@@ -8,12 +8,23 @@
 \usepackage{booktabs}
 \usepackage{graphicx}
 \usepackage{xcolor}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,fit,backgrounds}
 \modulolinenumbers[5]
+
+%% Fig. 1 styles
+\tikzset{
+  stage/.style={draw, rounded corners=2pt, align=center, font=\small,
+    inner sep=4pt, minimum height=8mm, fill=blue!4},
+  core/.style={stage, fill=green!6},
+  outbox/.style={stage, fill=orange!6},
+  flow/.style={-{Stealth[length=2mm]}, thick},
+}
 
 \journal{Computers \& Geosciences}
 
-%% Numbered reference style (C&G)
-\bibliographystyle{elsarticle-num}
+%% Numbered reference style with author names available for textual cites (C&G)
+\bibliographystyle{elsarticle-num-names}
 
 \begin{document}
 
@@ -303,8 +314,124 @@ against the R \texttt{bfast} package.
 
 \section{The datacube-rs engine}
 \label{sec:engine}
-% TODO: Fig. 1 architecture. 3.1 cube model; 3.2 streaming iterator + chunking
-% (Rayon); 3.3 STAC/COG ingest + cross-zone mosaic; 3.4 deployment targets.
+
+\texttt{datacube-rs} is a Rust workspace (edition 2024) organised as a compute
+core with no input/output, a cloud-ingestion crate, and three thin frontends.
+The core, \texttt{datacube-core}, holds the cube data model, the streaming
+iterators, and the estimators of Section~\ref{sec:methods}; it depends only on
+\texttt{ndarray}, \texttt{rayon}, and \texttt{libm}, and implements the
+least-squares normal equations and the special functions (error and incomplete
+beta functions for the $p$-values) directly, with no linear-algebra dependency.
+Figure~\ref{fig:arch} shows the dataflow from satellite scenes to per-pixel
+results and the frontends that wrap the shared core.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[node distance=4.5mm]
+  \node[stage] (src) {STAC catalogue $+$ COG assets\\\footnotesize (Planetary Computer / Earth Search)};
+  \node[stage, below=of src] (io) {\texttt{datacube-io}: search $\rightarrow$ cloud filter\\$\rightarrow$ windowed COG read $\rightarrow$ UTM reproject\\$+$ cross-zone mosaic $\rightarrow$ grid align};
+  \node[core, below=of io] (cube) {\textbf{Cube} $(\mathrm{band}, y, x, t)$\\\footnotesize contiguous time axis, \texttt{NaN} nodata};
+  \node[core, below=of cube] (iter) {Streaming iterators\\\footnotesize \texttt{iter\_series} $\cdot$ \texttt{par\_map\_series} (Rayon) $\cdot$ \texttt{chunks}};
+  \node[core, below=of iter, text width=82mm] (ops) {Estimators: OLS $\cdot$ Theil--Sen $\cdot$ Mann--Kendall $\cdot$ harmonic $\cdot$ OLS-CUSUM\\[2pt]Transforms: temporal composite $\cdot$ linear gap-fill};
+  \node[outbox, below=of ops] (outp) {Outputs: GeoTIFF trend / break maps $\cdot$ JSON reports};
+
+  \draw[flow] (src) -- (io);
+  \draw[flow] (io) -- (cube);
+  \draw[flow] (cube) -- (iter);
+  \draw[flow] (iter) -- (ops);
+  \draw[flow] (ops) -- (outp);
+
+  \begin{scope}[on background layer]
+    \node[draw, dashed, rounded corners, fit=(cube)(iter)(ops),
+      inner sep=6pt, label={[font=\footnotesize\itshape]right:datacube-core}] {};
+  \end{scope}
+
+  \node[stage, right=14mm of iter, text width=24mm, fill=gray!6] (tgt)
+    {\footnotesize Frontends:\\Rust lib\\CLI\\Python (PyO3)\\WASM};
+  \draw[flow, dashed] (tgt) -- (iter);
+\end{tikzpicture}
+\caption{Architecture of \texttt{datacube-rs}. Scenes are ingested from STAC/COG
+by \texttt{datacube-io}, assembled into a $(\mathrm{band}, y, x, t)$ cube whose
+innermost time axis makes each pixel series contiguous, streamed through the
+per-pixel/chunk iterators, and reduced by the temporal estimators and
+transforms. The compute core (dashed) is exposed unchanged through four
+frontends.}
+\label{fig:arch}
+\end{figure}
+
+\subsection{Cube data model}
+\label{sec:model}
+A cube is a four-dimensional array on the axes $(\mathrm{band}, y, x, t)$ with
+the time dimension \emph{innermost}, paired with a numeric time coordinate
+vector and a list of band names. Placing time last means that the complete
+series of a pixel occupies a contiguous region of memory: it can be borrowed as
+a slice and passed to an estimator with no copy and no gather. The constructor
+validates that the coordinate lengths match the array extents and, if necessary,
+copies the data into standard (row-major) layout so the contiguity guarantee
+holds. Missing observations are represented as \texttt{NaN}, which the estimators
+drop pairwise (Section~\ref{sec:methods}); no separate mask array is carried.
+
+\subsection{Streaming iteration and parallel evaluation}
+\label{sec:streaming}
+Three access patterns are built on the contiguous layout. \texttt{iter\_series}
+yields every pixel series of a band in row-major order as a zero-copy view;
+\texttt{chunks} yields spatial tiles (all bands and times) for blocked
+processing; and \texttt{par\_map\_series}---the central primitive for per-pixel
+analysis---applies a closure $f(\mathbf{t}, \mathbf{y})$ to every pixel series in
+parallel with Rayon and collects the results into a $(y, x)$ grid. A trend map is
+thus expressed as a single call whose closure invokes the relevant estimator;
+because the worker threads read disjoint contiguous slices and write disjoint
+output cells, no locking is required. Section~\ref{sec:validation} shows that
+throughput scales with the core count, so the cost is set by the per-pixel
+estimator rather than by parallel overhead.
+
+\subsection{Temporal compositing and gap-filling}
+\label{sec:transforms}
+Two cube-to-cube transforms support pre-processing. Compositing groups time
+slices---either those sharing a time coordinate (e.g.\ adjacent satellite tiles
+acquired in the same overpass) or fixed-width temporal bins such as months---and
+reduces each group per pixel with a \texttt{NaN}-aware median, mean, minimum, or
+maximum; the median composite is the standard cloud-robust reduction. Linear
+gap-filling interpolates \texttt{NaN} runs along time from the nearest finite
+observations on each side, leaving gaps wider than a configurable limit (and the
+series ends) untouched, so that no value is extrapolated. Both transforms run in
+parallel over pixels.
+
+\subsection{Cube ingestion from STAC and COG}
+\label{sec:ingest}
+The \texttt{datacube-io} crate assembles a cube directly from a satellite
+archive. Given a collection, a WGS84 bounding box, a date range, and a list of
+asset (band) keys, it queries a STAC API---Microsoft Planetary Computer, Element
+84 Earth Search, or any STAC endpoint---optionally discarding scenes above a
+cloud-cover threshold. For each retained scene it signs the asset URL when
+required (Planetary Computer shared-access signatures), reads the Cloud-Optimized
+GeoTIFF windowed to the bounding box (optionally at a coarser overview level for
+speed), and masks the nodata value to \texttt{NaN}. The first scene read defines
+a reference grid; subsequent scenes are reprojected and resampled onto it, and
+scenes lying in a neighbouring UTM zone are mosaicked across the zone boundary
+rather than discarded. Acquisition timestamps are converted to fractional years
+so that an annual cycle has unit period, matching the harmonic model of
+Section~\ref{sec:harmonic}. The heavy machinery---HTTP range reads, TIFF
+decoding, signature handling, and UTM reprojection---is reused from the SurtGIS
+engine's cloud stack, keeping \texttt{datacube-io} a thin assembly layer; it is
+an optional build feature so that the core and frontends compile without it.
+
+\subsection{Deployment targets}
+\label{sec:targets}
+The same compiled core is delivered through four frontends. As a \emph{Rust
+library} it is embedded directly in other tools. The \emph{command-line}
+program exposes the per-series estimators on CSV input and, with the ingestion
+feature enabled, a \texttt{stack} command that searches, assembles, and writes
+GeoTIFF trend- and break-map products in one step. The \emph{Python} extension
+(built with PyO3) presents the estimators and a cube class over NumPy arrays;
+because the Rayon workers touch no Python objects, the global interpreter lock is
+released during per-pixel evaluation, so a trend map of a moderate cube completes
+in well under a second from Python (Section~\ref{sec:validation}). The
+\emph{WebAssembly} module exposes the per-series estimators to JavaScript and
+powers an in-browser demonstration that fits a harmonic model and detects breaks
+on a synthetic series with no server-side computation. All targets share one
+implementation, so a result obtained at the command line, in a Python notebook,
+or in a browser is computed by identical code.
 
 \section{Validation and benchmarking}
 \label{sec:validation}
