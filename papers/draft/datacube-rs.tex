@@ -432,9 +432,11 @@ scenes lying in a neighbouring UTM zone are mosaicked across the zone boundary
 rather than discarded. Acquisition timestamps are converted to fractional years
 so that an annual cycle has unit period, matching the harmonic model of
 Section~\ref{sec:harmonic}. The heavy machinery---HTTP range reads, TIFF
-decoding, signature handling, and UTM reprojection---is reused from the SurtGIS
-engine's cloud stack, keeping \texttt{datacube-io} a thin assembly layer; it is
-an optional build feature so that the core and frontends compile without it.
+decoding, signature handling, and UTM reprojection---is reused from the
+open-source SurtGIS engine's cloud stack \citep{surtgis}, keeping
+\texttt{datacube-io} a thin assembly layer; it is an optional build feature, so
+the core and frontends compile without it, and both engines are publicly
+available, so the ingestion path is fully reproducible.
 
 \subsection{Deployment targets}
 \label{sec:targets}
@@ -711,8 +713,9 @@ Rust API level rather than through a scripting interface. Ingestion is built on
 Cloud-Optimized GeoTIFF; a GeoZarr backing store---an emerging analysis-ready
 standard that several Sentinel and Landsat collections are adopting---is planned
 but not yet implemented. Cross-zone mosaicking handles UTM-to-UTM reprojection
-only, and the ingestion crate reuses the SurtGIS cloud stack as an optional
-dependency. Finally, the case study of Section~\ref{sec:casestudy} demonstrates
+only, and the ingestion crate reuses the (open-source) SurtGIS cloud stack as an
+optional dependency. Finally, the case study of Section~\ref{sec:casestudy}
+demonstrates
 the workflow rather than a domain application; a full scientific evaluation is
 left to users of the tool.
 
@@ -762,7 +765,10 @@ Archived version: TODO (Zenodo DOI)
 \section*{Data availability}
 The Sentinel-2 case study uses freely available data from the Microsoft
 Planetary Computer STAC catalogue. The synthetic series and scripts used for the
-numerical-parity validation are included in the source repository.
+numerical-parity and controlled-recovery experiments are included in the source
+repository. The ingestion path depends on the open-source SurtGIS engine
+\citep{surtgis}, also publicly available, so all results are reproducible from
+public code.
 
 \section*{Declaration of generative AI and AI-assisted technologies}
 During the preparation of this work the author used an AI assistant (Anthropic
