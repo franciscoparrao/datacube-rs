@@ -18,3 +18,4 @@ papers/draft/*.fls
 papers/draft/*.pdf
 papers/*.pdf
 papers/draft/*.spl
+papers/draft/figures/*.png

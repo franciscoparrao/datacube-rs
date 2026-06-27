@@ -66,6 +66,15 @@ Mann--Kendall \sep Phenology \sep Structural breaks
 
 \end{frontmatter}
 
+\section*{Highlights}
+\begin{itemize}\setlength{\itemsep}{0pt}
+  \item Open-source Rust engine for temporal analysis of satellite image time series.
+  \item Trend, Mann--Kendall, harmonic and structural-break estimators as native operators.
+  \item Streaming (band,\,y,\,x,\,time) cube with zero-copy, Rayon-parallel per-pixel iteration.
+  \item Ingests STAC and Cloud-Optimized GeoTIFF with cross-UTM-zone mosaicking.
+  \item One core as library, CLI, Python and WebAssembly; validated to $10^{-9}$ parity.
+\end{itemize}
+
 \linenumbers
 
 \section{Introduction}
@@ -144,22 +153,33 @@ $10^{-9}$. The same compiled core is exposed as a native Rust library, a
 command-line tool, a Python extension (via PyO3) and a WebAssembly module that
 runs the estimators in the browser.
 
-The contributions of this paper are:
+The estimators themselves are established methods, and we make no claim of
+statistical novelty for them. The computer-science contribution is the
+\emph{engine}: an architecture that turns those estimators into first-class,
+numerically validated operators over cloud-native data cubes, streamed and
+parallelised by construction and deployable without a runtime. Concretely, the
+contributions are:
 \begin{itemize}
   \item a streaming $(\text{band}, y, x, \text{time})$ cube model whose
-  contiguous time axis enables zero-copy per-pixel and per-chunk iteration,
-  parallelised with Rayon;
-  \item a set of per-pixel temporal estimators---OLS trend, Theil--Sen,
-  tie-corrected Mann--Kendall, harmonic regression and OLS-CUSUM structural
-  breaks---implemented natively and validated to $10^{-9}$ numerical parity
-  against pyMannKendall, SciPy and statsmodels;
+  contiguous time axis enables zero-copy, lock-free per-pixel and per-chunk
+  iteration parallelised with Rayon, so that temporal statistics over a cube are
+  expressed as a single parallel map;
+  \item the integration of trend, robust-slope, monotonic-trend-test, harmonic
+  and structural-break estimators as native operators, cross-validated to
+  $10^{-9}$ numerical parity against pyMannKendall, SciPy, NumPy and statsmodels
+  and characterised against known ground truth---a level of verification that is
+  hard to assert for analyses assembled from user-defined functions;
   \item direct ingestion of satellite time series from STAC/COG with
   cross-UTM-zone mosaicking, plus temporal compositing and gap-filling on the
   cube;
-  \item a single dependency-light Rust core delivered as four deployment
-  targets---library, CLI, Python and in-browser WebAssembly---with reproducible
-  benchmarks of its parallel scaling.
+  \item a single dependency-light Rust core delivered, without modification, as
+  four deployment targets---library, CLI, Python and in-browser
+  WebAssembly---with reproducible benchmarks of its parallel scaling.
 \end{itemize}
+The novelty is therefore architectural and integrative rather than
+algorithmic: no existing tool offers this set of temporal estimators as
+validated native operators over a streaming, cloud-native, multi-target cube
+engine (Section~\ref{sec:related}).
 
 The remainder of the paper is organised as follows.
 Section~\ref{sec:methods} states the temporal estimators and their reference
@@ -436,10 +456,57 @@ or in a browser is computed by identical code.
 \section{Validation and benchmarking}
 \label{sec:validation}
 
-We validate \texttt{datacube-rs} in three ways: numerical agreement with
-established reference implementations of each estimator, performance benchmarks
-of the per-pixel estimators and the parallel iterator, and an end-to-end case
-study on a real Sentinel-2 cube.
+We validate \texttt{datacube-rs} in four ways: a controlled recovery experiment
+against known ground truth, numerical agreement with established reference
+implementations of each estimator, performance benchmarks of the per-pixel
+estimators and the parallel iterator, and an end-to-end case study on a real
+Sentinel-2 cube.
+
+\subsection{Controlled recovery against ground truth}
+\label{sec:recovery}
+Numerical parity (Section~\ref{sec:parity}) establishes that the estimators are
+computed correctly, but not how well they recover a signal under realistic
+noise and cloud gaps. We therefore run a Monte-Carlo recovery experiment with
+known ground truth. Synthetic monthly NDVI-like series (six years, $72$
+observations) are generated as a baseline plus a known linear trend
+($0.02\,\mathrm{yr}^{-1}$), an annual harmonic (amplitude $0.20$), Gaussian noise
+of standard deviation $\sigma$, and, where applicable, an abrupt step of known
+magnitude and time; a fraction of observations is removed at random to emulate
+cloud gaps. Each configuration is repeated over $300$ realisations.
+Figure~\ref{fig:recovery} reports the outcome.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\textwidth]{figures/recovery.pdf}
+\caption{Controlled recovery against known ground truth ($300$ realisations per
+point). (a) Theil--Sen slope error grows smoothly with noise and stays small
+relative to the true slope ($0.02\,\mathrm{yr}^{-1}$). (b) The Mann--Kendall
+test, applied to a monotonic series, has near-unit power up to moderate noise
+and degrades gracefully; the break detector's false-positive rate on
+break-free series stays below the nominal $\alpha = 0.05$, i.e.\ it is
+conservative. (c) Break-detection rate rises with disturbance magnitude:
+realistic NDVI drops ($\gtrsim 0.25$, typical of fire or clear-cut) are detected
+reliably under $10\%$ gaps, with detection weakening as gaps reach $40\%$.
+Detected breaks are localised to within one month (median timing error
+$0.083\,\mathrm{yr}$).}
+\label{fig:recovery}
+\end{figure}
+
+The Theil--Sen slope is recovered with low error (root-mean-square error from
+$0.004$ to $0.011\,\mathrm{yr}^{-1}$ across $\sigma = 0.02$ to $0.14$) and a
+small negative bias of about $0.0025\,\mathrm{yr}^{-1}$ that arises from the
+seasonal--gap interaction. The Mann--Kendall test, applied to a monotonic series
+as intended, has power near $1.0$ up to $\sigma \approx 0.08$ and $0.57$ at
+$\sigma = 0.14$ (for strongly seasonal series the harmonic model should be fitted
+first, or a seasonal Mann--Kendall variant used). The break detector is
+conservative---its false-positive rate on stable series is below $\alpha$ at
+every noise level---and recovers abrupt changes of realistic magnitude: at
+$\sigma = 0.05$ and $10\%$ gaps the detection rate exceeds $0.9$ for steps of
+$0.25$ and saturates by $0.30$, with the break localised to within one month.
+Detection of small ($<0.2$) steps and detection under heavy ($40\%$) gaps are
+the regimes where power is limited, consistent with the use of an OLS-CUSUM test
+rather than the more powerful but costlier procedures of
+Section~\ref{sec:breaks}.
 
 \subsection{Numerical parity}
 \label{sec:parity}
@@ -696,6 +763,14 @@ Archived version: TODO (Zenodo DOI)
 The Sentinel-2 case study uses freely available data from the Microsoft
 Planetary Computer STAC catalogue. The synthetic series and scripts used for the
 numerical-parity validation are included in the source repository.
+
+\section*{Declaration of generative AI and AI-assisted technologies}
+During the preparation of this work the author used an AI assistant (Anthropic
+Claude) to assist with software development, drafting and language editing. All
+algorithms, the numerical-parity and recovery experiments, the figures and
+tables, and every cited reference were specified, executed, verified and
+reviewed by the author, who takes full responsibility for the content of the
+publication. All source code is openly available for independent inspection.
 
 \section*{Declaration of competing interest}
 The author declares no competing interests.
