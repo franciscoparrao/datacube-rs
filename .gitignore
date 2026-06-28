@@ -19,3 +19,4 @@ papers/draft/*.pdf
 papers/*.pdf
 papers/draft/*.spl
 papers/draft/figures/*.png
+papers/draft/figures/*.npz

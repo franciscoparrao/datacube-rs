@@ -617,24 +617,50 @@ Harmonic ($K{=}2$) & $51\,$ms & $140\,$ms & $808\,$ms \\
 \end{tabular}
 \end{table}
 
-\subsection{Case study: a cross-zone Sentinel-2 cube}
+\subsection{Case study: dating and recovery of the 2023 Chile wildfires}
 \label{sec:casestudy}
-To exercise the full ingestion-to-analysis path we built a cube over a small
-area on the boundary between UTM zones 18S and 19S near Santiago, Chile
-($-72^\circ$ longitude), from the Sentinel-2 L2A collection on the Microsoft
-Planetary Computer. Querying the red band over the first half of 2024 with a
-$50\%$ cloud-cover threshold returns scenes tiled in both zones. With cross-zone
-mosaicking enabled, \texttt{datacube-rs} reprojects the neighbouring-zone tiles
-onto the reference grid and assembles $31$ usable time slices ($15$ from zone~19
-and $16$ reprojected from zone~18); with mosaicking disabled the same query
-yields only $15$ slices, the zone-18 tiles being skipped. Cross-zone mosaicking
-thus doubles the usable temporal depth for an area that straddles a zone
-boundary---a common situation for study areas that are not chosen to fit the
-satellite tiling. From the resulting cube, per-pixel Theil--Sen slope,
-Mann--Kendall significance and OLS-CUSUM break maps are produced and written as
-georeferenced GeoTIFFs in a single command. This is a demonstration of the
-workflow rather than a domain study; the estimators it applies are those
-validated in Section~\ref{sec:parity}.
+To exercise the engine on a real problem we ask, over a forest landscape near
+Santa Juana (Biob\'io region, central-southern Chile) that was severely affected
+by the catastrophic wildfires of early February 2023: \emph{where and when did
+vegetation undergo abrupt loss, and how is it recovering?} We assembled a
+monthly Sentinel-2 L2A NDVI cube ($58 \times 55$ pixels at $100$\,m, $66$ time
+steps, September~2022 to March~2024) from the Microsoft Planetary Computer,
+masking clouds and shadows with the scene-classification band. For each pixel we
+ran the OLS-CUSUM break detector ($K=1$ harmonic) to locate and date the
+disturbance, and the Theil--Sen estimator on the post-disturbance window to map
+recovery. Standard STAC tooling was used to build the NDVI array, so the case
+study is reproducible independently of the optional ingestion crate; the
+analysis is \texttt{datacube-rs}.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\textwidth]{figures/casestudy.pdf}
+\caption{Dating and recovery of the February~2023 wildfires over a forest
+landscape near Santa Juana, Chile, from a Sentinel-2 NDVI cube analysed with
+\texttt{datacube-rs}. (a) NDVI time series of a burned and an unburned pixel;
+the burned pixel collapses at the fire (dotted line, February~2023) and recovers
+partially through 2024. (b) Per-pixel first-break time from the OLS-CUSUM
+detector: the burn scar is a coherent cluster dated to early 2023. (c)
+Post-fire Theil--Sen recovery slope (NDVI\,yr$^{-1}$): positive (green) over most
+of the scar, resolving the spatial pattern of regrowth.}
+\label{fig:casestudy}
+\end{figure}
+
+Figure~\ref{fig:casestudy} shows the result. A burned pixel's NDVI collapses
+from $\sim\!0.5$ to $\sim\!0.05$ within a single month at the fire, against a
+seasonally varying but stable unburned pixel (panel a). The break detector
+flags an abrupt change in $31\%$ of the pixels---the burned fraction of the
+scene---and dates it to a median of $2023.09$, with $94\%$ of the detected
+breaks falling in January--March~2023, recovering the fire timing without any
+prior knowledge of the event; the median NDVI drop across the break is $-0.31$
+(panels a,b). The post-fire Theil--Sen slope is positive over most of the burn
+scar (median $+0.06\,\mathrm{NDVI\,yr^{-1}}$), quantifying the partial vegetation
+recovery through 2024 and resolving its spatial heterogeneity (panel c). The
+analysis---dating a disturbance and mapping its recovery from a cloud-masked
+satellite time series---uses the two estimators that distinguish
+\texttt{datacube-rs} from the generic reducers of existing cube tools, and runs
+on the cube in seconds. (Cross-UTM-zone mosaicking, exercised separately, is not
+needed here as the area lies within a single zone.)
 
 \section{Discussion}
 \label{sec:discussion}
@@ -714,10 +740,12 @@ Cloud-Optimized GeoTIFF; a GeoZarr backing store---an emerging analysis-ready
 standard that several Sentinel and Landsat collections are adopting---is planned
 but not yet implemented. Cross-zone mosaicking handles UTM-to-UTM reprojection
 only, and the ingestion crate reuses the (open-source) SurtGIS cloud stack as an
-optional dependency. Finally, the case study of Section~\ref{sec:casestudy}
-demonstrates
-the workflow rather than a domain application; a full scientific evaluation is
-left to users of the tool.
+optional dependency. Finally, the wildfire case study
+(Section~\ref{sec:casestudy}) is a single-region application at coarse
+($100$\,m) resolution intended to demonstrate the estimators end-to-end on a
+real problem; a multi-site assessment at native resolution, and validation of
+the recovered burn dates against an independent fire perimeter product, are left
+to users of the tool.
 
 \subsection{Outlook}
 Planned work follows directly from these limitations: a GeoZarr/STAC-Zarr backing
