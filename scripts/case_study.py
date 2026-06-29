@@ -59,7 +59,28 @@ def load_ndvi_cube():
     return ndvi, tfrac
 
 
+def validate_modis():
+    """External check: MODIS MCD64A1 burn dates over the AOI (independent
+    product). Confirms the datacube-rs break dates (run with --modis)."""
+    cat = pystac_client.Client.open(
+        "https://planetarycomputer.microsoft.com/api/stac/v1",
+        modifier=pc.sign_inplace)
+    items = list(cat.search(collections=["modis-64A1-061"], bbox=BBOX,
+                            datetime="2023-01-01/2023-06-30").items())
+    ds = odc_load(items, bands=["Burn_Date"], bbox=BBOX, resolution=500,
+                  groupby="solar_day")
+    bd = ds["Burn_Date"].values
+    burned = bd[bd > 0].astype(float)
+    ty = 2023 + (burned - 1) / 365
+    print(f"MODIS MCD64A1: burn DOY {burned.min():.0f}-{burned.max():.0f} "
+          f"(median {np.median(burned):.0f}); fractional-year median {np.median(ty):.3f}; "
+          f"AOI burned {100*(bd > 0).any(axis=0).mean():.0f}%")
+
+
 def main():
+    if "--modis" in sys.argv:
+        validate_modis()
+        return
     verify = "--verify" in sys.argv
     ndvi, t = load_ndvi_cube()
     # estimators expect f64; NDVI is computed as f32

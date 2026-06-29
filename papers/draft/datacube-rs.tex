@@ -44,7 +44,7 @@ generic reducers, leaving trend, phenology and structural-break analysis to
 separate single-purpose packages in different languages. We present
 \texttt{datacube-rs}, an open-source engine written in Rust that unifies
 temporal data-cube analysis with a validated set of per-pixel temporal
-estimators in a single, portable artifact. It models a cube on the
+estimators in one compiled core. It models a cube on the
 $(\text{band}, y, x, \text{time})$ axes with the time dimension innermost,
 enabling zero-copy per-pixel and per-chunk streaming parallelised with Rayon;
 ingests satellite time series directly from STAC catalogues and Cloud-Optimized
@@ -53,10 +53,13 @@ trend, the Theil--Sen slope and tie-corrected Mann--Kendall test, harmonic
 regression for seasonality, and OLS-CUSUM structural-break detection. Every
 estimator is cross-validated to numerical parity against established reference
 implementations (pyMannKendall, SciPy and statsmodels), passing 103 of 103
-checks at a relative tolerance of $10^{-9}$. The same compiled core is delivered
-as a native Rust library, a command-line tool, a Python extension (PyO3) and a
-WebAssembly module that runs in the browser. We report parallel-scaling
-benchmarks and a multiannual Sentinel-2 case study.
+checks at a relative tolerance of $10^{-9}$, and characterised against known
+ground truth. The same compiled core is delivered as a native Rust library, a
+command-line tool, a Python extension (PyO3) and a WebAssembly module that runs
+in the browser, with results agreeing across targets to $2.8\times10^{-15}$. We
+report parallel-scaling benchmarks and a case study that dates the February~2023
+Chilean wildfires from a Sentinel-2 cube, recovering the timing to within days
+of an independent burned-area product.
 \end{abstract}
 
 \begin{keyword}
@@ -440,7 +443,14 @@ decoding, signature handling, and UTM reprojection---is reused from the
 open-source SurtGIS engine's cloud stack \citep{surtgis}, keeping
 \texttt{datacube-io} a thin assembly layer; it is an optional build feature, so
 the core and frontends compile without it, and both engines are publicly
-available, so the ingestion path is fully reproducible.
+available, so the ingestion path is fully reproducible. The cross-zone
+mosaicking is consequential in practice: for a small area straddling the
+UTM~18S/19S boundary near Santiago ($-72^\circ$), a Sentinel-2 query over the
+first half of 2024 returns scenes tiled in both zones, and mosaicking the
+neighbouring-zone tiles onto the reference grid yields $31$ usable time slices
+($15$ from zone~19 plus $16$ reprojected from zone~18) where discarding them
+leaves only $15$---doubling the temporal depth for a study area that does not
+fit the satellite tiling.
 
 \subsection{Deployment targets}
 \label{sec:targets}
@@ -673,9 +683,12 @@ steps, September~2022 to March~2024) from the Microsoft Planetary Computer,
 masking clouds and shadows with the scene-classification band. For each pixel we
 ran the OLS-CUSUM break detector ($K=1$ harmonic) to locate and date the
 disturbance, and the Theil--Sen estimator on the post-disturbance window to map
-recovery. Standard STAC tooling was used to build the NDVI array, so the case
-study is reproducible independently of the optional ingestion crate; the
-analysis is \texttt{datacube-rs}.
+recovery. The index was assembled from the red and near-infrared assets with
+standard STAC tooling, because \texttt{datacube-io} stacks raw bands and
+band-arithmetic such as NDVI is a planned addition (Section~\ref{sec:limitations});
+the case study is thus reproducible independently of the optional ingestion
+crate, and the analysis---the part this paper contributes---is
+\texttt{datacube-rs}.
 
 \begin{figure}[t]
 \centering
@@ -700,12 +713,20 @@ breaks falling in January--March~2023, recovering the fire timing without any
 prior knowledge of the event; the median NDVI drop across the break is $-0.31$
 (panels a,b). The post-fire Theil--Sen slope is positive over most of the burn
 scar (median $+0.06\,\mathrm{NDVI\,yr^{-1}}$), quantifying the partial vegetation
-recovery through 2024 and resolving its spatial heterogeneity (panel c). The
+recovery through 2024 and resolving its spatial heterogeneity (panel c).
+
+The recovered dates agree with an independent source. The MODIS MCD64A1
+burned-area product \citep{giglio2018mcd64}---a different sensor and detection
+algorithm---dates burning
+in this area to day-of-year $33$--$41$ (2--10~February~2023), a median of
+$2023.090$, against the \texttt{datacube-rs} median break time of $2023.09$; the
+burned fraction it reports ($38\%$ at $500$\,m) is consistent with the $31\%$
+found here at $100$\,m. The break detector thus recovers the fire timing to
+within days of an independent product, with no prior knowledge of the event. The
 analysis---dating a disturbance and mapping its recovery from a cloud-masked
 satellite time series---uses the two estimators that distinguish
 \texttt{datacube-rs} from the generic reducers of existing cube tools, and runs
-on the cube in seconds. (Cross-UTM-zone mosaicking, exercised separately, is not
-needed here as the area lies within a single zone.)
+on the cube in seconds.
 
 \section{Discussion}
 \label{sec:discussion}
@@ -785,10 +806,11 @@ BFAST's OLS-MOSUM test with simultaneous Bai--Perron breakpoint estimation
 \citep{verbesselt2010bfast,baiperron2003}, and may be less powerful for closely
 spaced breaks. The set of estimators is fixed: unlike openEO's process graphs or
 the user-defined functions of gdalcubes and Earth Engine, extensibility is at the
-Rust API level rather than through a scripting interface. Ingestion is built on
-Cloud-Optimized GeoTIFF; a GeoZarr backing store---an emerging analysis-ready
-standard that several Sentinel and Landsat collections are adopting---is planned
-but not yet implemented. Cross-zone mosaicking handles UTM-to-UTM reprojection
+Rust API level rather than through a scripting interface. Ingestion stacks raw assets; band arithmetic such as
+NDVI must currently be computed before or after stacking (as in the case
+study), and a derived-index step in the ingestion path is planned. A GeoZarr
+backing store---an emerging analysis-ready standard that several Sentinel and
+Landsat collections are adopting---is likewise planned but not yet implemented. Cross-zone mosaicking handles UTM-to-UTM reprojection
 only, and the ingestion crate reuses the (open-source) SurtGIS cloud stack as an
 optional dependency. Finally, the wildfire case study
 (Section~\ref{sec:casestudy}) is a single-region application at coarse
