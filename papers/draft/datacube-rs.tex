@@ -522,7 +522,11 @@ $0.25$ and saturates by $0.30$, with the break localised to within one month.
 Detection of small ($<0.2$) steps and detection under heavy ($40\%$) gaps are
 the regimes where power is limited, consistent with the use of an OLS-CUSUM test
 rather than the more powerful but costlier procedures of
-Section~\ref{sec:breaks}.
+Section~\ref{sec:breaks}. The single-harmonic-plus-Gaussian model is a
+deliberate simplification: real NDVI residuals are heavier-tailed and partly
+autocorrelated, so the rates here are best read as the clean-signal envelope of
+the estimators rather than as field performance, which the case study of
+Section~\ref{sec:casestudy} probes directly.
 
 \subsection{Numerical parity}
 \label{sec:parity}
@@ -630,6 +634,15 @@ Harmonic ($K{=}2$) & $51\,$ms & $140\,$ms & $808\,$ms \\
 \bottomrule
 \end{tabular}
 \end{table}
+
+For a sense of the gain over the per-pixel Python workflow a user would
+otherwise assemble, a $64\times64\times60$ Theil--Sen-plus-Mann--Kendall trend
+map takes $131$\,ms in \texttt{datacube-rs} against $56$\,s for the equivalent
+loop over \texttt{pyMannKendall}---a $425\times$ speed-up that combines Rust
+execution, Rayon parallelism, and zero-copy iteration. The comparison is to the
+same estimators on the same data; the existing cube tools of
+Section~\ref{sec:related} do not provide these tests natively to compare
+against.
 
 \subsection{Cross-target reproducibility}
 \label{sec:crosstarget}

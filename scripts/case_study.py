@@ -166,16 +166,28 @@ def plot(arr, t, first_break, drop_mag, recov):
     ax[0].legend(fontsize=7, frameon=False, loc="lower left")
     ax[0].set_title("(a) Pixel time series", fontsize=9, loc="left")
 
+    def decorate(a):
+        # scale bar (10 px = 1 km at 100 m) and north arrow
+        ny_, nx_ = first_break.shape
+        x0, yb_ = nx_ * 0.06, ny_ * 0.92
+        a.plot([x0, x0 + 10], [yb_, yb_], "-", color="k", lw=2)
+        a.text(x0 + 5, yb_ - ny_ * 0.04, "1 km", ha="center", va="bottom",
+               fontsize=6, color="k")
+        a.annotate("N", xy=(nx_ * 0.93, ny_ * 0.07), xytext=(nx_ * 0.93, ny_ * 0.22),
+                   ha="center", fontsize=7, color="k",
+                   arrowprops=dict(arrowstyle="-|>", color="k", lw=1))
+        a.set_xticks([]); a.set_yticks([])
+
     # (b) first-break-time map
     im = ax[1].imshow(first_break, cmap="inferno", vmin=2022.9, vmax=2023.6)
-    ax[1].set_xticks([]); ax[1].set_yticks([])
+    decorate(ax[1])
     ax[1].set_title("(b) First-break time", fontsize=9, loc="left")
     cb = fig.colorbar(im, ax=ax[1], fraction=0.046, pad=0.04)
     cb.ax.tick_params(labelsize=6)
 
     # (c) post-fire recovery slope
     im2 = ax[2].imshow(recov, cmap="BrBG", vmin=-0.3, vmax=0.3)
-    ax[2].set_xticks([]); ax[2].set_yticks([])
+    decorate(ax[2])
     ax[2].set_title("(c) Recovery slope (NDVI/yr)", fontsize=9, loc="left")
     cb2 = fig.colorbar(im2, ax=ax[2], fraction=0.046, pad=0.04)
     cb2.ax.tick_params(labelsize=6)
