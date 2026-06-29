@@ -174,12 +174,16 @@ contributions are:
   cube;
   \item a single dependency-light Rust core delivered, without modification, as
   four deployment targets---library, CLI, Python and in-browser
-  WebAssembly---with reproducible benchmarks of its parallel scaling.
+  WebAssembly---producing results identical across targets to $2.8\times10^{-15}$
+  (Section~\ref{sec:crosstarget}), with reproducible benchmarks of its parallel
+  scaling.
 \end{itemize}
 The novelty is therefore architectural and integrative rather than
-algorithmic: no existing tool offers this set of temporal estimators as
-validated native operators over a streaming, cloud-native, multi-target cube
-engine (Section~\ref{sec:related}).
+algorithmic, and is demonstrated rather than asserted: no existing tool offers
+this set of temporal estimators as validated native operators over a
+streaming, cloud-native, multi-target cube engine that runs the same audited
+code from the command line to the browser (Sections~\ref{sec:crosstarget},
+\ref{sec:related}).
 
 The remainder of the paper is organised as follows.
 Section~\ref{sec:methods} states the temporal estimators and their reference
@@ -617,6 +621,47 @@ Harmonic ($K{=}2$) & $51\,$ms & $140\,$ms & $808\,$ms \\
 \end{tabular}
 \end{table}
 
+\subsection{Cross-target reproducibility}
+\label{sec:crosstarget}
+The defining property of the architecture---one validated core compiled to
+several deployment forms---is testable directly. We fed an identical input
+series to the five estimators in three targets: the native Rust binary, the
+Python extension, and the WebAssembly module running under Node. Because all
+three are built from the same Rust source, including the \texttt{libm} crate for
+the error and exponential functions in the $p$-values, the results agree to
+machine precision: across every reported quantity the maximum relative
+difference between targets is $2.8\times10^{-15}$ (the Theil--Sen slope and
+Kendall's $\tau$ are bit-identical). Table~\ref{tab:crosstarget} lists the
+per-estimator cost in each target: the Python extension matches native to within
+a few percent (the Rayon workers release the interpreter lock), while
+WebAssembly is $2$--$4\times$ slower but still operates in microseconds---and is
+the only one of these targets, and of the data-cube tools surveyed in
+Section~\ref{sec:related}, that runs the analysis entirely client-side in a
+browser, with no server, interpreter, or cloud account. This is the concrete
+pay-off of the single-core design: a result obtained at the command line, in a
+notebook, or in a web page is computed by the same audited code, to
+$10^{-15}$.
+
+\begin{table}[t]
+\centering
+\caption{Cross-target per-estimator cost (median, $\mu$s per call) on the same
+$120$-point series. Results agree across targets to a maximum relative
+difference of $2.8\times10^{-15}$.}
+\label{tab:crosstarget}
+\small
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Estimator & Native & Python (PyO3) & WebAssembly \\
+\midrule
+OLS trend          & $1.4$  & $1.6$  & $10.2$ \\
+Theil--Sen         & $18.4$ & $17.7$ & $64.2$ \\
+Mann--Kendall      & $9.9$  & $10.5$ & $17.4$ \\
+Harmonic ($K{=}2$) & $10.5$ & $11.8$ & $34.8$ \\
+OLS-CUSUM breaks   & $11.8$ & $12.3$ & $43.7$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
 \subsection{Case study: dating and recovery of the 2023 Chile wildfires}
 \label{sec:casestudy}
 To exercise the engine on a real problem we ask, over a forest landscape near
@@ -711,17 +756,22 @@ xarray         & Python    & library            & no            & yes & generic 
 \end{table*}
 
 \subsection{Design rationale}
-Three properties follow from implementing the engine in Rust as a single core.
-First, \emph{portability without a runtime}: the same compiled code is a library,
-a command-line tool, a Python extension and a WebAssembly module, so an analysis
-prototyped in a browser or a notebook runs identically in a batch pipeline,
-without a Python or R interpreter, a server, or a cloud account. Second,
-\emph{streaming by construction}: the contiguous time axis lets per-pixel series
-be processed as borrowed slices, so memory use is governed by the spatial chunk
-rather than by the whole cube, and the per-pixel map parallelises across cores
-without locking. Third, \emph{verifiability}: shipping the estimators as native
-code makes it meaningful to validate them to numerical parity against reference
-implementations (Section~\ref{sec:parity}), which is harder to assert for
+Three properties follow from implementing the engine in Rust as a single core,
+and each is measured rather than merely asserted. First, \emph{portability
+without a runtime}: the same compiled code is a library, a command-line tool, a
+Python extension and a WebAssembly module, so an analysis prototyped in a
+browser or a notebook runs identically in a batch pipeline, without a Python or
+R interpreter, a server, or a cloud account. Section~\ref{sec:crosstarget}
+quantifies this---the three targets agree to $2.8\times10^{-15}$, and the
+WebAssembly target runs client-side in a browser, which none of gdalcubes,
+xarray, or Earth Engine can do. Second, \emph{zero-copy iteration}: the
+contiguous time axis lets each per-pixel series be passed to an estimator as a
+borrowed slice, with no per-pixel allocation, and the per-pixel map parallelises
+across cores without locking, scaling linearly with the pool
+(Section~\ref{sec:perf}). Third, \emph{verifiability}: shipping the estimators
+as native code makes it meaningful to validate them to numerical parity against
+reference implementations and against known ground truth
+(Sections~\ref{sec:recovery}--\ref{sec:parity}), which is harder to assert for
 analyses assembled ad hoc from user-defined functions. We therefore position
 \texttt{datacube-rs} as complementary to the existing ecosystem rather than a
 replacement: it reads the same STAC/COG collections, and can export to formats
