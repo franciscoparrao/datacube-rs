@@ -129,11 +129,39 @@ proj) en vez de reinventar I/O. Diferenciador: cubo Rust nativo sobre GeoZarr.
   Verificada con screenshot headless (break detectado donde cae el nivel).
   Build: `wasm-pack build --target web --out-dir web/pkg` (pkg/ gitignored).
 
-## Estado (2026-06-18) — ROADMAP COMPLETO
-5 targets: core (stats+temporal), io (STAC/COG + cross-zone), CLI, PyO3, WASM.
-Validación 103/103 a 1e-9. cargo test --workspace 10 suites verdes.
+## Band-math / índices espectrales (v0.4, 2026-06-30)
+- Workspace bump a **0.4.0** (estaba estancado en 0.1.0 pese a v0.2/v0.3).
+- `datacube-core::bandmath` (módulo privado, `pub use indices`): álgebra de
+  bandas por celda `(y,x,t)` → cubo de 1 banda en la misma grilla.
+  - `Cube::band(name)` lookup → `CubeError::BandNotFound`.
+  - `Cube::normalized_difference(a,b,label)` = (a−b)/(a+b); NaN si algún input
+    es NaN o el denominador es 0. Workhorse de NDVI/NDWI/NBR/NDBI.
+  - `Cube::band_ratio(a,b,label)`, `Cube::combine_bands(label, f)` (primitiva
+    general con closure sobre las bandas de la celda; fast-path stack-buffer
+    para ≤16 bandas, fallback heap). Paraleliza sobre celdas (Rayon).
+  - `indices::{ndvi,ndwi,nbr,ndbi,evi,savi}` (EVI/SAVI vía combine_bands).
+  - Layout (band,y,x,t) → cada volumen de banda es contiguo: nd usa dos slices
+    elementwise; combine_bands gatherea banda*cells+i.
+- `datacube-python`: `Cube.{ndvi,ndwi,nbr,evi,savi,normalized_difference,
+  band_index}` (por nombre de banda). 4 tests pytest nuevos validan NDVI/EVI/
+  SAVI vs numpy closed-form a 1e-12 + propagación de NaN (14/14 total).
+- CLI `datacube stack --index ndvi|ndwi|nbr|ndbi|evi|savi` (feature `stac`):
+  computa el índice desde las bandas apiladas tras composite/gapfill y corre
+  trend/breaks sobre él. Roles de banda: `--nir/--red/--green/--blue/--swir`
+  (defaults S2: B08/B04/B03/B02/B11), `--savi-l` (0.5). El índice colapsa el
+  cubo a 1 banda → la selección de banda del análisis pasa a ser esa.
+- Cierra el gap del paper: el NDVI del caso de estudio se calculaba fuera del
+  motor (xarray en case_study.py); ahora el cubo lo computa nativo.
+- WASM no toca band-math (no expone `Cube`; consistente).
+
+## Estado (2026-06-30) — v0.4
+5 targets; core con stats+temporal+**bandmath**. Validación estadística
+103/103 a 1e-9 (intacta); band-math validado vs numpy a 1e-12 (pytest 14/14);
+core 50 unit + 9 doctests. cargo test --workspace verde.
 
 ## Próximos pasos al retomar
 1. Pensar el paper (venue: Computers & Geosciences o EMS). Material listo:
-   paridad numérica documentada, benchmarks, 5 targets, demo web.
-2. Opcional: exponer datacube-io (stack STAC) a Python; GeoZarr backing store.
+   paridad numérica documentada, benchmarks, 5 targets, demo web, band-math.
+   Opción: actualizar §4.4 para que el NDVI del caso lo compute el motor.
+2. Pendiente Zenodo DOI (gated en ORCID).
+3. Opcional v0.5: GeoZarr backing store; exponer datacube-io (stack STAC) a Python.

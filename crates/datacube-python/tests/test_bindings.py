@@ -112,3 +112,56 @@ def test_cube_gapfill_interpolates():
     filled = cube.gapfill().to_numpy()
     assert math.isclose(filled[0, 0, 0, 1], 3.0, abs_tol=1e-12)
     assert math.isclose(filled[0, 0, 0, 2], 5.0, abs_tol=1e-12)
+
+
+def _rgbn_cube():
+    # red, nir, blue; 2x2 px, 1 time; second pixel column has a masked NIR
+    nb, ny, nx, nt = 3, 2, 2, 1
+    data = np.zeros((nb, ny, nx, nt))
+    red = np.array([[0.10, 0.20], [0.15, 0.25]])
+    nir = np.array([[0.50, np.nan], [0.40, 0.60]])
+    blue = np.full((ny, nx), 0.05)
+    data[0, :, :, 0] = red
+    data[1, :, :, 0] = nir
+    data[2, :, :, 0] = blue
+    return dc.Cube(data, np.array([0.0]), ["red", "nir", "blue"])
+
+
+def test_cube_ndvi_matches_numpy_and_propagates_nan():
+    cube = _rgbn_cube()
+    nd = cube.ndvi("nir", "red")
+    assert nd.dims == (1, 2, 2, 1)
+    assert nd.bands == ["ndvi"]
+    out = nd.to_numpy()[0, :, :, 0]
+    red = np.array([[0.10, 0.20], [0.15, 0.25]])
+    nir = np.array([[0.50, np.nan], [0.40, 0.60]])
+    ref = (nir - red) / (nir + red)
+    # finite cells agree to machine precision; masked cell stays NaN both sides
+    finite = np.isfinite(ref)
+    assert np.allclose(out[finite], ref[finite], atol=1e-12)
+    assert np.isnan(out[~finite]).all()
+
+
+def test_cube_band_index_and_missing():
+    cube = _rgbn_cube()
+    assert cube.band_index("nir") == 1
+    try:
+        cube.band_index("swir")
+    except Exception as e:  # noqa: BLE001 - binding maps to a Python error
+        assert "swir" in str(e)
+    else:
+        raise AssertionError("expected band_index('swir') to raise")
+
+
+def test_cube_savi_l0_equals_ndvi():
+    cube = _rgbn_cube()
+    savi = cube.savi("nir", "red", 0.0).to_numpy()[0, :, :, 0]
+    ndvi = cube.ndvi("nir", "red").to_numpy()[0, :, :, 0]
+    finite = np.isfinite(ndvi)
+    assert np.allclose(savi[finite], ndvi[finite], atol=1e-12)
+
+
+def test_cube_normalized_difference_generic():
+    cube = _rgbn_cube()
+    nd = cube.normalized_difference("nir", "red", "myidx")
+    assert nd.bands == ["myidx"]

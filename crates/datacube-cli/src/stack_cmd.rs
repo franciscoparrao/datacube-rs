@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use datacube_core::{CompositeMethod, CompositeWindow, stats};
+use datacube_core::{CompositeMethod, CompositeWindow, indices, stats};
 use datacube_io::{StackConfig, StackedCube, stack};
 use surtgis_core::io::write_geotiff;
 use surtgis_core::{CRS, Raster};
@@ -54,6 +54,29 @@ pub struct StackArgs {
     /// than this many time units (in fractional years; 0 = no limit)
     #[arg(long)]
     gapfill: Option<f64>,
+    /// Compute a spectral index from the stacked bands before analysis; the
+    /// trend/break maps then run on the index. Band roles come from the
+    /// --nir/--red/--green/--blue/--swir flags (Sentinel-2 defaults).
+    #[arg(long, value_enum)]
+    index: Option<IndexKind>,
+    /// NIR asset key for --index
+    #[arg(long, default_value = "B08")]
+    nir: String,
+    /// Red asset key for --index
+    #[arg(long, default_value = "B04")]
+    red: String,
+    /// Green asset key for --index
+    #[arg(long, default_value = "B03")]
+    green: String,
+    /// Blue asset key for --index (EVI)
+    #[arg(long, default_value = "B02")]
+    blue: String,
+    /// SWIR asset key for --index (NBR/NDBI)
+    #[arg(long, default_value = "B11")]
+    swir: String,
+    /// Soil-brightness factor L for --index savi
+    #[arg(long, default_value_t = 0.5)]
+    savi_l: f64,
     /// Band (asset key) for the trend statistic
     #[arg(long)]
     band: Option<String>,
@@ -87,6 +110,16 @@ pub struct StackArgs {
 pub enum TrendStat {
     TheilSen,
     Ols,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum IndexKind {
+    Ndvi,
+    Ndwi,
+    Nbr,
+    Ndbi,
+    Evi,
+    Savi,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -152,6 +185,10 @@ pub fn run(args: &StackArgs) -> Result<()> {
         let max_gap = if mg > 0.0 { Some(mg) } else { None };
         cube = cube.gapfill_linear(max_gap).context("gap-filling failed")?;
     }
+    if let Some(kind) = args.index {
+        cube = compute_index(&cube, kind, args).context("spectral index failed")?;
+        eprintln!("computed index '{}' from stacked bands", cube.bands()[0]);
+    }
     let (nb, ny, nx, nt) = cube.dims();
 
     let wants_trend = args.output.is_some() || args.pvalue_output.is_some();
@@ -159,12 +196,17 @@ pub fn run(args: &StackArgs) -> Result<()> {
 
     let mut maps_written = Vec::new();
     if wants_trend || wants_breaks {
-        let band_key = args.band.as_deref().unwrap_or(&args.assets[0]);
-        let band = cube
-            .bands()
-            .iter()
-            .position(|b| b == band_key)
-            .with_context(|| format!("band '{band_key}' is not in the stacked assets"))?;
+        // an index collapses the cube to its single derived band; otherwise
+        // pick the requested asset (defaulting to the first stacked one).
+        let band = if args.index.is_some() {
+            0
+        } else {
+            let band_key = args.band.as_deref().unwrap_or(&args.assets[0]);
+            cube.bands()
+                .iter()
+                .position(|b| b == band_key)
+                .with_context(|| format!("band '{band_key}' is not in the stacked assets"))?
+        };
 
         if wants_trend {
             let (slope, pvalue) = trend_maps(&cube, band, args.stat)?;
@@ -206,6 +248,32 @@ pub fn run(args: &StackArgs) -> Result<()> {
     });
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
+}
+
+/// Computes the requested spectral index from the stacked bands, returning a
+/// single-band cube on the same grid. Band roles come from the --nir/--red/…
+/// flags so the asset keys can differ from the Sentinel-2 defaults.
+fn compute_index(
+    cube: &datacube_core::Cube,
+    kind: IndexKind,
+    args: &StackArgs,
+) -> Result<datacube_core::Cube> {
+    let (nir, red, green, blue, swir) = (
+        args.nir.as_str(),
+        args.red.as_str(),
+        args.green.as_str(),
+        args.blue.as_str(),
+        args.swir.as_str(),
+    );
+    let out = match kind {
+        IndexKind::Ndvi => indices::ndvi(cube, nir, red),
+        IndexKind::Ndwi => indices::ndwi(cube, green, nir),
+        IndexKind::Nbr => indices::nbr(cube, nir, swir),
+        IndexKind::Ndbi => indices::ndbi(cube, swir, nir),
+        IndexKind::Evi => indices::evi(cube, nir, red, blue),
+        IndexKind::Savi => indices::savi(cube, nir, red, args.savi_l),
+    };
+    out.map_err(|e| anyhow::anyhow!("{e} (check the --nir/--red/… asset keys match --assets)"))
 }
 
 /// Per-pixel slope and p-value grids for the selected band.

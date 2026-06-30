@@ -5,7 +5,7 @@
 //! `datacube_rs` extension module (see the `python/` package and
 //! `maturin develop`).
 
-use datacube_core::{CompositeMethod, CompositeWindow, Cube as CoreCube, stats};
+use datacube_core::{CompositeMethod, CompositeWindow, Cube as CoreCube, indices, stats};
 use ndarray::Array4;
 use numpy::{IntoPyArray, PyArray2, PyArray4, PyReadonlyArray1, PyReadonlyArray4};
 use pyo3::exceptions::{PyKeyError, PyValueError};
@@ -259,6 +259,58 @@ impl PyCube {
     fn gapfill(&self, max_gap: Option<f64>) -> PyResult<Self> {
         Ok(Self {
             inner: self.inner.gapfill_linear(max_gap).map_err(err)?,
+        })
+    }
+
+    /// Index of the band labelled `name`.
+    fn band_index(&self, name: &str) -> PyResult<usize> {
+        self.inner.band(name).map_err(err)
+    }
+
+    /// Normalized difference `(a - b) / (a + b)` of two bands (given by label),
+    /// returned as a new single-band cube. NaN where either input is NaN or the
+    /// denominator is zero.
+    #[pyo3(signature = (a, b, label="nd"))]
+    fn normalized_difference(&self, a: &str, b: &str, label: &str) -> PyResult<Self> {
+        let (ai, bi) = (self.inner.band(a).map_err(err)?, self.inner.band(b).map_err(err)?);
+        Ok(Self {
+            inner: self.inner.normalized_difference(ai, bi, label).map_err(err)?,
+        })
+    }
+
+    /// NDVI = (NIR − Red) / (NIR + Red) as a new single-band cube.
+    fn ndvi(&self, nir: &str, red: &str) -> PyResult<Self> {
+        Ok(Self {
+            inner: indices::ndvi(&self.inner, nir, red).map_err(err)?,
+        })
+    }
+
+    /// NDWI = (Green − NIR) / (Green + NIR) (McFeeters).
+    fn ndwi(&self, green: &str, nir: &str) -> PyResult<Self> {
+        Ok(Self {
+            inner: indices::ndwi(&self.inner, green, nir).map_err(err)?,
+        })
+    }
+
+    /// NBR = (NIR − SWIR) / (NIR + SWIR).
+    fn nbr(&self, nir: &str, swir: &str) -> PyResult<Self> {
+        Ok(Self {
+            inner: indices::nbr(&self.inner, nir, swir).map_err(err)?,
+        })
+    }
+
+    /// EVI = 2.5·(NIR − Red) / (NIR + 6·Red − 7.5·Blue + 1).
+    fn evi(&self, nir: &str, red: &str, blue: &str) -> PyResult<Self> {
+        Ok(Self {
+            inner: indices::evi(&self.inner, nir, red, blue).map_err(err)?,
+        })
+    }
+
+    /// SAVI = (1 + L)·(NIR − Red) / (NIR + Red + L); `l` is soil brightness.
+    #[pyo3(signature = (nir, red, l=0.5))]
+    fn savi(&self, nir: &str, red: &str, l: f64) -> PyResult<Self> {
+        Ok(Self {
+            inner: indices::savi(&self.inner, nir, red, l).map_err(err)?,
         })
     }
 }

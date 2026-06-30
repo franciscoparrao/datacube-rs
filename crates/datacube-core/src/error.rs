@@ -11,6 +11,10 @@ pub enum CubeError {
     #[error("band index {index} out of range ({nbands} bands)")]
     BandOutOfRange { index: usize, nbands: usize },
 
+    /// No band carries the requested label.
+    #[error("band not found: {0}")]
+    BandNotFound(String),
+
     /// Not enough finite observations for the requested statistic.
     #[error("insufficient data: need at least {needed} finite observations, got {got}")]
     InsufficientData { needed: usize, got: usize },

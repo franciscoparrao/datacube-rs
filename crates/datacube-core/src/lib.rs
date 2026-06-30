@@ -24,11 +24,13 @@
 //! assert!((trends[[0, 0]] - 1.0).abs() < 1e-12);
 //! ```
 
+mod bandmath;
 mod cube;
 mod error;
 pub mod stats;
 mod temporal;
 
+pub use bandmath::indices;
 pub use cube::{Cube, CubeChunk, PixelSeries};
 pub use error::CubeError;
 pub use temporal::{CompositeMethod, CompositeWindow};
