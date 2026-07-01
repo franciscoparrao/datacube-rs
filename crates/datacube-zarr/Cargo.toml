@@ -1,0 +1,18 @@
+[package]
+name = "datacube-zarr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Zarr V3 backing store for datacube-rs temporal cubes (read/write, cloud-native ARD)."
+
+[dependencies]
+datacube-core = { workspace = true }
+ndarray = { workspace = true }
+thiserror = { workspace = true }
+serde_json = { workspace = true }
+zarrs = "0.23"
+
+[dev-dependencies]
+tempfile = "3"

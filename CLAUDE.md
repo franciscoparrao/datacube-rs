@@ -154,14 +154,42 @@ proj) en vez de reinventar I/O. Diferenciador: cubo Rust nativo sobre GeoZarr.
   motor (xarray en case_study.py); ahora el cubo lo computa nativo.
 - WASM no toca band-math (no expone `Cube`; consistente).
 
-## Estado (2026-06-30) — v0.4
-5 targets; core con stats+temporal+**bandmath**. Validación estadística
-103/103 a 1e-9 (intacta); band-math validado vs numpy a 1e-12 (pytest 14/14);
+## datacube-zarr — GeoZarr backing store (v0.5, 2026-06-30)
+- Crate nuevo `crates/datacube-zarr` (6º target): serialización nativa del cubo
+  en **Zarr V3** vía `zarrs 0.23` (FilesystemStore, puro-Rust, sin surtgis →
+  testeable offline). Es la dirección cloud-native ARD del roadmap.
+- `write_zarr(cube, path, &GeoRef)` / `read_zarr(path) -> (Cube, GeoRef)`:
+  array 4-D f64 `(band,y,x,time)` en `/cube` bajo un grupo raíz Zarr V3, con
+  `dimension_names=["band","y","x","time"]` y atributos `bands`/`time`/`epsg`/
+  `geotransform`. Chunk espacial 256 (bandas y tiempo single-chunk).
+  `GeoRef { epsg: Option<u32>, transform: Option<[f64;6]> }`.
+- OJO choque de versiones: zarrs usa **ndarray 0.17**, el workspace **0.16**.
+  No se pasan tipos ndarray a través del límite → se usa la API por-bytes
+  no-deprecada `store_array_subset(&subset, &[f64])` /
+  `retrieve_array_subset::<Vec<f64>>(&subset)` y se reconstruye `Array4` con
+  nuestra 0.16 (layout std row-major = C-order de zarr, 1:1).
+- API zarrs 0.23 (afinada contra el crate): `data_type::float64()`,
+  `ArrayBuilder::new(shape, chunk, dtype, fill)` (fill acepta `f64` directo),
+  `ArraySubset` en `zarrs::array`, `GroupBuilder::new().build(store,"/")`.
+- Tests: roundtrip (multi-chunk y=300, NaN, georef) + error al abrir ausente.
+- **Interop probada** (el diferenciador): `examples/write_sample.rs` escribe un
+  store y `scripts/zarr_interop.py` lo lee con **zarr 3.2.1 desde Python**
+  (dims, dimension_names, atributos, valores); NDVI computado en Rust coincide
+  con el recalculado en Python. zarr instalado en `.venv-validate` (xarray ya
+  estaba). Correr: `cargo run -p datacube-zarr --example write_sample -- P` +
+  `.venv-validate/bin/python scripts/zarr_interop.py P`.
+- Falta para GeoZarr-CF pleno (refinamiento): variables-coordenada separadas,
+  `grid_mapping`/CRS WKT, atributos CF por-banda. Hoy es cubo-en-Zarr-V3 fiel.
+
+## Estado (2026-06-30) — v0.5
+**6 targets**: core (stats+temporal+bandmath), io (STAC/COG+cross-zone), CLI,
+PyO3, WASM, **zarr (GeoZarr backing store)**. Validación estadística 103/103 a
+1e-9; band-math vs numpy 1e-12 (pytest 14/14); zarr roundtrip + interop Python;
 core 50 unit + 9 doctests. cargo test --workspace verde.
 
 ## Próximos pasos al retomar
-1. Pensar el paper (venue: Computers & Geosciences o EMS). Material listo:
-   paridad numérica documentada, benchmarks, 5 targets, demo web, band-math.
-   Opción: actualizar §4.4 para que el NDVI del caso lo compute el motor.
+1. Paper (C&G/EMS): material listo + band-math + GeoZarr. Opciones: §4.4 con
+   NDVI in-engine; añadir GeoZarr como sección de arquitectura/persistencia.
 2. Pendiente Zenodo DOI (gated en ORCID).
-3. Opcional v0.5: GeoZarr backing store; exponer datacube-io (stack STAC) a Python.
+3. Opcional v0.6: GeoZarr-CF pleno (coord vars, grid_mapping); object-store
+   (S3/HTTP) vía zarrs async; exponer datacube-io (stack STAC) a Python.
