@@ -2,10 +2,20 @@ use thiserror::Error;
 
 /// Errors produced by cube construction, access and statistics.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum CubeError {
     /// Shapes of data, time axis or band labels do not agree.
     #[error("dimension mismatch: {0}")]
     DimensionMismatch(String),
+
+    /// An operation that requires a sorted time axis got an unsorted one.
+    #[error("time axis must be ascending: {0}")]
+    UnsortedTime(String),
+
+    /// The input is structurally valid but carries no usable signal
+    /// (e.g. a constant time coordinate, where a slope is undefined).
+    #[error("degenerate input: {0}")]
+    DegenerateInput(String),
 
     /// A band index outside `0..nbands`.
     #[error("band index {index} out of range ({nbands} bands)")]

@@ -97,7 +97,7 @@ impl Cube {
     pub fn gapfill_linear(&self, max_gap: Option<f64>) -> Result<Cube, CubeError> {
         let time = self.time();
         if time.windows(2).any(|w| w[1] < w[0]) {
-            return Err(CubeError::DimensionMismatch(
+            return Err(CubeError::UnsortedTime(
                 "gapfill_linear requires an ascending time axis".into(),
             ));
         }
@@ -138,7 +138,7 @@ impl Cube {
 /// Groups time indices according to the window; groups preserve time order.
 fn group_times(time: &[f64], window: CompositeWindow) -> Result<Vec<Vec<usize>>, CubeError> {
     if time.windows(2).any(|w| w[1] < w[0]) {
-        return Err(CubeError::DimensionMismatch(
+        return Err(CubeError::UnsortedTime(
             "composite requires an ascending time axis".into(),
         ));
     }

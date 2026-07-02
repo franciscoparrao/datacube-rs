@@ -15,7 +15,9 @@ use datacube_core::stats;
 use serde_json::{Value, json};
 
 fn main() {
-    let path = std::env::args().nth(1).expect("usage: cross_target <input.json>");
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: cross_target <input.json>");
     let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     let t: Vec<f64> = v["t"].as_array().unwrap().iter().map(num).collect();
     let y: Vec<f64> = v["y"].as_array().unwrap().iter().map(num).collect();
@@ -24,8 +26,15 @@ fn main() {
     let ts = stats::theil_sen(&t, &y).unwrap();
     let mk = stats::mann_kendall(&y).unwrap();
     let hr = stats::harmonic_regression(&t, &y, 1.0, 2).unwrap();
-    let br = stats::detect_breaks(&t, &y, &stats::BreakOptions { n_harmonics: 1, ..Default::default() })
-        .unwrap();
+    let br = stats::detect_breaks(
+        &t,
+        &y,
+        &stats::BreakOptions {
+            n_harmonics: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
 
     // timing: median over repeats
     let reps = 2000;

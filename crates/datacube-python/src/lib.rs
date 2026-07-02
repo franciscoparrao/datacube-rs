@@ -199,6 +199,8 @@ impl PyCube {
     /// Per-pixel trend maps for `band` (default 0): returns `(slope, p_value)`
     /// as two `(height, width)` NumPy arrays. `method` is "theil_sen"
     /// (slope + Mann-Kendall p) or "ols" (slope + t-test p).
+    ///
+    /// The GIL is released while the Rayon compute runs.
     #[pyo3(signature = (band=0, method="theil_sen"))]
     fn trend_map<'py>(
         &self,
@@ -206,18 +208,23 @@ impl PyCube {
         band: usize,
         method: &str,
     ) -> PyResult<GridPair<'py>> {
+        let inner = &self.inner;
         let grid = match method {
-            "theil_sen" => self.inner.par_map_series(band, |t, y| {
-                let slope = stats::theil_sen(t, y).map(|r| r.slope).unwrap_or(f64::NAN);
-                let p = stats::mann_kendall(y)
-                    .map(|r| r.p_value)
-                    .unwrap_or(f64::NAN);
-                (slope, p)
+            "theil_sen" => py.detach(|| {
+                inner.par_map_series(band, |t, y| {
+                    let slope = stats::theil_sen(t, y).map(|r| r.slope).unwrap_or(f64::NAN);
+                    let p = stats::mann_kendall(y)
+                        .map(|r| r.p_value)
+                        .unwrap_or(f64::NAN);
+                    (slope, p)
+                })
             }),
-            "ols" => self.inner.par_map_series(band, |t, y| {
-                stats::linear_trend(t, y)
-                    .map(|r| (r.slope, r.p_value))
-                    .unwrap_or((f64::NAN, f64::NAN))
+            "ols" => py.detach(|| {
+                inner.par_map_series(band, |t, y| {
+                    stats::linear_trend(t, y)
+                        .map(|r| (r.slope, r.p_value))
+                        .unwrap_or((f64::NAN, f64::NAN))
+                })
             }),
             other => return Err(PyValueError::new_err(format!("unknown method '{other}'"))),
         }
@@ -231,7 +238,7 @@ impl PyCube {
     /// "monthly" (or "period:<width>" in time units); `method` is one of
     /// median, mean, min, max.
     #[pyo3(signature = (window="monthly", method="median"))]
-    fn composite(&self, window: &str, method: &str) -> PyResult<Self> {
+    fn composite(&self, py: Python<'_>, window: &str, method: &str) -> PyResult<Self> {
         let win = match window {
             "same_time" => CompositeWindow::SameTime,
             "monthly" => CompositeWindow::Period(1.0 / 12.0),
@@ -248,17 +255,19 @@ impl PyCube {
             "max" => CompositeMethod::Max,
             other => return Err(PyKeyError::new_err(format!("bad method '{other}'"))),
         };
+        let inner = &self.inner;
         Ok(Self {
-            inner: self.inner.composite(win, m).map_err(err)?,
+            inner: py.detach(|| inner.composite(win, m)).map_err(err)?,
         })
     }
 
     /// Fill temporal NaN gaps by linear interpolation; gaps wider than
     /// `max_gap` time units (None = unlimited) and edges are left as NaN.
     #[pyo3(signature = (max_gap=None))]
-    fn gapfill(&self, max_gap: Option<f64>) -> PyResult<Self> {
+    fn gapfill(&self, py: Python<'_>, max_gap: Option<f64>) -> PyResult<Self> {
+        let inner = &self.inner;
         Ok(Self {
-            inner: self.inner.gapfill_linear(max_gap).map_err(err)?,
+            inner: py.detach(|| inner.gapfill_linear(max_gap)).map_err(err)?,
         })
     }
 
@@ -271,46 +280,69 @@ impl PyCube {
     /// returned as a new single-band cube. NaN where either input is NaN or the
     /// denominator is zero.
     #[pyo3(signature = (a, b, label="nd"))]
-    fn normalized_difference(&self, a: &str, b: &str, label: &str) -> PyResult<Self> {
-        let (ai, bi) = (self.inner.band(a).map_err(err)?, self.inner.band(b).map_err(err)?);
+    fn normalized_difference(
+        &self,
+        py: Python<'_>,
+        a: &str,
+        b: &str,
+        label: &str,
+    ) -> PyResult<Self> {
+        let (ai, bi) = (
+            self.inner.band(a).map_err(err)?,
+            self.inner.band(b).map_err(err)?,
+        );
+        let inner = &self.inner;
         Ok(Self {
-            inner: self.inner.normalized_difference(ai, bi, label).map_err(err)?,
+            inner: py
+                .detach(|| inner.normalized_difference(ai, bi, label))
+                .map_err(err)?,
         })
     }
 
     /// NDVI = (NIR − Red) / (NIR + Red) as a new single-band cube.
-    fn ndvi(&self, nir: &str, red: &str) -> PyResult<Self> {
+    fn ndvi(&self, py: Python<'_>, nir: &str, red: &str) -> PyResult<Self> {
+        let inner = &self.inner;
         Ok(Self {
-            inner: indices::ndvi(&self.inner, nir, red).map_err(err)?,
+            inner: py.detach(|| indices::ndvi(inner, nir, red)).map_err(err)?,
         })
     }
 
     /// NDWI = (Green − NIR) / (Green + NIR) (McFeeters).
-    fn ndwi(&self, green: &str, nir: &str) -> PyResult<Self> {
+    fn ndwi(&self, py: Python<'_>, green: &str, nir: &str) -> PyResult<Self> {
+        let inner = &self.inner;
         Ok(Self {
-            inner: indices::ndwi(&self.inner, green, nir).map_err(err)?,
+            inner: py
+                .detach(|| indices::ndwi(inner, green, nir))
+                .map_err(err)?,
         })
     }
 
     /// NBR = (NIR − SWIR) / (NIR + SWIR).
-    fn nbr(&self, nir: &str, swir: &str) -> PyResult<Self> {
+    fn nbr(&self, py: Python<'_>, nir: &str, swir: &str) -> PyResult<Self> {
+        let inner = &self.inner;
         Ok(Self {
-            inner: indices::nbr(&self.inner, nir, swir).map_err(err)?,
+            inner: py.detach(|| indices::nbr(inner, nir, swir)).map_err(err)?,
         })
     }
 
     /// EVI = 2.5·(NIR − Red) / (NIR + 6·Red − 7.5·Blue + 1).
-    fn evi(&self, nir: &str, red: &str, blue: &str) -> PyResult<Self> {
+    fn evi(&self, py: Python<'_>, nir: &str, red: &str, blue: &str) -> PyResult<Self> {
+        let inner = &self.inner;
         Ok(Self {
-            inner: indices::evi(&self.inner, nir, red, blue).map_err(err)?,
+            inner: py
+                .detach(|| indices::evi(inner, nir, red, blue))
+                .map_err(err)?,
         })
     }
 
     /// SAVI = (1 + L)·(NIR − Red) / (NIR + Red + L); `l` is soil brightness.
     #[pyo3(signature = (nir, red, l=0.5))]
-    fn savi(&self, nir: &str, red: &str, l: f64) -> PyResult<Self> {
+    fn savi(&self, py: Python<'_>, nir: &str, red: &str, l: f64) -> PyResult<Self> {
+        let inner = &self.inner;
         Ok(Self {
-            inner: indices::savi(&self.inner, nir, red, l).map_err(err)?,
+            inner: py
+                .detach(|| indices::savi(inner, nir, red, l))
+                .map_err(err)?,
         })
     }
 }

@@ -187,6 +187,19 @@ PyO3, WASM, **zarr (GeoZarr backing store)**. Validación estadística 103/103 a
 1e-9; band-math vs numpy 1e-12 (pytest 14/14); zarr roundtrip + interop Python;
 core 50 unit + 9 doctests. cargo test --workspace verde.
 
+## Auditoría + quick wins (2026-07-02)
+- `AUDIT.md` (raíz): auditoría completa del motor — 0 critical, 5 HIGH de
+  diseño (composite calendario, máscara SCL, GridSpec, georef en core,
+  ejecución por chunks), roadmap priorizado hacia "mejor motor de cubos".
+- Quick wins aplicados: `CubeError::{UnsortedTime, DegenerateInput}` +
+  `#[non_exhaustive]`; PyO3 libera el GIL (`py.detach`) en trend_map/
+  composite/gapfill/índices; CLI stack ya no clona el cubo (destructure);
+  copia escena→cubo por slices; items STAC ordenados por año fraccional (no
+  string); alpha estricto en (0,1); bump workspace 0.5.0; tags v0.1.0–v0.4.0;
+  CI GitHub Actions (fmt+clippy -D warnings+test, clona surtgis sibling);
+  `cargo fmt` aplicado a todo el workspace (antes no estaba formateado).
+- OJO pyo3 0.29: el método es `py.detach(...)`, NO `allow_threads` (renombrado).
+
 ## Próximos pasos al retomar
 1. Paper (C&G/EMS): material listo + band-math + GeoZarr. Opciones: §4.4 con
    NDVI in-engine; añadir GeoZarr como sección de arquitectura/persistencia.

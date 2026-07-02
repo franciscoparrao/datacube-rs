@@ -120,10 +120,16 @@ impl Cube {
     {
         let (nb, ny, nx, nt) = self.dims();
         if a >= nb {
-            return Err(CubeError::BandOutOfRange { index: a, nbands: nb });
+            return Err(CubeError::BandOutOfRange {
+                index: a,
+                nbands: nb,
+            });
         }
         if b >= nb {
-            return Err(CubeError::BandOutOfRange { index: b, nbands: nb });
+            return Err(CubeError::BandOutOfRange {
+                index: b,
+                nbands: nb,
+            });
         }
         let cells = ny * nx * nt;
         let view = self.data();
@@ -287,7 +293,10 @@ mod tests {
         let c = rgbn_cube();
         assert!(matches!(
             c.normalized_difference(9, 0, "x"),
-            Err(CubeError::BandOutOfRange { index: 9, nbands: 3 })
+            Err(CubeError::BandOutOfRange {
+                index: 9,
+                nbands: 3
+            })
         ));
     }
 }

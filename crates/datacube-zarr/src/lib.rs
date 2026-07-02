@@ -51,8 +51,8 @@ pub enum ZarrError {
     Cube(#[from] datacube_core::CubeError),
 }
 
-/// Writes `cube` to a Zarr V3 store rooted at `path`, returning the stored
-/// georeference echo. `geo` is persisted in the array attributes.
+/// Writes `cube` to a Zarr V3 store rooted at `path`; `geo` is persisted in
+/// the array attributes alongside the band labels and time coordinates.
 pub fn write_zarr(cube: &Cube, path: &Path, geo: &GeoRef) -> Result<(), ZarrError> {
     let store = Arc::new(FilesystemStore::new(path).map_err(|e| ZarrError::Store(e.to_string()))?);
 
@@ -112,8 +112,7 @@ pub fn write_zarr(cube: &Cube, path: &Path, geo: &GeoRef) -> Result<(), ZarrErro
 /// georeference.
 pub fn read_zarr(path: &Path) -> Result<(Cube, GeoRef), ZarrError> {
     let store = Arc::new(FilesystemStore::new(path).map_err(|e| ZarrError::Store(e.to_string()))?);
-    let array =
-        Array::open(store, CUBE_PATH).map_err(|e| ZarrError::Array(e.to_string()))?;
+    let array = Array::open(store, CUBE_PATH).map_err(|e| ZarrError::Array(e.to_string()))?;
 
     let shape = array.shape();
     if shape.len() != 4 {
@@ -149,8 +148,8 @@ pub fn read_zarr(path: &Path) -> Result<(Cube, GeoRef), ZarrError> {
     let flat: Vec<f64> = array
         .retrieve_array_subset::<Vec<f64>>(&subset)
         .map_err(|e| ZarrError::Array(e.to_string()))?;
-    let data = Array4::from_shape_vec(dims, flat)
-        .map_err(|e| ZarrError::Metadata(e.to_string()))?;
+    let data =
+        Array4::from_shape_vec(dims, flat).map_err(|e| ZarrError::Metadata(e.to_string()))?;
     let cube = Cube::new(data, time, bands)?;
     Ok((cube, geo))
 }

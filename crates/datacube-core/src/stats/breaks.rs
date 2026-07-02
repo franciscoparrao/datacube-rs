@@ -85,7 +85,7 @@ pub struct BreakResult {
 /// assert!((r.breaks[0].index as i64 - 29).abs() <= 1);
 /// ```
 pub fn detect_breaks(t: &[f64], y: &[f64], opts: &BreakOptions) -> Result<BreakResult, CubeError> {
-    if !(0.0..1.0).contains(&opts.alpha) {
+    if !(opts.alpha > 0.0 && opts.alpha < 1.0) {
         return Err(CubeError::InvalidParameter(format!(
             "alpha must be in (0, 1), got {}",
             opts.alpha
@@ -114,7 +114,7 @@ pub fn detect_breaks(t: &[f64], y: &[f64], opts: &BreakOptions) -> Result<BreakR
         });
     }
     if t.windows(2).any(|w| w[1] < w[0]) {
-        return Err(CubeError::DimensionMismatch(
+        return Err(CubeError::UnsortedTime(
             "detect_breaks requires an ascending time axis".into(),
         ));
     }

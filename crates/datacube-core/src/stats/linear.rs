@@ -52,7 +52,7 @@ pub fn linear_trend(t: &[f64], y: &[f64]) -> Result<LinearTrend, CubeError> {
         ss_yy += dy * dy;
     }
     if ss_tt == 0.0 {
-        return Err(CubeError::DimensionMismatch(
+        return Err(CubeError::DegenerateInput(
             "time coordinate is constant; slope is undefined".into(),
         ));
     }

@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use datacube_core::{CompositeMethod, CompositeWindow, indices, stats};
 use datacube_io::{StackConfig, StackedCube, stack};
 use surtgis_core::io::write_geotiff;
-use surtgis_core::{CRS, Raster};
+use surtgis_core::{CRS, GeoTransform, Raster};
 
 #[derive(clap::Args)]
 pub struct StackArgs {
@@ -155,16 +155,21 @@ pub fn run(args: &StackArgs) -> Result<()> {
     }
 
     eprintln!("searching {} in {} ...", args.collection, args.catalog);
-    let stacked = stack(&cfg).context("stacking failed")?;
+    // destructure to take ownership of the cube (no full-cube clone)
+    let StackedCube {
+        mut cube,
+        slices,
+        skipped,
+        transform,
+        epsg,
+    } = stack(&cfg).context("stacking failed")?;
     {
-        let (nb, ny, nx, nt) = stacked.cube.dims();
+        let (nb, ny, nx, nt) = cube.dims();
         eprintln!(
             "stacked {nt} scenes ({nb} bands, {ny}x{nx} px), {} skipped",
-            stacked.skipped.len()
+            skipped.len()
         );
     }
-
-    let mut cube = stacked.cube.clone();
     if let Some(kind) = args.composite {
         let window = match kind {
             CompositeKind::SameTime => CompositeWindow::SameTime,
@@ -211,39 +216,39 @@ pub fn run(args: &StackArgs) -> Result<()> {
         if wants_trend {
             let (slope, pvalue) = trend_maps(&cube, band, args.stat)?;
             if let Some(path) = &args.output {
-                write_map(&slope, &stacked, path)?;
+                write_map(&slope, transform, epsg, path)?;
                 maps_written.push(path.display().to_string());
             }
             if let Some(path) = &args.pvalue_output {
-                write_map(&pvalue, &stacked, path)?;
+                write_map(&pvalue, transform, epsg, path)?;
                 maps_written.push(path.display().to_string());
             }
         }
         if wants_breaks {
             let (count, first) = break_maps(&cube, band, args.break_harmonics, args.break_alpha)?;
             if let Some(path) = &args.breaks_output {
-                write_map(&count, &stacked, path)?;
+                write_map(&count, transform, epsg, path)?;
                 maps_written.push(path.display().to_string());
             }
             if let Some(path) = &args.first_break_output {
-                write_map(&first, &stacked, path)?;
+                write_map(&first, transform, epsg, path)?;
                 maps_written.push(path.display().to_string());
             }
         }
     }
 
     let report = serde_json::json!({
-        "scenes": stacked.slices.iter().map(|s| serde_json::json!({
+        "scenes": slices.iter().map(|s| serde_json::json!({
             "id": s.item_id,
             "datetime": s.datetime,
             "time": s.time,
             "cloud_cover": s.cloud_cover,
         })).collect::<Vec<_>>(),
-        "skipped": stacked.skipped,
+        "skipped": skipped,
         "dims": { "bands": nb, "height": ny, "width": nx, "times": nt },
         "bands": cube.bands(),
         "time_range": [cube.time().first(), cube.time().last()],
-        "epsg": stacked.epsg,
+        "epsg": epsg,
         "maps_written": maps_written,
     });
     println!("{}", serde_json::to_string_pretty(&report)?);
@@ -333,7 +338,12 @@ fn break_maps(
 }
 
 /// Writes a float map on the stack's grid as GeoTIFF (f32, NaN nodata).
-fn write_map(values: &ndarray::Array2<f64>, stacked: &StackedCube, path: &PathBuf) -> Result<()> {
+fn write_map(
+    values: &ndarray::Array2<f64>,
+    transform: GeoTransform,
+    epsg: Option<u32>,
+    path: &PathBuf,
+) -> Result<()> {
     let (ny, nx) = values.dim();
     let mut raster = Raster::<f32>::new(ny, nx);
     {
@@ -342,8 +352,8 @@ fn write_map(values: &ndarray::Array2<f64>, stacked: &StackedCube, path: &PathBu
             data[[r, c]] = *v as f32;
         }
     }
-    raster.set_transform(stacked.transform);
-    raster.set_crs(stacked.epsg.map(CRS::from_epsg));
+    raster.set_transform(transform);
+    raster.set_crs(epsg.map(CRS::from_epsg));
     raster.set_nodata(Some(f32::NAN));
     write_geotiff(&raster, path, None)
         .map_err(|e| anyhow::anyhow!("writing {} failed: {e}", path.display()))

@@ -43,7 +43,7 @@ pub fn theil_sen(t: &[f64], y: &[f64]) -> Result<TheilSenResult, CubeError> {
         }
     }
     if slopes.is_empty() {
-        return Err(CubeError::DimensionMismatch(
+        return Err(CubeError::DegenerateInput(
             "time coordinate is constant; slope is undefined".into(),
         ));
     }

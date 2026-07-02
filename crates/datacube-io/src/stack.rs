@@ -182,7 +182,16 @@ pub fn stack(cfg: &StackConfig) -> Result<StackedCube, StackError> {
             cfg.collection, cfg.datetime
         )));
     }
-    items.sort_by(|a, b| a.properties.datetime.cmp(&b.properties.datetime));
+    // sort by the parsed time coordinate (robust to mixed datetime formats);
+    // items whose datetime cannot be parsed sort first and are skipped below
+    let time_key = |item: &StacItem| {
+        item.properties
+            .datetime
+            .as_deref()
+            .and_then(fractional_year)
+            .unwrap_or(f64::NEG_INFINITY)
+    };
+    items.sort_by(|a, b| time_key(a).total_cmp(&time_key(b)));
 
     let wgs_bbox = BBox::new(w, s, e, n);
     let mut skipped = Vec::new();
@@ -260,12 +269,8 @@ pub fn stack(cfg: &StackConfig) -> Result<StackedCube, StackError> {
     let mut slices = Vec::with_capacity(nt);
     for (ti, (meta, rasters)) in scenes.into_iter().enumerate() {
         for (bi, raster) in rasters.iter().enumerate() {
-            let src = raster.data();
-            for r in 0..ny {
-                for c in 0..nx {
-                    data[[bi, r, c, ti]] = src[[r, c]];
-                }
-            }
+            data.slice_mut(ndarray::s![bi, .., .., ti])
+                .assign(raster.data());
         }
         times.push(meta.time);
         slices.push(meta);
