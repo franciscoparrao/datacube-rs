@@ -234,14 +234,16 @@ impl PyCube {
         Ok((slope.into_pyarray(py), pvalue.into_pyarray(py)))
     }
 
-    /// Aggregate time slices into composites. `window` is "same_time" or
-    /// "monthly" (or "period:<width>" in time units); `method` is one of
-    /// median, mean, min, max.
+    /// Aggregate time slices into composites. `window` is "same_time",
+    /// "monthly" (calendar months), "yearly" (calendar years) or
+    /// "period:<width>" (fixed bins in time units, anchored on the first
+    /// observation); `method` is one of median, mean, min, max.
     #[pyo3(signature = (window="monthly", method="median"))]
     fn composite(&self, py: Python<'_>, window: &str, method: &str) -> PyResult<Self> {
         let win = match window {
             "same_time" => CompositeWindow::SameTime,
-            "monthly" => CompositeWindow::Period(1.0 / 12.0),
+            "monthly" => CompositeWindow::CalendarMonth,
+            "yearly" => CompositeWindow::CalendarYear,
             other => other
                 .strip_prefix("period:")
                 .and_then(|w| w.parse::<f64>().ok())

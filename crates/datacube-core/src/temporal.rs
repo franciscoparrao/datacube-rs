@@ -25,9 +25,19 @@ pub enum CompositeWindow {
     /// Merge slices with an identical time coordinate (e.g. adjacent
     /// satellite tiles acquired at the same instant).
     SameTime,
-    /// Fixed-width bins starting at the first time (e.g. `1.0 / 12.0` for
-    /// monthly composites on a fractional-year axis).
+    /// Fixed-width bins starting at the first time (physical windows such
+    /// as 16-day composites: `16.0 / 365.25` on a fractional-year axis).
+    /// Bins are anchored on the first observation, so the grouping depends
+    /// on when the series starts; for calendar months use [`CalendarMonth`].
+    ///
+    /// [`CalendarMonth`]: CompositeWindow::CalendarMonth
     Period(f64),
+    /// Calendar-month bins recovered exactly from a fractional-year time
+    /// axis (the inverse of `datacube_io::fractional_year`): each slice is
+    /// keyed by its `(year, month)`, independent of when the series starts.
+    CalendarMonth,
+    /// Calendar-year bins on a fractional-year time axis.
+    CalendarYear,
 }
 
 impl Cube {
@@ -160,17 +170,73 @@ fn group_times(time: &[f64], window: CompositeWindow) -> Result<Vec<Vec<usize>>,
                 )));
             }
             let t0 = time.first().copied().unwrap_or(0.0);
-            let mut groups: Vec<(u64, Vec<usize>)> = Vec::new();
-            for (i, &t) in time.iter().enumerate() {
-                let bin = ((t - t0) / width).floor() as u64;
-                match groups.last_mut() {
-                    Some((b, g)) if *b == bin => g.push(i),
-                    _ => groups.push((bin, vec![i])),
-                }
-            }
-            Ok(groups.into_iter().map(|(_, g)| g).collect())
+            group_by_key(time, |t| ((t - t0) / width).floor() as i64)
+        }
+        CompositeWindow::CalendarMonth => group_by_key(time, |t| {
+            let (year, month) = calendar_year_month(t);
+            i64::from(year) * 12 + i64::from(month) - 1
+        }),
+        CompositeWindow::CalendarYear => {
+            group_by_key(time, |t| i64::from(calendar_year_month(t).0))
         }
     }
+}
+
+/// Groups consecutive indices whose times map to the same bin key (the time
+/// axis is ascending, so equal keys are always adjacent).
+fn group_by_key(time: &[f64], key: impl Fn(f64) -> i64) -> Result<Vec<Vec<usize>>, CubeError> {
+    if time.iter().any(|t| !t.is_finite()) {
+        return Err(CubeError::InvalidParameter(
+            "calendar/period composites require finite time coordinates".into(),
+        ));
+    }
+    let mut groups: Vec<(i64, Vec<usize>)> = Vec::new();
+    for (i, &t) in time.iter().enumerate() {
+        let bin = key(t);
+        match groups.last_mut() {
+            Some((b, g)) if *b == bin => g.push(i),
+            _ => groups.push((bin, vec![i])),
+        }
+    }
+    Ok(groups.into_iter().map(|(_, g)| g).collect())
+}
+
+/// Cumulative days before each month in a non-leap year.
+const CUM_DAYS: [f64; 12] = [
+    0.0, 31.0, 59.0, 90.0, 120.0, 151.0, 181.0, 212.0, 243.0, 273.0, 304.0, 334.0,
+];
+
+fn is_leap(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+/// Recovers `(year, month)` from a fractional-year coordinate — the exact
+/// inverse of the month binning in `datacube_io::fractional_year`.
+///
+/// A tolerance of ~0.09 s absorbs the floating-point round-trip so that
+/// coordinates computed for exact month boundaries (e.g. `2024 + 31/366`
+/// for 2024-02-01T00:00Z) land in the month they name.
+fn calendar_year_month(t: f64) -> (i32, u32) {
+    const EPS: f64 = 1e-6; // days
+    let mut year = t.floor() as i32;
+    let days_in_year = if is_leap(year) { 366.0 } else { 365.0 };
+    // 0-based day-of-year (+ intra-day fraction)
+    let mut doy = (t - f64::from(year)) * days_in_year + EPS;
+    if doy >= days_in_year {
+        // t sat a hair below an exact year boundary: it names Jan 1 of the
+        // next year
+        year += 1;
+        doy = 0.0;
+    }
+    let leap_shift = if is_leap(year) { 1.0 } else { 0.0 };
+    let month = (0..12)
+        .rev()
+        .find(|&m| {
+            let start = CUM_DAYS[m] + if m >= 2 { leap_shift } else { 0.0 };
+            doy >= start
+        })
+        .unwrap_or(0);
+    (year, month as u32 + 1)
 }
 
 /// NaN-free reduction; `values` may be reordered. Empty input → NaN.
@@ -212,6 +278,83 @@ mod tests {
         assert_eq!(c.data()[[0, 0, 0, 0]], 2.0); // median(1, 9, 2)
         assert_eq!(c.data()[[0, 0, 0, 1]], 5.0); // median(4, 6)
         assert_abs_diff_eq!(c.time()[0], 2024.01, epsilon = 1e-12);
+    }
+
+    /// Fractional year of a calendar date, mirroring `datacube_io::fractional_year`.
+    fn fy(year: i32, doy0: u32, day_frac: f64) -> f64 {
+        let days = if is_leap(year) { 366.0 } else { 365.0 };
+        f64::from(year) + (f64::from(doy0) + day_frac) / days
+    }
+
+    #[test]
+    fn calendar_month_bins_are_anchor_independent() {
+        // Jan 20 and Feb 5: 16 days apart, so Period(1/12) anchored on the
+        // first observation lumps them together; CalendarMonth must not.
+        let times = [fy(2023, 19, 0.5), fy(2023, 35, 0.5)];
+        let cube = cube_1px(&[1.0, 3.0], &times);
+        let p = cube
+            .composite(CompositeWindow::Period(1.0 / 12.0), CompositeMethod::Mean)
+            .unwrap();
+        assert_eq!(p.dims().3, 1, "period bins anchor on the first obs");
+        let c = cube
+            .composite(CompositeWindow::CalendarMonth, CompositeMethod::Mean)
+            .unwrap();
+        assert_eq!(c.dims().3, 2, "calendar bins split Jan from Feb");
+        assert_eq!(c.data()[[0, 0, 0, 0]], 1.0);
+        assert_eq!(c.data()[[0, 0, 0, 1]], 3.0);
+    }
+
+    #[test]
+    fn calendar_month_handles_exact_boundaries_and_leap_years() {
+        // exact midnight coordinates around the Jan/Feb boundary, leap year
+        assert_eq!(calendar_year_month(fy(2024, 30, 0.0)), (2024, 1)); // Jan 31
+        assert_eq!(calendar_year_month(fy(2024, 31, 0.0)), (2024, 2)); // Feb 1
+        assert_eq!(calendar_year_month(fy(2024, 59, 0.0)), (2024, 2)); // Feb 29
+        assert_eq!(calendar_year_month(fy(2024, 60, 0.0)), (2024, 3)); // Mar 1
+        // non-leap year: Mar 1 is doy0 59
+        assert_eq!(calendar_year_month(fy(2023, 59, 0.0)), (2023, 3));
+        // late in the day stays in its month
+        assert_eq!(calendar_year_month(fy(2023, 30, 0.99)), (2023, 1));
+        // a coordinate a hair below an exact year boundary is Jan 1
+        assert_eq!(calendar_year_month(2024.0 - 1e-14), (2024, 1));
+        assert_eq!(calendar_year_month(2023.0), (2023, 1));
+        assert_eq!(calendar_year_month(fy(2023, 364, 0.5)), (2023, 12));
+    }
+
+    #[test]
+    fn calendar_month_separates_same_month_across_years() {
+        let times = [fy(2023, 10, 0.0), fy(2024, 10, 0.0)];
+        let cube = cube_1px(&[1.0, 5.0], &times);
+        let c = cube
+            .composite(CompositeWindow::CalendarMonth, CompositeMethod::Mean)
+            .unwrap();
+        assert_eq!(c.dims().3, 2, "Jan 2023 and Jan 2024 are distinct bins");
+    }
+
+    #[test]
+    fn calendar_year_composite() {
+        let times = [
+            fy(2023, 5, 0.0),
+            fy(2023, 200, 0.0),
+            fy(2024, 5, 0.0),
+            fy(2024, 300, 0.0),
+        ];
+        let cube = cube_1px(&[1.0, 3.0, 10.0, 20.0], &times);
+        let c = cube
+            .composite(CompositeWindow::CalendarYear, CompositeMethod::Mean)
+            .unwrap();
+        assert_eq!(c.dims().3, 2);
+        assert_abs_diff_eq!(c.data()[[0, 0, 0, 0]], 2.0, epsilon = 1e-12);
+        assert_abs_diff_eq!(c.data()[[0, 0, 0, 1]], 15.0, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn calendar_composite_rejects_non_finite_times() {
+        let cube = cube_1px(&[1.0, 2.0], &[2023.0, f64::NAN]);
+        assert!(
+            cube.composite(CompositeWindow::CalendarMonth, CompositeMethod::Mean)
+                .is_err()
+        );
     }
 
     #[test]

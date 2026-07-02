@@ -416,8 +416,17 @@ publicable por sí sola.
    tags v0.1.0–v0.4.0, CI en `.github/workflows/ci.yml`, `cargo fmt` aplicado
    a todo el workspace). Verificado: cargo test 12 suites ok, clippy limpio
    (incl. `--features stac`), pytest 14/14 con el módulo reconstruido.
-2. **Paridad funcional ARD** — lo que un usuario de gdalcubes/ODC nota el día 1:
-   H2 (máscara SCL por píxel), H1 (composite calendario), H3 (GridSpec).
+2. **Paridad funcional ARD** — ✅ **ejecutado el 2026-07-02 (v0.6.0)**:
+   H2 (`MaskConfig` en `StackConfig`: asset de calidad leído 1×/escena,
+   resample nearest a la grilla de cada banda, NaN fuera de `keep`, aplicado
+   antes del resample bilineal; CLI `--mask-scl --mask-asset --mask-keep`),
+   H1 (`CompositeWindow::{CalendarMonth, CalendarYear}` con inversa exacta de
+   `fractional_year`; `--composite monthly` ahora es calendario, `yearly`
+   nuevo, `Period` queda para ventanas físicas; Python `"monthly"`/`"yearly"`),
+   H3 (`GridSpec { epsg, resolution, bbox, align }` en `StackConfig`:
+   referencia sintética construida antes del loop → grilla reproducible;
+   CLI `--grid-epsg --grid-res --grid-bbox --grid-align`).
+   Verificado: tests core 55 + io 15, pytest 15/15, clippy limpio.
 3. **El diferenciador** — la tesis "mejor motor de cubos":
    H4 (georef en core) → M2 (Zarr comprimido + f32) → H5 (ejecución por chunks
    sobre GeoZarr) → M3 (lecturas paralelas). En ese orden: cada paso habilita el

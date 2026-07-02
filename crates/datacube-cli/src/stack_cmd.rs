@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use datacube_core::{CompositeMethod, CompositeWindow, indices, stats};
-use datacube_io::{StackConfig, StackedCube, stack};
+use datacube_io::{GridSpec, MaskConfig, StackConfig, StackedCube, stack};
 use surtgis_core::io::write_geotiff;
 use surtgis_core::{CRS, GeoTransform, Raster};
 
@@ -44,6 +44,31 @@ pub struct StackArgs {
     /// reference grid (cross-zone mosaicking is on by default)
     #[arg(long)]
     no_cross_zone: bool,
+    /// Mask pixels per scene with the S2 SCL band, keeping only clear classes
+    /// (vegetation, bare, water, unclassified, snow); see --mask-asset/--mask-keep
+    #[arg(long)]
+    mask_scl: bool,
+    /// Quality-band asset key for --mask-scl
+    #[arg(long, default_value = "SCL")]
+    mask_asset: String,
+    /// Comma-separated class values kept by --mask-scl
+    #[arg(long, value_delimiter = ',', default_values_t = [4u16, 5, 6, 7, 11])]
+    mask_keep: Vec<u16>,
+    /// Explicit target grid EPSG (requires --grid-res); the cube grid then no
+    /// longer depends on which scene is read first
+    #[arg(long)]
+    grid_epsg: Option<u32>,
+    /// Explicit grid resolution in CRS units (requires --grid-epsg)
+    #[arg(long)]
+    grid_res: Option<f64>,
+    /// Explicit grid extent in the target CRS: minx,miny,maxx,maxy
+    /// (default: derived from --bbox)
+    #[arg(long, value_delimiter = ',', allow_hyphen_values = true)]
+    grid_bbox: Option<Vec<f64>>,
+    /// Snap the grid origin outward to a multiple of this value
+    /// (e.g. 60 to align with the Sentinel-2 MGRS grid)
+    #[arg(long)]
+    grid_align: Option<f64>,
     /// Composite slices before analysis
     #[arg(long, value_enum)]
     composite: Option<CompositeKind>,
@@ -126,8 +151,10 @@ pub enum IndexKind {
 pub enum CompositeKind {
     /// Merge tiles acquired at the same instant
     SameTime,
-    /// Monthly bins (1/12 of a fractional year)
+    /// Calendar-month bins (year + month recovered from the time axis)
     Monthly,
+    /// Calendar-year bins
+    Yearly,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -153,6 +180,34 @@ pub fn run(args: &StackArgs) -> Result<()> {
     if let Some(mc) = args.max_cloud {
         cfg = cfg.max_cloud_cover(mc);
     }
+    if args.mask_scl {
+        cfg = cfg.mask(MaskConfig {
+            asset: args.mask_asset.clone(),
+            keep: args.mask_keep.clone(),
+            ..MaskConfig::scl()
+        });
+    }
+    match (args.grid_epsg, args.grid_res) {
+        (Some(epsg), Some(res)) => {
+            let mut spec = GridSpec::new(epsg, res);
+            if let Some(gb) = &args.grid_bbox {
+                if gb.len() != 4 {
+                    bail!("--grid-bbox needs minx,miny,maxx,maxy");
+                }
+                spec = spec.bbox(gb[0], gb[1], gb[2], gb[3]);
+            }
+            if let Some(step) = args.grid_align {
+                spec = spec.align(step);
+            }
+            cfg = cfg.grid(spec);
+        }
+        (None, None) => {
+            if args.grid_bbox.is_some() || args.grid_align.is_some() {
+                bail!("--grid-bbox/--grid-align require --grid-epsg and --grid-res");
+            }
+        }
+        _ => bail!("--grid-epsg and --grid-res must be given together"),
+    }
 
     eprintln!("searching {} in {} ...", args.collection, args.catalog);
     // destructure to take ownership of the cube (no full-cube clone)
@@ -173,7 +228,8 @@ pub fn run(args: &StackArgs) -> Result<()> {
     if let Some(kind) = args.composite {
         let window = match kind {
             CompositeKind::SameTime => CompositeWindow::SameTime,
-            CompositeKind::Monthly => CompositeWindow::Period(1.0 / 12.0),
+            CompositeKind::Monthly => CompositeWindow::CalendarMonth,
+            CompositeKind::Yearly => CompositeWindow::CalendarYear,
         };
         let method = match args.composite_method {
             CompositeAgg::Median => CompositeMethod::Median,

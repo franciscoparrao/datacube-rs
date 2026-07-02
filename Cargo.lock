@@ -445,7 +445,7 @@ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
 name = "datacube-cli"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -458,7 +458,7 @@ dependencies = [
 
 [[package]]
 name = "datacube-core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "approx",
  "criterion",
@@ -470,7 +470,7 @@ dependencies = [
 
 [[package]]
 name = "datacube-io"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "approx",
  "datacube-core",
@@ -482,7 +482,7 @@ dependencies = [
 
 [[package]]
 name = "datacube-python"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "datacube-core",
  "ndarray 0.16.1",
@@ -492,7 +492,7 @@ dependencies = [
 
 [[package]]
 name = "datacube-wasm"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "datacube-core",
  "js-sys",
@@ -504,7 +504,7 @@ dependencies = [
 
 [[package]]
 name = "datacube-zarr"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "datacube-core",
  "ndarray 0.16.1",
@@ -640,12 +640,6 @@ name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
-
-[[package]]
-name = "foldhash"
-version = "0.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
 name = "foldhash"
@@ -870,24 +864,13 @@ dependencies = [
 
 [[package]]
 name = "hashbrown"
-version = "0.15.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
-dependencies = [
- "allocator-api2",
- "equivalent",
- "foldhash 0.1.5",
-]
-
-[[package]]
-name = "hashbrown"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
 dependencies = [
  "allocator-api2",
  "equivalent",
- "foldhash 0.2.0",
+ "foldhash",
 ]
 
 [[package]]
@@ -1319,15 +1302,6 @@ name = "log"
 version = "0.4.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "953f07c43838f8e6f9758cab68bf5bed85465e7587ebe0b823f1bcd81978ad3a"
-
-[[package]]
-name = "lru"
-version = "0.12.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "234cf4f4a04dc1f57e24b96cc0cd600cf2af460d4161ac5ecdd0af8e1f3b2a38"
-dependencies = [
- "hashbrown 0.15.5",
-]
 
 [[package]]
 name = "lru"
@@ -2336,12 +2310,12 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "surtgis-cloud"
-version = "0.16.4"
+version = "0.17.0"
 dependencies = [
  "byteorder",
  "flate2",
  "futures",
- "lru 0.12.5",
+ "lru",
  "ndarray 0.16.1",
  "num-traits",
  "reqwest",
@@ -2355,7 +2329,7 @@ dependencies = [
 
 [[package]]
 name = "surtgis-core"
-version = "0.16.4"
+version = "0.17.0"
 dependencies = [
  "anyhow",
  "geo",
@@ -3106,7 +3080,7 @@ dependencies = [
  "itoa",
  "libz-sys",
  "log",
- "lru 0.16.4",
+ "lru",
  "moka",
  "ndarray 0.17.2",
  "num",

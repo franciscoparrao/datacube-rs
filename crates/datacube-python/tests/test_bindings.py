@@ -106,6 +106,18 @@ def test_cube_composite_same_time_merges_tiles():
     assert out[0, 0, 1, 0] == 3.0
 
 
+def test_cube_composite_monthly_uses_calendar_months():
+    # Jan 20 and Feb 5, 2023: 16 days apart, but distinct calendar months
+    times = np.array([2023.0 + 19.5 / 365.0, 2023.0 + 35.5 / 365.0])
+    data = np.array([1.0, 3.0]).reshape(1, 1, 1, 2)
+    cube = dc.Cube(data, times, ["b"])
+    monthly = cube.composite("monthly", "mean")
+    assert monthly.dims == (1, 1, 1, 2)
+    out = monthly.to_numpy()
+    assert out[0, 0, 0, 0] == 1.0
+    assert out[0, 0, 0, 1] == 3.0
+
+
 def test_cube_gapfill_interpolates():
     data = np.array([1.0, np.nan, np.nan, 7.0]).reshape(1, 1, 1, 4)
     cube = dc.Cube(data, np.arange(4, dtype=float), ["b"])

@@ -30,7 +30,7 @@
 mod stack;
 mod time;
 
-pub use stack::{SliceMeta, StackConfig, StackedCube, stack};
+pub use stack::{GridSpec, MaskConfig, SliceMeta, StackConfig, StackedCube, stack};
 pub use time::fractional_year;
 
 use thiserror::Error;

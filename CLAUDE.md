@@ -181,11 +181,12 @@ proj) en vez de reinventar I/O. Diferenciador: cubo Rust nativo sobre GeoZarr.
 - Falta para GeoZarr-CF pleno (refinamiento): variables-coordenada separadas,
   `grid_mapping`/CRS WKT, atributos CF por-banda. Hoy es cubo-en-Zarr-V3 fiel.
 
-## Estado (2026-06-30) — v0.5
-**6 targets**: core (stats+temporal+bandmath), io (STAC/COG+cross-zone), CLI,
-PyO3, WASM, **zarr (GeoZarr backing store)**. Validación estadística 103/103 a
-1e-9; band-math vs numpy 1e-12 (pytest 14/14); zarr roundtrip + interop Python;
-core 50 unit + 9 doctests. cargo test --workspace verde.
+## Estado (2026-07-02) — v0.6
+**6 targets**: core (stats+temporal+bandmath), io (STAC/COG+cross-zone+
+**mask SCL+GridSpec**), CLI, PyO3, WASM, zarr (GeoZarr backing store).
+Validación estadística 103/103 a 1e-9; band-math vs numpy 1e-12; pytest
+15/15; zarr roundtrip + interop Python; core 55 unit + 9 doctests, io 15.
+cargo test --workspace verde.
 
 ## Auditoría + quick wins (2026-07-02)
 - `AUDIT.md` (raíz): auditoría completa del motor — 0 critical, 5 HIGH de
@@ -200,9 +201,41 @@ core 50 unit + 9 doctests. cargo test --workspace verde.
   `cargo fmt` aplicado a todo el workspace (antes no estaba formateado).
 - OJO pyo3 0.29: el método es `py.detach(...)`, NO `allow_threads` (renombrado).
 
+## Paridad ARD — AUDIT grupo 2 (v0.6, 2026-07-02)
+- **H1 composite calendario**: `CompositeWindow::{CalendarMonth, CalendarYear}`
+  en core (`temporal.rs`): bin por `(año, mes)` recuperado con la inversa
+  exacta de `fractional_year` (tabla CUM_DAYS + leap shift, tolerancia 1e-6
+  días para bordes exactos de mes/año). `--composite monthly` del CLI y
+  `"monthly"` de Python ahora son calendario (antes `Period(1/12)` anclado en
+  la 1ª observación → no reproducible); `yearly` nuevo en ambos; `Period`
+  queda para ventanas físicas (16 días etc.). `group_by_key` rechaza tiempos
+  no finitos.
+- **H2 máscara por píxel**: `MaskConfig { asset, keep, resample }` +
+  `StackConfig::mask()`; `MaskConfig::scl()` = SCL keep [4,5,6,7,11] nearest.
+  El asset de máscara se lee 1×/escena (`read_asset`, helper extraído) y
+  `apply_mask` lo resamplea nearest a la grilla de cada banda y pone NaN
+  donde la clase no está en keep — ANTES del resample bilineal a la
+  referencia (no sangra nubes a vecinos). Nodata/NaN del mask → masked.
+  CLI: `--mask-scl` (+ `--mask-asset`, `--mask-keep`).
+- **H3 GridSpec**: `GridSpec { epsg, resolution, bbox: Option<[f64;4]> en CRS
+  destino, align: Option<f64> }` + `StackConfig::grid()`. Cuando está seteado,
+  `reference_from_grid` construye la referencia sintética (Raster vacío con
+  transform/CRS del spec, origen = esquina sup-izq, snap outward con align,
+  guard 1..=100_000 px/eje) ANTES del loop → grilla independiente del orden
+  del catálogo/nubes/red. bbox None → deriva reproyectando el bbox WGS84
+  (`reproject_bbox_to_cog`; EPSG no-UTM requiere bbox explícito). CLI:
+  `--grid-epsg --grid-res` (juntos) + `--grid-bbox --grid-align`.
+- stack() ahora chequea `scenes.is_empty()` (antes el error Empty salía de
+  reference=None, que con GridSpec ya no ocurre).
+- Verificación: core 55 unit (5 nuevos calendario), io 15 (7 nuevos
+  mask/grid), pytest 15/15, clippy limpio, e2e vs PC con
+  `--mask-scl --grid-epsg/--grid-res --composite monthly`.
+
 ## Próximos pasos al retomar
-1. Paper (C&G/EMS): material listo + band-math + GeoZarr. Opciones: §4.4 con
-   NDVI in-engine; añadir GeoZarr como sección de arquitectura/persistencia.
+1. Paper (C&G/EMS): material listo + band-math + GeoZarr + ARD (mask/grid).
+   Opciones: §4.4 con NDVI in-engine; sección GeoZarr; mencionar cube_view.
 2. Pendiente Zenodo DOI (gated en ORCID).
-3. Opcional v0.6: GeoZarr-CF pleno (coord vars, grid_mapping); object-store
+3. AUDIT grupo 3 (diferenciador): H4 georef en core → M2 zarr zstd+f32 →
+   H5 ejecución por chunks sobre GeoZarr → M3 lecturas STAC paralelas.
+4. Opcional: GeoZarr-CF pleno (coord vars, grid_mapping); object-store
    (S3/HTTP) vía zarrs async; exponer datacube-io (stack STAC) a Python.
