@@ -211,7 +211,7 @@ xarray/stackstac, sits).
   level 5) y store f32 ambos decodifican transparentemente, NDVI recalculado
   coincide. (c) sharding queda pendiente (solo relevante para object store).
 
-### [MEDIUM] M3 — Lecturas STAC secuenciales
+### [MEDIUM] M3 — Lecturas STAC secuenciales ✅ resuelto v0.9.0
 
 - **Archivo**: `crates/datacube-io/src/stack.rs:193-245`
 - **Dimensión**: D1 (latencia, no complejidad)
@@ -228,6 +228,23 @@ xarray/stackstac, sits).
   válida secuencialmente, luego el resto en paralelo), y `StacClientBlocking` /
   firma SAS deben ser `Sync` o clonables por worker. Exponer `concurrency: usize`
   en `StackConfig`.
+- **Resuelto en v0.9.0**: `stack()` se dividió en dos fases. *Bootstrap*
+  (solo si `cfg.grid` es `None`): lee ítems uno a uno, secuencial, hasta que
+  el primero exitoso fija la grilla de referencia. *Paralela*: el resto de
+  los ítems (o **todos**, si `GridSpec` ya fijó la referencia de antemano —
+  caso común dado H3) se filtran con `plan_scene` (chequeo barato sin red:
+  datetime/nubes/cross-zone) y se leen con `rayon::ThreadPoolBuilder::new()
+  .num_threads(cfg.concurrency)` — un pool acotado dedicado, separado del
+  pool global de Rayon usado para cómputo por-píxel. `into_par_iter()
+  .collect()` sobre un `Vec` preserva el orden de entrada, así que el eje
+  temporal del cubo sigue ordenado sin trabajo extra. `StacClientBlocking`
+  resultó `Sync` sin cambios (runtime tokio compartido `'static` + `Mutex`
+  interno para el cache SAS). Nuevo `StackConfig::concurrency` (default 8) +
+  CLI `--concurrency`. Verificado e2e contra Planetary Computer (49 ítems,
+  Santiago ene-abr 2024): **4m41s → 47s** (~6×) con `--concurrency 8` vs `1`,
+  mismo orden de escenas, mismos skips, mismo cubo resultante byte a byte
+  (comparado vía el reporte JSON). También probado con `GridSpec` fijo (toda
+  la lectura va a la fase paralela desde el ítem 0, sin bootstrap).
 
 ### [MEDIUM] M4 — Copia escena→cubo elemento a elemento y clon completo del cubo en el CLI
 
@@ -460,7 +477,12 @@ publicable por sí sola.
    **M2 + H5(parcial) ejecutados el 2026-07-02 (v0.8.0)**: ver detalle en los
    hallazgos M2/H5 arriba — Zarr comprimido zstd + f32 opcional, y
    `read_zarr_chunked`/`ZarrCubeWriter` para ejecución por chunks acotada en
-   memoria sobre GeoZarr. Falta M3 (lecturas STAC paralelas) y, dentro de H5,
-   el streaming en `stack()` mismo y el grafo lazy.
+   memoria sobre GeoZarr.
+   **M3 ejecutado el 2026-07-02 (v0.9.0)**: lecturas STAC en pool paralelo
+   acotado (`StackConfig::concurrency`, default 8) — ver detalle arriba;
+   ~6× de aceleración medido e2e. AUDIT grupo 3 queda con dos ítems abiertos,
+   ambos dentro de H5: streaming en `stack()` mismo (paso 1, elimina el
+   `Vec<Raster>` intermedio) y el grafo lazy `stack→mask→composite→index→
+   trend` evaluado por chunk (paso 3, v0.7+ en el roadmap original).
 4. **Ecosistema/adopción**: M6 (desacoplar surtgis), L6 (stubs + wheels PyPI),
    M9 (feature serde en core). Sin esto el motor es excelente pero solo tuyo.

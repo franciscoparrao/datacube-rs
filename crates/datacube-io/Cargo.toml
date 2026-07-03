@@ -10,9 +10,11 @@ authors.workspace = true
 [dependencies]
 datacube-core = { workspace = true }
 ndarray = { workspace = true }
+rayon = { workspace = true }
 thiserror = { workspace = true }
 surtgis-core = { workspace = true }
 surtgis-cloud = { workspace = true, features = ["native"] }
 
 [dev-dependencies]
 approx = { workspace = true }
+serde_json = { workspace = true }

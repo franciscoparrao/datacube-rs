@@ -445,7 +445,7 @@ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
 name = "datacube-cli"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -458,7 +458,7 @@ dependencies = [
 
 [[package]]
 name = "datacube-core"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "approx",
  "criterion",
@@ -470,11 +470,13 @@ dependencies = [
 
 [[package]]
 name = "datacube-io"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "approx",
  "datacube-core",
  "ndarray 0.16.1",
+ "rayon",
+ "serde_json",
  "surtgis-cloud",
  "surtgis-core",
  "thiserror",
@@ -482,7 +484,7 @@ dependencies = [
 
 [[package]]
 name = "datacube-python"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "datacube-core",
  "ndarray 0.16.1",
@@ -492,7 +494,7 @@ dependencies = [
 
 [[package]]
 name = "datacube-wasm"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "datacube-core",
  "js-sys",
@@ -504,7 +506,7 @@ dependencies = [
 
 [[package]]
 name = "datacube-zarr"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "approx",
  "datacube-core",

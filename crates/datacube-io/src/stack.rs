@@ -1,5 +1,6 @@
 use datacube_core::{Cube, GeoRef};
 use ndarray::{Array2, Array4};
+use rayon::prelude::*;
 use surtgis_cloud::blocking::{CogReaderBlocking, StacClientBlocking};
 use surtgis_cloud::stac_models::StacItem;
 use surtgis_cloud::{
@@ -123,6 +124,10 @@ pub struct StackConfig {
     pub mask: Option<MaskConfig>,
     /// Explicit target grid. `None` = the first readable scene defines it.
     pub grid: Option<GridSpec>,
+    /// Number of scenes read concurrently once the reference grid is known.
+    /// Stacking is I/O-bound (HTTP range requests), so this is a worker-pool
+    /// size independent of CPU count, not a CPU-bound Rayon setting.
+    pub concurrency: usize,
 }
 
 impl StackConfig {
@@ -142,6 +147,7 @@ impl StackConfig {
             cross_zone_mosaic: true,
             mask: None,
             grid: None,
+            concurrency: 8,
         }
     }
 
@@ -198,6 +204,15 @@ impl StackConfig {
         self
     }
 
+    /// Number of scenes read concurrently once the reference grid is known
+    /// (default 8). Stacking is network-bound, so raising this past the
+    /// default can meaningfully cut wall-clock time for 30-100 scene stacks;
+    /// stay mindful of the catalog's rate limits.
+    pub fn concurrency(mut self, n: usize) -> Self {
+        self.concurrency = n;
+        self
+    }
+
     fn validate(&self) -> Result<(), StackError> {
         if self.assets.is_empty() {
             return Err(StackError::Config(
@@ -244,6 +259,9 @@ impl StackConfig {
                     "grid align step must be finite and > 0, got {step}"
                 )));
             }
+        }
+        if self.concurrency == 0 {
+            return Err(StackError::Config("concurrency must be > 0".into()));
         }
         Ok(())
     }
@@ -342,57 +360,81 @@ pub fn stack(cfg: &StackConfig) -> Result<StackedCube, StackError> {
     let mut ref_epsg: Option<u32> = cfg.grid.as_ref().map(|g| g.epsg);
     let mut scenes: Vec<(SliceMeta, Vec<Raster<f64>>)> = Vec::new();
 
-    for item in &items {
-        let Some(datetime) = item.properties.datetime.clone() else {
-            skipped.push(format!("{}: item has no datetime", item.id));
-            continue;
-        };
-        let Some(time) = fractional_year(&datetime) else {
-            skipped.push(format!("{}: unparseable datetime '{datetime}'", item.id));
-            continue;
-        };
-        if let (Some(max), Some(cc)) = (cfg.max_cloud_cover, item.properties.eo_cloud_cover)
-            && cc > max
-        {
-            skipped.push(format!("{}: cloud cover {cc:.0}% > {max:.0}%", item.id));
-            continue;
-        }
-        // when cross-zone mosaicking is off, keep the old behaviour: scenes
-        // in a different CRS than the reference are skipped.
-        if !cfg.cross_zone_mosaic
-            && let (Some(re), Some(ie)) = (ref_epsg, item.epsg())
-            && re != ie
-        {
-            skipped.push(format!(
-                "{}: EPSG {ie} differs from reference EPSG {re} (cross-zone mosaic off)",
-                item.id
-            ));
-            continue;
-        }
-
-        match read_scene(
-            &client,
-            item,
-            cfg,
-            &wgs_bbox,
-            needs_signing,
-            reference.as_ref(),
-            ref_epsg,
-        ) {
-            Ok(rasters) => {
-                if reference.is_none() {
+    // Bootstrap phase (only needed when the grid isn't already fixed by a
+    // GridSpec): read items one at a time, sequentially, until the first
+    // succeeds and defines the reference grid. `bootstrapped` counts every
+    // item this consumes (successes and failures alike) so the parallel
+    // phase below never reconsiders them.
+    let mut bootstrapped = 0;
+    if reference.is_none() {
+        for item in &items {
+            bootstrapped += 1;
+            let meta = match plan_scene(item, cfg, ref_epsg) {
+                Ok(meta) => meta,
+                Err(reason) => {
+                    skipped.push(reason);
+                    continue;
+                }
+            };
+            match read_scene(&client, item, cfg, &wgs_bbox, needs_signing, None, ref_epsg) {
+                Ok(rasters) => {
                     reference = Some(rasters[0].clone());
                     ref_epsg = item.epsg();
+                    scenes.push((meta, rasters));
+                    break;
                 }
-                let meta = SliceMeta {
-                    item_id: item.id.clone(),
-                    datetime,
-                    time,
-                    cloud_cover: item.properties.eo_cloud_cover,
-                };
-                scenes.push((meta, rasters));
+                Err(err) => skipped.push(format!("{}: {err}", meta.item_id)),
             }
-            Err(err) => skipped.push(format!("{}: {err}", item.id)),
+        }
+    }
+
+    // Parallel phase: once the reference grid is known (from GridSpec, or
+    // from the bootstrap above), every remaining scene reads independently —
+    // stacking is I/O-bound (HTTP range requests), so a bounded worker pool
+    // sized by `cfg.concurrency` cuts wall-clock time close to N-fold for
+    // N-scene stacks. `into_par_iter().collect()` on a `Vec` preserves the
+    // candidates' order, keeping the cube's time axis sorted.
+    let remaining = &items[bootstrapped..];
+    if !remaining.is_empty() {
+        let candidates: Vec<(&StacItem, SliceMeta)> = remaining
+            .iter()
+            .filter_map(|item| match plan_scene(item, cfg, ref_epsg) {
+                Ok(meta) => Some((item, meta)),
+                Err(reason) => {
+                    skipped.push(reason);
+                    None
+                }
+            })
+            .collect();
+
+        if !candidates.is_empty() {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(cfg.concurrency)
+                .build()
+                .map_err(|e| StackError::Config(format!("failed to build read pool: {e}")))?;
+            let results: Vec<SceneReadResult> = pool.install(|| {
+                candidates
+                    .into_par_iter()
+                    .map(|(item, meta)| {
+                        let result = read_scene(
+                            &client,
+                            item,
+                            cfg,
+                            &wgs_bbox,
+                            needs_signing,
+                            reference.as_ref(),
+                            ref_epsg,
+                        );
+                        (meta, result)
+                    })
+                    .collect()
+            });
+            for (meta, result) in results {
+                match result {
+                    Ok(rasters) => scenes.push((meta, rasters)),
+                    Err(err) => skipped.push(format!("{}: {err}", meta.item_id)),
+                }
+            }
         }
     }
 
@@ -432,6 +474,49 @@ pub fn stack(cfg: &StackConfig) -> Result<StackedCube, StackError> {
         skipped,
         transform,
         epsg,
+    })
+}
+
+/// One scene's read outcome, paired with the metadata it would use if
+/// successful (produced by the parallel phase of [`stack`]).
+type SceneReadResult = (SliceMeta, Result<Vec<Raster<f64>>, StackError>);
+
+/// Cheap, network-free pre-filter: item metadata (datetime, cloud cover,
+/// cross-zone-off EPSG mismatch) decides whether `item` is even worth an I/O
+/// attempt. `Ok` carries the [`SliceMeta`] to use if the read succeeds;
+/// `Err` carries the skip reason (`"<id>: ..."`) to report as-is.
+fn plan_scene(
+    item: &StacItem,
+    cfg: &StackConfig,
+    ref_epsg: Option<u32>,
+) -> Result<SliceMeta, String> {
+    let Some(datetime) = item.properties.datetime.clone() else {
+        return Err(format!("{}: item has no datetime", item.id));
+    };
+    let Some(time) = fractional_year(&datetime) else {
+        return Err(format!("{}: unparseable datetime '{datetime}'", item.id));
+    };
+    if let (Some(max), Some(cc)) = (cfg.max_cloud_cover, item.properties.eo_cloud_cover)
+        && cc > max
+    {
+        return Err(format!("{}: cloud cover {cc:.0}% > {max:.0}%", item.id));
+    }
+    // when cross-zone mosaicking is off, keep the old behaviour: scenes in a
+    // different CRS than the reference are skipped.
+    if !cfg.cross_zone_mosaic
+        && let (Some(re), Some(ie)) = (ref_epsg, item.epsg())
+        && re != ie
+    {
+        return Err(format!(
+            "{}: EPSG {ie} differs from reference EPSG {re} (cross-zone mosaic off)",
+            item.id
+        ));
+    }
+    Ok(SliceMeta {
+        item_id: item.id.clone(),
+        datetime,
+        time,
+        cloud_cover: item.properties.eo_cloud_cover,
     })
 }
 
@@ -651,6 +736,99 @@ mod tests {
             .bbox(-70.0, -34.0, -69.0, -33.0)
             .datetime("2024-01-01/2024-12-31");
         assert!(ok.validate().is_ok());
+    }
+
+    fn test_item(
+        id: &str,
+        datetime: Option<&str>,
+        cloud_cover: Option<f64>,
+        epsg: Option<u32>,
+    ) -> StacItem {
+        let mut extra = std::collections::HashMap::new();
+        if let Some(epsg) = epsg {
+            extra.insert("proj:epsg".to_string(), serde_json::json!(epsg));
+        }
+        StacItem {
+            type_: "Feature".to_string(),
+            id: id.to_string(),
+            geometry: None,
+            bbox: None,
+            properties: surtgis_cloud::stac_models::StacItemProperties {
+                datetime: datetime.map(str::to_string),
+                eo_cloud_cover: cloud_cover,
+                platform: None,
+                constellation: None,
+                gsd: None,
+                extra,
+            },
+            assets: std::collections::HashMap::new(),
+            collection: None,
+            links: vec![],
+        }
+    }
+
+    fn base_cfg() -> StackConfig {
+        StackConfig::new("pc", "sentinel-2-l2a", &["B04"])
+            .bbox(-70.0, -34.0, -69.0, -33.0)
+            .datetime("2024-01-01/2024-12-31")
+    }
+
+    #[test]
+    fn plan_scene_accepts_a_clean_item() {
+        let item = test_item("ok", Some("2024-06-15T00:00:00Z"), Some(10.0), None);
+        let meta = plan_scene(&item, &base_cfg(), None).unwrap();
+        assert_eq!(meta.item_id, "ok");
+        assert_eq!(meta.time, fractional_year("2024-06-15T00:00:00Z").unwrap());
+    }
+
+    #[test]
+    fn plan_scene_rejects_missing_or_unparseable_datetime() {
+        let cfg = base_cfg();
+        assert!(plan_scene(&test_item("a", None, None, None), &cfg, None).is_err());
+        assert!(plan_scene(&test_item("b", Some("not-a-date"), None, None), &cfg, None).is_err());
+    }
+
+    #[test]
+    fn plan_scene_rejects_scenes_over_the_cloud_cover_limit() {
+        let cfg = base_cfg().max_cloud_cover(20.0);
+        let item = test_item("cloudy", Some("2024-06-15T00:00:00Z"), Some(50.0), None);
+        assert!(plan_scene(&item, &cfg, None).is_err());
+        let clear = test_item("clear", Some("2024-06-15T00:00:00Z"), Some(5.0), None);
+        assert!(plan_scene(&clear, &cfg, None).is_ok());
+    }
+
+    #[test]
+    fn plan_scene_cross_zone_filter_only_applies_when_mosaicking_is_off() {
+        let item = test_item(
+            "other-zone",
+            Some("2024-06-15T00:00:00Z"),
+            None,
+            Some(32618),
+        );
+        // mosaicking on (default): a differing EPSG is not a reason to skip
+        assert!(plan_scene(&item, &base_cfg(), Some(32719)).is_ok());
+        // mosaicking off: differing EPSG is skipped outright
+        let cfg = base_cfg().cross_zone_mosaic(false);
+        assert!(plan_scene(&item, &cfg, Some(32719)).is_err());
+        // ...but matching EPSG is fine even with mosaicking off
+        assert!(plan_scene(&item, &cfg, Some(32618)).is_ok());
+        // and with no reference EPSG yet (bootstrap), nothing to compare against
+        assert!(plan_scene(&item, &cfg, None).is_ok());
+    }
+
+    #[test]
+    fn concurrency_defaults_and_validates() {
+        let base = || {
+            StackConfig::new("pc", "sentinel-2-l2a", &["B04"])
+                .bbox(-70.0, -34.0, -69.0, -33.0)
+                .datetime("2024-01-01/2024-12-31")
+        };
+        assert_eq!(base().concurrency, 8);
+        assert!(base().concurrency(1).validate().is_ok());
+        assert!(matches!(
+            base().concurrency(0).validate(),
+            Err(StackError::Config(_))
+        ));
     }
 
     fn raster_at(data: Array2<f64>, x0: f64, y1: f64, res: f64) -> Raster<f64> {

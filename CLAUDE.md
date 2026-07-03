@@ -181,13 +181,13 @@ proj) en vez de reinventar I/O. Diferenciador: cubo Rust nativo sobre GeoZarr.
 - Falta para GeoZarr-CF pleno (refinamiento): variables-coordenada separadas,
   `grid_mapping`/CRS WKT, atributos CF por-banda. Hoy es cubo-en-Zarr-V3 fiel.
 
-## Estado (2026-07-02) — v0.8
+## Estado (2026-07-02) — v0.9
 **6 targets**: core (stats+temporal+bandmath+GeoRef), io (STAC/COG+cross-zone
-+mask SCL+GridSpec), CLI, PyO3, WASM, zarr (**comprimido zstd+f32 opcional,
-lectura/escritura por chunks**). Validación estadística 103/103 a 1e-9;
-band-math vs numpy 1e-12; pytest 16/16; zarr 8 tests + interop Python real
-(zstd y f32 decodifican transparentemente); core 61 unit + 9 doctests, io 15.
-cargo test --workspace verde.
++mask SCL+GridSpec+**lecturas paralelas**), CLI, PyO3, WASM, zarr (comprimido
+zstd+f32 opcional, lectura/escritura por chunks). Validación estadística
+103/103 a 1e-9; band-math vs numpy 1e-12; pytest 16/16; zarr 8 tests + interop
+Python real; core 61 unit + 9 doctests, io 20. cargo test --workspace verde.
+Stacking ~6× más rápido en escenarios de red reales (M3).
 
 ## Auditoría + quick wins (2026-07-02)
 - `AUDIT.md` (raíz): auditoría completa del motor — 0 critical, 5 HIGH de
@@ -304,14 +304,52 @@ cargo test --workspace verde.
 - Workspace bump 0.8.0. `approx` añadido como dev-dependency de
   `datacube-zarr` (ya estaba en `workspace.dependencies`).
 
+## AUDIT grupo 3 — M3 lecturas STAC paralelas (v0.9, 2026-07-02)
+- `stack()` en dos fases. **Bootstrap** (solo si `cfg.grid` es `None`): lee
+  ítems uno a uno hasta que el primero exitoso fija la grilla de referencia
+  (`bootstrapped` cuenta cuántos ítems ya se consumieron, éxito o fracaso).
+  **Paralela**: el resto (`items[bootstrapped..]`) — o TODOS si `GridSpec`
+  ya fijó la grilla de antemano, caso común dado H3 — se filtra con
+  `plan_scene(item, cfg, ref_epsg) -> Result<SliceMeta, String>` (chequeo
+  barato sin red: datetime válido, cloud cover, cross-zone-off EPSG
+  mismatch; antes vivía inline en el loop, ahora factorizado y testeado
+  solo con 4 tests de unidad construyendo `StacItem` a mano) y se lee con
+  `rayon::ThreadPoolBuilder::new().num_threads(cfg.concurrency).build()`
+  — pool dedicado y acotado, separado del pool global de Rayon (que sigue
+  usándose para cómputo por-píxel en core). `candidates.into_par_iter()
+  .collect()` sobre un `Vec` preserva el orden de entrada (ya ordenado por
+  tiempo), así el eje temporal del cubo sale ordenado sin trabajo extra.
+- `StacClientBlocking` resultó `Sync` sin ningún cambio: runtime tokio
+  compartido `&'static Runtime` + `Mutex<HashMap<...>>` interno para el
+  cache SAS — compilo a la primera compartiendo `&client` entre closures
+  paralelas.
+- `StackConfig::concurrency` (default 8, validado > 0) + CLI `--concurrency`.
+  `rayon` pasó a dependencia directa de `datacube-io` (antes solo
+  transitiva vía datacube-core).
+- Verificado e2e vs Planetary Computer (49 ítems, Santiago ene-abr 2024):
+  **4m41s → 47s (~6×)** con `--concurrency 8` vs `1`; mismo orden de
+  escenas, mismos 5 skips, mismo `time_range`. Repetido con `GridSpec` fijo
+  (`--mask-scl --grid-epsg --grid-res --composite monthly --index ndvi`):
+  toda la lectura entra a la fase paralela desde el ítem 0 (sin bootstrap),
+  mismas dims/EPSG que el run pre-M3.
+- Tests: io 20 (antes 15) — `plan_scene` (4 nuevos: item limpio, datetime
+  faltante/malformado, cloud cover, cross-zone solo cuando mosaicking está
+  off) + `concurrency` default/validación. `StacItem`/`StacItemProperties`
+  se construyen a mano en tests (no hay `StacItem::new()` en surtgis-cloud;
+  `item.epsg()` lee `properties.extra["proj:epsg"]`, un `HashMap` capturado
+  por `#[serde(flatten)]`).
+- Workspace bump 0.9.0.
+
 ## Próximos pasos al retomar
 1. Paper (C&G/EMS): material listo + band-math + GeoZarr (comprimido+chunks)
-   + ARD (mask/grid) + georef unificado. Opciones: §4.4 NDVI in-engine;
-   sección GeoZarr/arquitectura citando `read_zarr_chunked` como el
-   "cube_view + chunk streaming" de gdalcubes hecho en Rust sobre Zarr V3.
+   + ARD (mask/grid) + georef unificado + stacking paralelo. Opciones: §4.4
+   NDVI in-engine; sección GeoZarr/arquitectura citando `read_zarr_chunked`
+   como el "cube_view + chunk streaming" de gdalcubes hecho en Rust/Zarr V3;
+   mencionar el ~6× de M3 como evidencia de perf en la sección de benchmarks.
 2. Pendiente Zenodo DOI (gated en ORCID).
-3. AUDIT grupo 3 restante: M3 (lecturas STAC paralelas en `datacube-io`,
-   independiente de zarr); dentro de H5, streaming en `stack()` y grafo lazy.
+3. AUDIT grupo 3 queda con dos ítems abiertos, ambos dentro de H5: streaming
+   en `stack()` mismo (paso 1, elimina el `Vec<Raster>` intermedio) y el
+   grafo lazy `stack→mask→composite→index→trend` evaluado por chunk (paso 3).
 4. Bug externo detectado en sesión anterior: paginación de `search_all` en
    surtgis-cloud repite items en Earth Search (dedup por id ya puesto como
    guard en `stack()`, pero el fix real es en surtgis).

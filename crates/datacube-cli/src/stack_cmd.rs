@@ -44,6 +44,11 @@ pub struct StackArgs {
     /// reference grid (cross-zone mosaicking is on by default)
     #[arg(long)]
     no_cross_zone: bool,
+    /// Scenes read concurrently once the reference grid is known (stacking
+    /// is network-bound; higher values cut wall-clock time for 30-100 scene
+    /// stacks, within the catalog's rate limits)
+    #[arg(long, default_value_t = 8)]
+    concurrency: usize,
     /// Mask pixels per scene with the S2 SCL band, keeping only clear classes
     /// (vegetation, bare, water, unclassified, snow); see --mask-asset/--mask-keep
     #[arg(long)]
@@ -176,7 +181,8 @@ pub fn run(args: &StackArgs) -> Result<()> {
         .max_items(args.limit)
         .overview(args.overview)
         .scaling(args.scale, args.offset)
-        .cross_zone_mosaic(!args.no_cross_zone);
+        .cross_zone_mosaic(!args.no_cross_zone)
+        .concurrency(args.concurrency);
     if let Some(mc) = args.max_cloud {
         cfg = cfg.max_cloud_cover(mc);
     }
