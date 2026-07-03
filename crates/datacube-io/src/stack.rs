@@ -1,5 +1,5 @@
 use datacube_core::{Cube, GeoRef};
-use ndarray::{Array2, Array4};
+use ndarray::{Array2, Array4, Axis};
 use rayon::prelude::*;
 use surtgis_cloud::blocking::{CogReaderBlocking, StacClientBlocking};
 use surtgis_cloud::stac_models::StacItem;
@@ -358,7 +358,9 @@ pub fn stack(cfg: &StackConfig) -> Result<StackedCube, StackError> {
         None => None,
     };
     let mut ref_epsg: Option<u32> = cfg.grid.as_ref().map(|g| g.epsg);
-    let mut scenes: Vec<(SliceMeta, Vec<Raster<f64>>)> = Vec::new();
+    // the bootstrap scene's rasters (if any), held only until the shared
+    // Array4 below can be allocated (its shape needs the reference grid).
+    let mut bootstrap_scene: Option<(SliceMeta, Vec<Raster<f64>>)> = None;
 
     // Bootstrap phase (only needed when the grid isn't already fixed by a
     // GridSpec): read items one at a time, sequentially, until the first
@@ -380,87 +382,125 @@ pub fn stack(cfg: &StackConfig) -> Result<StackedCube, StackError> {
                 Ok(rasters) => {
                     reference = Some(rasters[0].clone());
                     ref_epsg = item.epsg();
-                    scenes.push((meta, rasters));
+                    bootstrap_scene = Some((meta, rasters));
                     break;
                 }
                 Err(err) => skipped.push(format!("{}: {err}", meta.item_id)),
             }
         }
     }
+    let Some(reference) = reference else {
+        return Err(StackError::Empty(format!(
+            "no scene could be read ({} skipped: {})",
+            skipped.len(),
+            skipped.join("; ")
+        )));
+    };
 
-    // Parallel phase: once the reference grid is known (from GridSpec, or
-    // from the bootstrap above), every remaining scene reads independently —
-    // stacking is I/O-bound (HTTP range requests), so a bounded worker pool
-    // sized by `cfg.concurrency` cuts wall-clock time close to N-fold for
-    // N-scene stacks. `into_par_iter().collect()` on a `Vec` preserves the
-    // candidates' order, keeping the cube's time axis sorted.
-    let remaining = &items[bootstrapped..];
-    if !remaining.is_empty() {
-        let candidates: Vec<(&StacItem, SliceMeta)> = remaining
-            .iter()
-            .filter_map(|item| match plan_scene(item, cfg, ref_epsg) {
-                Ok(meta) => Some((item, meta)),
-                Err(reason) => {
-                    skipped.push(reason);
-                    None
+    // Cheap, network-free pre-filter for the remaining items (datetime/
+    // cloud-cover/cross-zone); only survivors are worth a read attempt.
+    let candidates: Vec<(&StacItem, SliceMeta)> = items[bootstrapped..]
+        .iter()
+        .filter_map(|item| match plan_scene(item, cfg, ref_epsg) {
+            Ok(meta) => Some((item, meta)),
+            Err(reason) => {
+                skipped.push(reason);
+                None
+            }
+        })
+        .collect();
+
+    // Every candidate gets a pre-allocated time slot up front — an upper
+    // bound on the final scene count, since only a genuine I/O failure
+    // inside `read_scene` shrinks it further (everything else was already
+    // filtered above). Scenes write directly into their slot as soon as
+    // they're read, instead of accumulating a separate `Vec<Raster>` for
+    // the whole batch before copying it into the cube's `Array4` — the ~2x
+    // memory peak this closes.
+    let (ny, nx) = reference.shape();
+    let nb = cfg.assets.len();
+    let bootstrap_count = usize::from(bootstrap_scene.is_some());
+    let upper_bound = bootstrap_count + candidates.len();
+    let mut data = Array4::from_elem((nb, ny, nx, upper_bound), f64::NAN);
+    let mut times = Vec::with_capacity(upper_bound);
+    let mut slices = Vec::with_capacity(upper_bound);
+    // whether `data`'s time slot at this index was actually written
+    // (bootstrap's slot, if any, always was).
+    let mut slot_ok = vec![true; bootstrap_count];
+
+    if let Some((meta, rasters)) = bootstrap_scene {
+        for (bi, raster) in rasters.iter().enumerate() {
+            data.slice_mut(ndarray::s![bi, .., .., 0])
+                .assign(raster.data());
+        }
+        times.push(meta.time);
+        slices.push(meta);
+    }
+
+    // Parallel phase: every candidate reads independently and writes
+    // straight into its own (disjoint) time slot — stacking is I/O-bound
+    // (HTTP range requests), so a bounded worker pool sized by
+    // `cfg.concurrency` cuts wall-clock time close to N-fold for N-scene
+    // stacks. Zipping two `Vec`s as parallel iterators and collecting
+    // preserves index order, so slots line up with candidates and outcomes
+    // come back in the candidates' (time-sorted) order for free.
+    if !candidates.is_empty() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(cfg.concurrency)
+            .build()
+            .map_err(|e| StackError::Config(format!("failed to build read pool: {e}")))?;
+        let slots: Vec<_> = data.axis_iter_mut(Axis(3)).skip(bootstrap_count).collect();
+        let outcomes: Vec<(SliceMeta, Result<(), StackError>)> = pool.install(|| {
+            candidates
+                .into_par_iter()
+                .zip(slots)
+                .map(|((item, meta), mut slot)| {
+                    let result = read_scene(
+                        &client,
+                        item,
+                        cfg,
+                        &wgs_bbox,
+                        needs_signing,
+                        Some(&reference),
+                        ref_epsg,
+                    )
+                    .map(|rasters| {
+                        for (bi, raster) in rasters.iter().enumerate() {
+                            slot.slice_mut(ndarray::s![bi, .., ..])
+                                .assign(raster.data());
+                        }
+                    });
+                    (meta, result)
+                })
+                .collect()
+        });
+        for (meta, result) in outcomes {
+            match result {
+                Ok(()) => {
+                    slot_ok.push(true);
+                    times.push(meta.time);
+                    slices.push(meta);
                 }
-            })
-            .collect();
-
-        if !candidates.is_empty() {
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(cfg.concurrency)
-                .build()
-                .map_err(|e| StackError::Config(format!("failed to build read pool: {e}")))?;
-            let results: Vec<SceneReadResult> = pool.install(|| {
-                candidates
-                    .into_par_iter()
-                    .map(|(item, meta)| {
-                        let result = read_scene(
-                            &client,
-                            item,
-                            cfg,
-                            &wgs_bbox,
-                            needs_signing,
-                            reference.as_ref(),
-                            ref_epsg,
-                        );
-                        (meta, result)
-                    })
-                    .collect()
-            });
-            for (meta, result) in results {
-                match result {
-                    Ok(rasters) => scenes.push((meta, rasters)),
-                    Err(err) => skipped.push(format!("{}: {err}", meta.item_id)),
+                Err(err) => {
+                    slot_ok.push(false);
+                    skipped.push(format!("{}: {err}", meta.item_id));
                 }
             }
         }
     }
 
-    if scenes.is_empty() {
+    if slices.is_empty() {
         return Err(StackError::Empty(format!(
             "no scene could be read ({} skipped: {})",
             skipped.len(),
             skipped.join("; ")
         )));
     }
-    let reference = reference.expect("a read scene implies a reference grid");
 
-    let (ny, nx) = reference.shape();
-    let nb = cfg.assets.len();
-    let nt = scenes.len();
-    let mut data = Array4::from_elem((nb, ny, nx, nt), f64::NAN);
-    let mut times = Vec::with_capacity(nt);
-    let mut slices = Vec::with_capacity(nt);
-    for (ti, (meta, rasters)) in scenes.into_iter().enumerate() {
-        for (bi, raster) in rasters.iter().enumerate() {
-            data.slice_mut(ndarray::s![bi, .., .., ti])
-                .assign(raster.data());
-        }
-        times.push(meta.time);
-        slices.push(meta);
-    }
+    // Compact away any failed slots (the common case — no read failures once
+    // the cheap pre-filter has run — is a no-op with zero extra copies; only
+    // genuine I/O failures pay for a smaller, final-sized compaction copy).
+    let data = compact_time_axis(data, &slot_ok);
 
     let transform = *reference.transform();
     let epsg = ref_epsg.or_else(|| reference.crs().and_then(|c| c.epsg()));
@@ -477,9 +517,28 @@ pub fn stack(cfg: &StackConfig) -> Result<StackedCube, StackError> {
     })
 }
 
-/// One scene's read outcome, paired with the metadata it would use if
-/// successful (produced by the parallel phase of [`stack`]).
-type SceneReadResult = (SliceMeta, Result<Vec<Raster<f64>>, StackError>);
+/// Drops the time slots marked `false` in `slot_ok`, keeping the rest in
+/// order. A no-op (returns `data` unchanged, no allocation) when every slot
+/// is `true` — the expected case once [`plan_scene`] has already ruled out
+/// everything except genuine I/O failures.
+fn compact_time_axis(data: Array4<f64>, slot_ok: &[bool]) -> Array4<f64> {
+    if slot_ok.iter().all(|&ok| ok) {
+        return data;
+    }
+    let (nb, ny, nx, _) = data.dim();
+    let nt = slot_ok.iter().filter(|&&ok| ok).count();
+    let mut compact = Array4::from_elem((nb, ny, nx, nt), f64::NAN);
+    let mut dst = 0;
+    for (src, &ok) in slot_ok.iter().enumerate() {
+        if ok {
+            compact
+                .slice_mut(ndarray::s![.., .., .., dst])
+                .assign(&data.slice(ndarray::s![.., .., .., src]));
+            dst += 1;
+        }
+    }
+    compact
+}
 
 /// Cheap, network-free pre-filter: item metadata (datetime, cloud cover,
 /// cross-zone-off EPSG mismatch) decides whether `item` is even worth an I/O
@@ -814,6 +873,32 @@ mod tests {
         assert!(plan_scene(&item, &cfg, Some(32618)).is_ok());
         // and with no reference EPSG yet (bootstrap), nothing to compare against
         assert!(plan_scene(&item, &cfg, None).is_ok());
+    }
+
+    #[test]
+    fn compact_time_axis_is_a_noop_when_every_slot_is_ok() {
+        let data = Array4::from_shape_fn((1, 1, 1, 3), |(_, _, _, t)| t as f64);
+        let ptr_before = data.as_ptr();
+        let out = compact_time_axis(data, &[true, true, true]);
+        assert_eq!(out.dim(), (1, 1, 1, 3));
+        // no reallocation happened: same backing buffer
+        assert_eq!(out.as_ptr(), ptr_before);
+        assert_eq!(out.iter().copied().collect::<Vec<_>>(), vec![0.0, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn compact_time_axis_drops_failed_slots_preserving_order() {
+        let data = Array4::from_shape_fn((1, 1, 1, 4), |(_, _, _, t)| t as f64);
+        let out = compact_time_axis(data, &[true, false, true, false]);
+        assert_eq!(out.dim(), (1, 1, 1, 2));
+        assert_eq!(out.iter().copied().collect::<Vec<_>>(), vec![0.0, 2.0]);
+    }
+
+    #[test]
+    fn compact_time_axis_handles_all_failed() {
+        let data = Array4::from_shape_fn((1, 2, 2, 2), |(_, _, _, t)| t as f64);
+        let out = compact_time_axis(data, &[false, false]);
+        assert_eq!(out.dim(), (1, 2, 2, 0));
     }
 
     #[test]

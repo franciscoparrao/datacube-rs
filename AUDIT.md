@@ -138,7 +138,7 @@ xarray/stackstac, sits).
   espacial). `StackedCube` y `datacube-zarr` pasan a consumirlo; `datacube-zarr`
   borra su copia. Exponer `.epsg`/`.transform` en PyO3.
 
-### [HIGH] H5 — Ejecución enteramente materializada: el streaming es solo de vistas ✅ resuelto v0.8.0 (parcial)
+### [HIGH] H5 — Ejecución enteramente materializada: el streaming es solo de vistas ✅ resuelto v0.8.0 + v0.10.0 (parcial: pasos 1-2, falta paso 3)
 
 - **Archivo**: `crates/datacube-io/src/stack.rs:255-274`,
   `crates/datacube-zarr/src/lib.rs:99-155`
@@ -161,15 +161,31 @@ xarray/stackstac, sits).
   3. (v0.7+) un grafo lazy estilo gdalcubes sobre esa primitiva
      (`stack → mask → composite → index → trend` evaluado por chunk). El
      diferenciador "cubo Rust nativo sobre GeoZarr" se concreta aquí.
-- **Resuelto (parcial) en v0.8.0**: pasos 2 hecho — `read_zarr_chunked(path,
+- **Resuelto (parcial) en v0.8.0**: paso 2 hecho — `read_zarr_chunked(path,
   chunk_y, chunk_x)` (iterador perezoso, memoria acotada a un tile, `GeoRef`
   desplazado por tile) + `ZarrCubeWriter::create/.write_chunk` (contraparte de
   escritura, tiles en cualquier orden). Patrón `for chunk in
   read_zarr_chunked(...) { cube.par_map_series(...) }` verificado con tests
   que reconstruyen el cubo completo desde tiles y comparan igualdad exacta.
-  Paso 1 (streaming en `stack()` mismo) y paso 3 (grafo lazy) quedan
-  pendientes — este primitivo GeoZarr es independiente de `datacube-io` y no
-  requiere red, por eso se priorizó.
+- **Resuelto en v0.10.0**: paso 1 hecho — `stack()` ya no acumula un
+  `Vec<(SliceMeta, Vec<Raster<f64>>)>` para todo el lote antes de copiarlo al
+  `Array4` del cubo. Cada candidato recibe un slot de tiempo pre-asignado
+  (cota superior = ítems que sobrevivieron el filtro barato de `plan_scene`;
+  solo un fallo de I/O real la reduce) y escribe ahí directo apenas se lee,
+  vía `data.axis_iter_mut(Axis(3))` repartido entre las tareas paralelas de
+  M3 (cada slot es una sub-vista disjunta, así que múltiples hilos escriben
+  sin sincronización ni `unsafe`). Caso común (0 fallos de lectura, que es lo
+  esperado ya que `plan_scene` filtró todo lo demás por adelantado): el
+  `Array4` se reusa tal cual, **cero copias extra** (verificado con un test
+  que compara el puntero del buffer antes/después). Caso con fallos: una
+  única copia de compactación de tamaño *final* (nunca del tamaño del lote
+  completo) vía `compact_time_axis`, función pura testeada aparte sin red.
+  Paso 3 (grafo lazy `stack→mask→composite→index→trend` por chunk) queda
+  pendiente — es un rediseño arquitectónico mayor (v0.7+ en el roadmap
+  original), fuera de alcance de un "quick win".
+  Verificado e2e vs Planetary Computer: mismo cubo (dims/orden/skips/
+  time_range) que antes del cambio, mismo tiempo de wall-clock (~48s, la
+  paralelización de M3 no se vio afectada).
 
 ### [MEDIUM] M1 — Los bindings Python retienen el GIL durante todo el cómputo Rayon
 
@@ -480,9 +496,12 @@ publicable por sí sola.
    memoria sobre GeoZarr.
    **M3 ejecutado el 2026-07-02 (v0.9.0)**: lecturas STAC en pool paralelo
    acotado (`StackConfig::concurrency`, default 8) — ver detalle arriba;
-   ~6× de aceleración medido e2e. AUDIT grupo 3 queda con dos ítems abiertos,
-   ambos dentro de H5: streaming en `stack()` mismo (paso 1, elimina el
-   `Vec<Raster>` intermedio) y el grafo lazy `stack→mask→composite→index→
-   trend` evaluado por chunk (paso 3, v0.7+ en el roadmap original).
+   ~6× de aceleración medido e2e.
+   **H5 paso 1 ejecutado el 2026-07-03 (v0.10.0)**: `stack()` escribe cada
+   escena directo en su slot final del `Array4` (sin `Vec<Raster>`
+   intermedio); ver detalle en el hallazgo H5 arriba. AUDIT grupo 3 queda
+   con un solo ítem abierto: el grafo lazy `stack→mask→composite→index→
+   trend` evaluado por chunk (H5 paso 3, v0.7+ en el roadmap original —
+   rediseño arquitectónico mayor, no un quick win).
 4. **Ecosistema/adopción**: M6 (desacoplar surtgis), L6 (stubs + wheels PyPI),
    M9 (feature serde en core). Sin esto el motor es excelente pero solo tuyo.

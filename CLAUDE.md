@@ -181,13 +181,14 @@ proj) en vez de reinventar I/O. Diferenciador: cubo Rust nativo sobre GeoZarr.
 - Falta para GeoZarr-CF pleno (refinamiento): variables-coordenada separadas,
   `grid_mapping`/CRS WKT, atributos CF por-banda. Hoy es cubo-en-Zarr-V3 fiel.
 
-## Estado (2026-07-02) — v0.9
+## Estado (2026-07-03) — v0.10
 **6 targets**: core (stats+temporal+bandmath+GeoRef), io (STAC/COG+cross-zone
-+mask SCL+GridSpec+**lecturas paralelas**), CLI, PyO3, WASM, zarr (comprimido
-zstd+f32 opcional, lectura/escritura por chunks). Validación estadística
-103/103 a 1e-9; band-math vs numpy 1e-12; pytest 16/16; zarr 8 tests + interop
-Python real; core 61 unit + 9 doctests, io 20. cargo test --workspace verde.
-Stacking ~6× más rápido en escenarios de red reales (M3).
++mask SCL+GridSpec+lecturas paralelas+**escritura directa por-slot**), CLI,
+PyO3, WASM, zarr (comprimido zstd+f32 opcional, lectura/escritura por chunks).
+Validación estadística 103/103 a 1e-9; band-math vs numpy 1e-12; pytest
+16/16; zarr 8 tests + interop Python real; core 61 unit + 9 doctests, io 23.
+cargo test --workspace verde. Stacking ~6× más rápido en escenarios de red
+reales (M3) sin el pico de memoria 2× de antes (H5 paso 1).
 
 ## Auditoría + quick wins (2026-07-02)
 - `AUDIT.md` (raíz): auditoría completa del motor — 0 critical, 5 HIGH de
@@ -340,16 +341,49 @@ Stacking ~6× más rápido en escenarios de red reales (M3).
   por `#[serde(flatten)]`).
 - Workspace bump 0.9.0.
 
+## AUDIT grupo 3 — H5 paso 1: escritura directa por-slot en stack() (v0.10, 2026-07-03)
+- `stack()` ya no acumula `scenes: Vec<(SliceMeta, Vec<Raster<f64>>)>` para
+  todo el lote antes de copiarlo al `Array4` del cubo (el pico de memoria
+  ~2× que señalaba H5). Cada candidato (post `plan_scene`, ver M3) recibe un
+  slot de tiempo pre-asignado en un `Array4` dimensionado a una cota
+  superior (`bootstrap_count + candidates.len()` — solo un fallo de I/O real
+  dentro de `read_scene` la reduce, ya que todo lo demás fue filtrado antes
+  sin red) y escribe ahí apenas se lee.
+- Los slots se reparten entre las tareas paralelas de M3 vía
+  `data.axis_iter_mut(Axis(3)).skip(bootstrap_count).collect::<Vec<_>>()`
+  zippeado con `candidates` — cada `ArrayViewMut` es una sub-vista disjunta
+  del mismo `Array4`, así que N hilos escriben simultáneamente **sin**
+  `unsafe` ni sincronización (compila porque `ArrayViewMut<f64,_>: Send`;
+  no hizo falta el feature "rayon" de ndarray, basta el `Vec<T: Send>` +
+  `IntoParallelIterator` de rayon).
+  `outcomes` sigue devolviendo `(SliceMeta, Result<(), StackError>)` por
+  candidato en el orden original (temporal), igual que antes de este cambio.
+- Caso común (0 fallos — lo esperado, dado que `plan_scene` ya descartó todo
+  lo demás por adelantado): `compact_time_axis` es un no-op literal, **el
+  mismo buffer se reusa sin copiar nada** (test dedicado compara el puntero
+  del buffer antes/después). Caso con fallos reales de I/O: una única copia
+  de compactación al tamaño *final* (nunca al tamaño del lote completo) vía
+  la función pura `compact_time_axis(data, slot_ok) -> Array4<f64>`
+  (extraída para poder testearla sin red: construye un `Array4` sintético y
+  un `&[bool]`, sin `StacItem` ni `read_scene` de por medio).
+- Verificación: io 23 tests (+3: no-op sin copia, compactación preserva
+  orden, todos fallidos → 0 tiempos), `cargo test --workspace` verde,
+  clippy limpio. E2E vs Planetary Computer (mismo escenario de M3): cubo
+  idéntico (dims/orden de escenas/skips/`time_range`) y mismo wall-clock
+  (~48s) — la paralelización de M3 no se vio afectada por el cambio.
+- Workspace bump 0.10.0.
+
 ## Próximos pasos al retomar
 1. Paper (C&G/EMS): material listo + band-math + GeoZarr (comprimido+chunks)
-   + ARD (mask/grid) + georef unificado + stacking paralelo. Opciones: §4.4
-   NDVI in-engine; sección GeoZarr/arquitectura citando `read_zarr_chunked`
-   como el "cube_view + chunk streaming" de gdalcubes hecho en Rust/Zarr V3;
-   mencionar el ~6× de M3 como evidencia de perf en la sección de benchmarks.
+   + ARD (mask/grid) + georef unificado + stacking paralelo sin pico 2×.
+   Opciones: §4.4 NDVI in-engine; sección GeoZarr/arquitectura citando
+   `read_zarr_chunked` como el "cube_view + chunk streaming" de gdalcubes
+   hecho en Rust/Zarr V3; mencionar el ~6× de M3 como evidencia de perf.
 2. Pendiente Zenodo DOI (gated en ORCID).
-3. AUDIT grupo 3 queda con dos ítems abiertos, ambos dentro de H5: streaming
-   en `stack()` mismo (paso 1, elimina el `Vec<Raster>` intermedio) y el
-   grafo lazy `stack→mask→composite→index→trend` evaluado por chunk (paso 3).
+3. AUDIT grupo 3 queda con UN solo ítem abierto: el grafo lazy
+   `stack→mask→composite→index→trend` evaluado por chunk (H5 paso 3,
+   v0.7+ en el roadmap original) — rediseño arquitectónico mayor, no un
+   quick win; requiere decidir la forma del DAG/API antes de tocar código.
 4. Bug externo detectado en sesión anterior: paginación de `search_all` en
    surtgis-cloud repite items en Earth Search (dedup por id ya puesto como
    guard en `stack()`, pero el fix real es en surtgis).
