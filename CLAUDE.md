@@ -181,11 +181,12 @@ proj) en vez de reinventar I/O. Diferenciador: cubo Rust nativo sobre GeoZarr.
 - Falta para GeoZarr-CF pleno (refinamiento): variables-coordenada separadas,
   `grid_mapping`/CRS WKT, atributos CF por-banda. Hoy es cubo-en-Zarr-V3 fiel.
 
-## Estado (2026-07-02) — v0.7
-**6 targets**: core (stats+temporal+bandmath+**GeoRef**), io (STAC/COG+
-cross-zone+mask SCL+GridSpec), CLI, PyO3, WASM, zarr (GeoZarr, dedup GeoRef).
-Validación estadística 103/103 a 1e-9; band-math vs numpy 1e-12; pytest
-16/16; zarr roundtrip + interop Python; core 61 unit + 9 doctests, io 15.
+## Estado (2026-07-02) — v0.8
+**6 targets**: core (stats+temporal+bandmath+GeoRef), io (STAC/COG+cross-zone
++mask SCL+GridSpec), CLI, PyO3, WASM, zarr (**comprimido zstd+f32 opcional,
+lectura/escritura por chunks**). Validación estadística 103/103 a 1e-9;
+band-math vs numpy 1e-12; pytest 16/16; zarr 8 tests + interop Python real
+(zstd y f32 decodifican transparentemente); core 61 unit + 9 doctests, io 15.
 cargo test --workspace verde.
 
 ## Auditoría + quick wins (2026-07-02)
@@ -262,16 +263,59 @@ cargo test --workspace verde.
   --grid-res --composite monthly --index ndvi`.
 - Workspace bump 0.7.0.
 
+## AUDIT grupo 3 — M2 (Zarr zstd+f32) + H5 parcial (chunks sobre GeoZarr) (v0.8, 2026-07-02)
+- **M2**: `ZarrOptions { compression_level: Option<i32>, dtype: ZarrDType }`
+  (`ZarrDType::{F64,F32}`). Default `Default for ZarrOptions` = zstd nivel 5 +
+  f64 — `write_zarr`/`read_zarr` (firmas sin cambios) ahora comprimen por
+  defecto de forma transparente (lossless; ningún test de igualdad exacta se
+  rompió). `write_zarr_with_options(cube, path, geo, options)` para f32 u
+  override de compresión. `read_zarr` detecta el dtype real vía
+  `array.data_type()` comparado contra `data_type::float32()`/`float64()` (
+  `DataType: PartialEq`, confirmado en el fuente vendored de zarrs 0.23.13) y
+  sube f32→f64 al leer (`Vec<f32>` → `.map(f64::from)`).
+  API de zarrs usada: `ArrayBuilder::bytes_to_bytes_codecs(vec![Arc::new(
+  zarrs::array::codec::ZstdCodec::new(level, checksum))])` — zstd viene en
+  el feature-set default de `zarrs` (`Cargo.toml` de datacube-zarr no
+  desactiva default-features, no hizo falta tocarlo).
+- **H5 (parcial)**: `read_zarr_chunked(path, chunk_y, chunk_x) -> impl
+  Iterator<Item = Result<(Cube, ChunkPos), ZarrError>>` — solo la metadata se
+  lee al abrir; cada `.next()` trae UN tile espacial (todas las bandas/tiempo,
+  `y0..y1 × x0..x1`) vía `ArraySubset::new_with_ranges` con offset no-cero
+  (infalible, a diferencia de `new_with_start_shape` que devuelve Result).
+  `GeoRef` de cada tile tiene el origen del transform desplazado
+  (`shift_georef`: `a' = a + x0·b + y0·c`, `d' = d + x0·e + y0·f`, convención
+  GDAL) — el tile es georreferenciable de forma independiente.
+  `ZarrCubeWriter::create(path, dims, bands, time, geo, options)` +
+  `.write_chunk(view, y0, x0)`: contraparte de escritura, tiles en cualquier
+  orden (zarrs re-codifica solo los chunks Zarr que el subset toca — API
+  confirmada en el ejemplo oficial `array_write_read.rs` del crate).
+  `create_array`/`store_region`/`retrieve_region` factorizados y compartidos
+  entre `write_zarr`, `read_zarr`, `read_zarr_chunked` y `ZarrCubeWriter`.
+- Verificación: zarr 8 tests (roundtrip f64/f32, compresión on/off idénticas,
+  chunked read reensambla == cubo completo, georef desplazado por tile,
+  writer por chunks == write_zarr, rechazo chunk_size=0), interop Python real
+  (zarr 3.2.1) confirmando que `zarr-python` decodifica zstd y f32
+  transparentemente (`arr.metadata.codecs` muestra `ZstdCodec(level=5,
+  checksum=False)`; ejemplo sintético comprimió 98304→2578 bytes). Ejemplo
+  `write_sample.rs` acepta un segundo arg `f32` para demostrarlo.
+- Pendiente de H5: paso 1 (streaming directo en `stack()`, elimina el pico
+  2× reteniendo `Vec<Raster>`) y paso 3 (grafo lazy `stack→mask→composite→
+  index→trend` evaluado por chunk, v0.7+ en el roadmap original).
+- Workspace bump 0.8.0. `approx` añadido como dev-dependency de
+  `datacube-zarr` (ya estaba en `workspace.dependencies`).
+
 ## Próximos pasos al retomar
-1. Paper (C&G/EMS): material listo + band-math + GeoZarr + ARD (mask/grid) +
-   georef unificado. Opciones: §4.4 NDVI in-engine; sección GeoZarr;
-   mencionar el paralelo con `cube_view` de gdalcubes.
+1. Paper (C&G/EMS): material listo + band-math + GeoZarr (comprimido+chunks)
+   + ARD (mask/grid) + georef unificado. Opciones: §4.4 NDVI in-engine;
+   sección GeoZarr/arquitectura citando `read_zarr_chunked` como el
+   "cube_view + chunk streaming" de gdalcubes hecho en Rust sobre Zarr V3.
 2. Pendiente Zenodo DOI (gated en ORCID).
-3. AUDIT grupo 3 restante: M2 (Zarr zstd+f32, ahora que GeoRef ya no está
-   duplicado) → H5 (ejecución por chunks sobre GeoZarr, `read_zarr_chunked`)
-   → M3 (lecturas STAC paralelas).
-4. Bug externo detectado en sesión: paginación de `search_all` en
+3. AUDIT grupo 3 restante: M3 (lecturas STAC paralelas en `datacube-io`,
+   independiente de zarr); dentro de H5, streaming en `stack()` y grafo lazy.
+4. Bug externo detectado en sesión anterior: paginación de `search_all` en
    surtgis-cloud repite items en Earth Search (dedup por id ya puesto como
    guard en `stack()`, pero el fix real es en surtgis).
 5. Opcional: GeoZarr-CF pleno (coord vars, grid_mapping); object-store
-   (S3/HTTP) vía zarrs async; exponer datacube-io (stack STAC) a Python.
+   (S3/HTTP) vía zarrs async; exponer datacube-io (stack STAC) a Python;
+   sharding Zarr para object store (M2.c, no implementado — solo relevante
+   para S3/HTTP, no filesystem local).

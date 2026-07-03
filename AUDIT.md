@@ -138,7 +138,7 @@ xarray/stackstac, sits).
   espacial). `StackedCube` y `datacube-zarr` pasan a consumirlo; `datacube-zarr`
   borra su copia. Exponer `.epsg`/`.transform` en PyO3.
 
-### [HIGH] H5 — Ejecución enteramente materializada: el streaming es solo de vistas
+### [HIGH] H5 — Ejecución enteramente materializada: el streaming es solo de vistas ✅ resuelto v0.8.0 (parcial)
 
 - **Archivo**: `crates/datacube-io/src/stack.rs:255-274`,
   `crates/datacube-zarr/src/lib.rs:99-155`
@@ -161,6 +161,15 @@ xarray/stackstac, sits).
   3. (v0.7+) un grafo lazy estilo gdalcubes sobre esa primitiva
      (`stack → mask → composite → index → trend` evaluado por chunk). El
      diferenciador "cubo Rust nativo sobre GeoZarr" se concreta aquí.
+- **Resuelto (parcial) en v0.8.0**: pasos 2 hecho — `read_zarr_chunked(path,
+  chunk_y, chunk_x)` (iterador perezoso, memoria acotada a un tile, `GeoRef`
+  desplazado por tile) + `ZarrCubeWriter::create/.write_chunk` (contraparte de
+  escritura, tiles en cualquier orden). Patrón `for chunk in
+  read_zarr_chunked(...) { cube.par_map_series(...) }` verificado con tests
+  que reconstruyen el cubo completo desde tiles y comparan igualdad exacta.
+  Paso 1 (streaming en `stack()` mismo) y paso 3 (grafo lazy) quedan
+  pendientes — este primitivo GeoZarr es independiente de `datacube-io` y no
+  requiere red, por eso se priorizó.
 
 ### [MEDIUM] M1 — Los bindings Python retienen el GIL durante todo el cómputo Rayon
 
@@ -180,7 +189,7 @@ xarray/stackstac, sits).
   Aplicarlo a todo método cuyo closure no toque objetos Python (todos los de
   cómputo cumplen). Cero costo, gran diferencia en integración real.
 
-### [MEDIUM] M2 — Zarr sin compresión, sin f32 y con I/O de un solo bloque
+### [MEDIUM] M2 — Zarr sin compresión, sin f32 y con I/O de un solo bloque ✅ resuelto v0.8.0
 
 - **Archivo**: `crates/datacube-zarr/src/lib.rs:86-92, 104-107, 148-151`
 - **Dimensión**: D7 Deuda técnica (para la promesa "cloud-native ARD")
@@ -193,6 +202,14 @@ xarray/stackstac, sits).
   dtype f32 en escritura (`write_zarr_f32` o campo en options) manteniendo f64
   el modelo en memoria; (c) sharding cuando se apunte a object store. Interop:
   zarr-python/xarray leen zstd sin fricción.
+- **Resuelto en v0.8.0**: (a) y (b) hechos — `ZarrOptions { compression_level:
+  Option<i32>, dtype: ZarrDType::{F64,F32} }`, default zstd nivel 5 + f64
+  (compresión transparente y sin pérdida; antes el default era f64 crudo).
+  `write_zarr_with_options`/`ZarrCubeWriter::create` la aceptan; `read_zarr`
+  detecta el dtype real (`array.data_type()`) y sube f32→f64 al leer. Interop
+  verificada desde Python real (zarr 3.2.1): store default (`bytes`+`zstd`,
+  level 5) y store f32 ambos decodifican transparentemente, NDVI recalculado
+  coincide. (c) sharding queda pendiente (solo relevante para object store).
 
 ### [MEDIUM] M3 — Lecturas STAC secuenciales
 
@@ -440,5 +457,10 @@ publicable por sí sola.
    `transform`/`epsg` a mano por toda la función — los lee de `cube.georef()`
    justo antes de escribir el GeoTIFF, después de mask/grid/composite/index.
    Verificado e2e: mismo GeoTIFF (origen, pixel size, EPSG) que antes de H4.
+   **M2 + H5(parcial) ejecutados el 2026-07-02 (v0.8.0)**: ver detalle en los
+   hallazgos M2/H5 arriba — Zarr comprimido zstd + f32 opcional, y
+   `read_zarr_chunked`/`ZarrCubeWriter` para ejecución por chunks acotada en
+   memoria sobre GeoZarr. Falta M3 (lecturas STAC paralelas) y, dentro de H5,
+   el streaming en `stack()` mismo y el grafo lazy.
 4. **Ecosistema/adopción**: M6 (desacoplar surtgis), L6 (stubs + wheels PyPI),
    M9 (feature serde en core). Sin esto el motor es excelente pero solo tuyo.
