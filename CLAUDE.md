@@ -181,11 +181,11 @@ proj) en vez de reinventar I/O. Diferenciador: cubo Rust nativo sobre GeoZarr.
 - Falta para GeoZarr-CF pleno (refinamiento): variables-coordenada separadas,
   `grid_mapping`/CRS WKT, atributos CF por-banda. Hoy es cubo-en-Zarr-V3 fiel.
 
-## Estado (2026-07-02) — v0.6
-**6 targets**: core (stats+temporal+bandmath), io (STAC/COG+cross-zone+
-**mask SCL+GridSpec**), CLI, PyO3, WASM, zarr (GeoZarr backing store).
+## Estado (2026-07-02) — v0.7
+**6 targets**: core (stats+temporal+bandmath+**GeoRef**), io (STAC/COG+
+cross-zone+mask SCL+GridSpec), CLI, PyO3, WASM, zarr (GeoZarr, dedup GeoRef).
 Validación estadística 103/103 a 1e-9; band-math vs numpy 1e-12; pytest
-15/15; zarr roundtrip + interop Python; core 55 unit + 9 doctests, io 15.
+16/16; zarr roundtrip + interop Python; core 61 unit + 9 doctests, io 15.
 cargo test --workspace verde.
 
 ## Auditoría + quick wins (2026-07-02)
@@ -231,11 +231,47 @@ cargo test --workspace verde.
   mask/grid), pytest 15/15, clippy limpio, e2e vs PC con
   `--mask-scl --grid-epsg/--grid-res --composite monthly`.
 
+## AUDIT grupo 3 — H4 georef en core (v0.7, 2026-07-02)
+- `datacube_core::GeoRef { epsg: Option<u32>, transform: Option<[f64;6]> }`
+  (Copy) ahora vive como campo privado `Option<GeoRef>` de `Cube`
+  (`cube.rs`): `Cube::with_georef(geo)` (builder), `.georef()` (getter),
+  `pub(crate) inherit_georef(&self, from: &Cube)` para que las operaciones
+  internas copien el georef del cubo fuente sin exponer el campo.
+- Propagación automática en las operaciones que preservan la grilla espacial:
+  `composite`/`gapfill_linear` (`temporal.rs`) y `combine_bands`/
+  `binary_band` — o sea todos los índices espectrales (`bandmath.rs`).
+  Operaciones sin georef en el cubo fuente producen cubos geo-blind (`None`),
+  sin cambio de comportamiento para el código previo a v0.7.
+- `datacube-io::stack()`: adjunta `GeoRef{epsg, transform: reference
+  .transform().to_gdal()}` al cubo devuelto (`StackedCube.cube.georef()`),
+  además de seguir exponiendo `StackedCube.transform/epsg` para compat.
+- `datacube-zarr`: borró su copia duplicada del struct — `pub use
+  datacube_core::GeoRef;`. `read_zarr` además adjunta el GeoRef leído al
+  `Cube` devuelto (antes solo iba en la tupla separada).
+- PyO3: `Cube.epsg`/`Cube.transform` (getters) + `Cube.with_georef(epsg=,
+  transform=)` (copia); `transform` se lee desde Python como lista de 6
+  floats. `composite`/`gapfill` ya lo propagan gratis vía core.
+- CLI `datacube stack`: dejó de acarrear `transform`/`epsg` manualmente por
+  toda la función — `cube_georef()` los lee de `cube.georef()` justo antes
+  de escribir el GeoTIFF, después de mask/grid/composite/index. Es la prueba
+  de que H4 cierra el problema real: un solo `cube.georef()` reemplaza el
+  hilo de dos variables que antes había que mantener sincronizado a mano.
+- Verificación: core 61 unit (+6 georef), zarr 2 (dedup sin romper roundtrip
+  ni interop Python), pytest 16/16, clippy limpio, e2e vs PC: mismo GeoTIFF
+  (origen/pixel size/EPSG) que antes de H4 con `--mask-scl --grid-epsg
+  --grid-res --composite monthly --index ndvi`.
+- Workspace bump 0.7.0.
+
 ## Próximos pasos al retomar
-1. Paper (C&G/EMS): material listo + band-math + GeoZarr + ARD (mask/grid).
-   Opciones: §4.4 con NDVI in-engine; sección GeoZarr; mencionar cube_view.
+1. Paper (C&G/EMS): material listo + band-math + GeoZarr + ARD (mask/grid) +
+   georef unificado. Opciones: §4.4 NDVI in-engine; sección GeoZarr;
+   mencionar el paralelo con `cube_view` de gdalcubes.
 2. Pendiente Zenodo DOI (gated en ORCID).
-3. AUDIT grupo 3 (diferenciador): H4 georef en core → M2 zarr zstd+f32 →
-   H5 ejecución por chunks sobre GeoZarr → M3 lecturas STAC paralelas.
-4. Opcional: GeoZarr-CF pleno (coord vars, grid_mapping); object-store
+3. AUDIT grupo 3 restante: M2 (Zarr zstd+f32, ahora que GeoRef ya no está
+   duplicado) → H5 (ejecución por chunks sobre GeoZarr, `read_zarr_chunked`)
+   → M3 (lecturas STAC paralelas).
+4. Bug externo detectado en sesión: paginación de `search_all` en
+   surtgis-cloud repite items en Earth Search (dedup por id ya puesto como
+   guard en `stack()`, pero el fix real es en surtgis).
+5. Opcional: GeoZarr-CF pleno (coord vars, grid_mapping); object-store
    (S3/HTTP) vía zarrs async; exponer datacube-io (stack STAC) a Python.

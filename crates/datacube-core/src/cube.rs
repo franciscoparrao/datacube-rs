@@ -3,6 +3,25 @@ use rayon::prelude::*;
 
 use crate::error::CubeError;
 
+/// Optional geospatial reference for a [`Cube`]: CRS + affine geotransform.
+///
+/// A `Cube` is geo-blind by default (`Cube::georef` is `None`) — this is how
+/// an I/O layer (STAC/COG, Zarr, ...) attaches "where in space" once, so
+/// consumers stop re-threading a transform/EPSG pair alongside every cube by
+/// hand. Operations that preserve the spatial grid ([`Cube::composite`],
+/// [`Cube::gapfill_linear`], the band-math indices) propagate it to their
+/// output automatically; operations that don't preserve the grid simply
+/// don't set it on their result.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct GeoRef {
+    /// EPSG code of the cube's CRS.
+    pub epsg: Option<u32>,
+    /// Affine geotransform `[a, b, c, d, e, f]` mapping pixel `(col, row)` to
+    /// world `(x, y)` as `x = a + col·b + row·c`, `y = d + col·e + row·f`
+    /// (the GDAL convention).
+    pub transform: Option<[f64; 6]>,
+}
+
 /// An in-memory temporal data cube with axes `(band, y, x, time)`.
 ///
 /// The time axis is innermost so every per-pixel series is a contiguous
@@ -14,6 +33,7 @@ pub struct Cube {
     data: Array4<f64>,
     time: Vec<f64>,
     bands: Vec<String>,
+    georef: Option<GeoRef>,
 }
 
 /// One pixel's time series, yielded by [`Cube::iter_series`].
@@ -61,7 +81,31 @@ impl Cube {
         } else {
             data.as_standard_layout().to_owned()
         };
-        Ok(Self { data, time, bands })
+        Ok(Self {
+            data,
+            time,
+            bands,
+            georef: None,
+        })
+    }
+
+    /// Attaches a georeference, replacing any existing one.
+    pub fn with_georef(mut self, georef: GeoRef) -> Self {
+        self.georef = Some(georef);
+        self
+    }
+
+    /// The cube's georeference, if one was attached.
+    pub fn georef(&self) -> Option<GeoRef> {
+        self.georef
+    }
+
+    /// Copies `from`'s georeference onto `self`, if any. Used internally by
+    /// operations that preserve the spatial grid (composite, gapfill,
+    /// band-math) to propagate it to their output.
+    pub(crate) fn inherit_georef(mut self, from: &Cube) -> Self {
+        self.georef = from.georef;
+        self
     }
 
     /// `(bands, height, width, time steps)`.
@@ -259,5 +303,40 @@ mod tests {
                 nbands: 1
             })
         ));
+    }
+
+    #[test]
+    fn cube_is_geo_blind_by_default() {
+        let cube = ramp_cube(1, 1, 2);
+        assert_eq!(cube.georef(), None);
+    }
+
+    #[test]
+    fn with_georef_attaches_and_replaces() {
+        let geo = GeoRef {
+            epsg: Some(32719),
+            transform: Some([300_000.0, 10.0, 0.0, 6_200_000.0, 0.0, -10.0]),
+        };
+        let cube = ramp_cube(1, 1, 2).with_georef(geo);
+        assert_eq!(cube.georef(), Some(geo));
+
+        let other = GeoRef {
+            epsg: Some(4326),
+            transform: None,
+        };
+        let cube = cube.with_georef(other);
+        assert_eq!(cube.georef(), Some(other));
+    }
+
+    #[test]
+    fn inherit_georef_copies_from_source() {
+        let geo = GeoRef {
+            epsg: Some(32719),
+            transform: Some([0.0; 6]),
+        };
+        let src = ramp_cube(1, 1, 2).with_georef(geo);
+        let plain = ramp_cube(1, 1, 2);
+        let out = plain.inherit_georef(&src);
+        assert_eq!(out.georef(), Some(geo));
     }
 }

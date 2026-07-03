@@ -106,6 +106,28 @@ def test_cube_composite_same_time_merges_tiles():
     assert out[0, 0, 1, 0] == 3.0
 
 
+def test_cube_georef_is_none_by_default_and_propagates_through_ops():
+    data = np.array([1.0, np.nan, 3.0, 4.0]).reshape(1, 1, 1, 4)
+    cube = dc.Cube(data, np.arange(4, dtype=float), ["b"])
+    assert cube.epsg is None
+    assert cube.transform is None
+
+    transform = [300000.0, 10.0, 0.0, 6200000.0, 0.0, -10.0]
+    geo_cube = cube.with_georef(epsg=32719, transform=transform)
+    assert geo_cube.epsg == 32719
+    assert list(geo_cube.transform) == transform
+    # original is untouched (with_georef returns a copy)
+    assert cube.epsg is None
+
+    # composite/gapfill preserve the spatial grid, so georef propagates
+    composited = geo_cube.composite("same_time", "median")
+    assert composited.epsg == 32719
+    assert list(composited.transform) == transform
+    filled = geo_cube.gapfill()
+    assert filled.epsg == 32719
+    assert list(filled.transform) == transform
+
+
 def test_cube_composite_monthly_uses_calendar_months():
     # Jan 20 and Feb 5, 2023: 16 days apart, but distinct calendar months
     times = np.array([2023.0 + 19.5 / 365.0, 2023.0 + 35.5 / 365.0])

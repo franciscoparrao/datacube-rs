@@ -1,4 +1,4 @@
-use datacube_core::Cube;
+use datacube_core::{Cube, GeoRef};
 use ndarray::{Array2, Array4};
 use surtgis_cloud::blocking::{CogReaderBlocking, StacClientBlocking};
 use surtgis_cloud::stac_models::StacItem;
@@ -264,15 +264,21 @@ pub struct SliceMeta {
 #[derive(Debug)]
 pub struct StackedCube {
     /// `(band, y, x, time)` cube; nodata is `NaN`, time is fractional years.
+    /// Also carries the grid as a [`datacube_core::GeoRef`]
+    /// ([`Cube::georef`](datacube_core::Cube::georef)), which `composite`,
+    /// `gapfill_linear` and the band-math indices propagate automatically —
+    /// prefer that over the `transform`/`epsg` fields below once the cube has
+    /// gone through those transforms.
     pub cube: Cube,
     /// One entry per time slice, in cube time order.
     pub slices: Vec<SliceMeta>,
     /// Scenes that were skipped, with the reason (cloud filter, missing
     /// asset, read failure, CRS mismatch, ...).
     pub skipped: Vec<String>,
-    /// Geotransform of the common grid (from the reference scene).
+    /// Geotransform of the common grid (from the reference scene). Also
+    /// available (as `[f64; 6]`) via `cube.georef()`.
     pub transform: GeoTransform,
-    /// EPSG of the common grid, if known.
+    /// EPSG of the common grid, if known. Also available via `cube.georef()`.
     pub epsg: Option<u32>,
 }
 
@@ -414,13 +420,18 @@ pub fn stack(cfg: &StackConfig) -> Result<StackedCube, StackError> {
         slices.push(meta);
     }
 
-    let cube = Cube::new(data, times, cfg.assets.clone())?;
+    let transform = *reference.transform();
+    let epsg = ref_epsg.or_else(|| reference.crs().and_then(|c| c.epsg()));
+    let cube = Cube::new(data, times, cfg.assets.clone())?.with_georef(GeoRef {
+        epsg,
+        transform: Some(transform.to_gdal()),
+    });
     Ok(StackedCube {
         cube,
         slices,
         skipped,
-        transform: *reference.transform(),
-        epsg: ref_epsg.or_else(|| reference.crs().and_then(|c| c.epsg())),
+        transform,
+        epsg,
     })
 }
 
@@ -814,5 +825,9 @@ mod tests {
         assert!(ny > 0 && nx > 0);
         assert_eq!(stacked.slices.len(), nt);
         assert!(stacked.cube.time().windows(2).all(|w| w[0] <= w[1]));
+
+        let geo = stacked.cube.georef().expect("stack() attaches a georef");
+        assert_eq!(geo.epsg, stacked.epsg);
+        assert_eq!(geo.transform, Some(stacked.transform.to_gdal()));
     }
 }

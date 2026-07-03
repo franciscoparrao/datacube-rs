@@ -210,13 +210,15 @@ pub fn run(args: &StackArgs) -> Result<()> {
     }
 
     eprintln!("searching {} in {} ...", args.collection, args.catalog);
-    // destructure to take ownership of the cube (no full-cube clone)
+    // destructure to take ownership of the cube (no full-cube clone); the
+    // grid (transform/EPSG) travels with the cube itself as a GeoRef and
+    // survives composite/gapfill/index, so it's read back from the cube at
+    // write time instead of being threaded through this function by hand.
     let StackedCube {
         mut cube,
         slices,
         skipped,
-        transform,
-        epsg,
+        ..
     } = stack(&cfg).context("stacking failed")?;
     {
         let (nb, ny, nx, nt) = cube.dims();
@@ -251,6 +253,7 @@ pub fn run(args: &StackArgs) -> Result<()> {
         eprintln!("computed index '{}' from stacked bands", cube.bands()[0]);
     }
     let (nb, ny, nx, nt) = cube.dims();
+    let (transform, epsg) = cube_georef(&cube)?;
 
     let wants_trend = args.output.is_some() || args.pvalue_output.is_some();
     let wants_breaks = args.breaks_output.is_some() || args.first_break_output.is_some();
@@ -394,6 +397,21 @@ fn break_maps(
 }
 
 /// Writes a float map on the stack's grid as GeoTIFF (f32, NaN nodata).
+/// Recovers the GeoTIFF-writable georeference from a cube's `GeoRef`. `stack`
+/// always attaches one and every transform applied above preserves the
+/// spatial grid, so this only fails if that invariant is somehow broken.
+fn cube_georef(cube: &datacube_core::Cube) -> Result<(GeoTransform, Option<u32>)> {
+    let geo = cube
+        .georef()
+        .context("stacked cube unexpectedly has no georeference")?;
+    Ok((
+        geo.transform
+            .map(GeoTransform::from_gdal)
+            .unwrap_or_default(),
+        geo.epsg,
+    ))
+}
+
 fn write_map(
     values: &ndarray::Array2<f64>,
     transform: GeoTransform,

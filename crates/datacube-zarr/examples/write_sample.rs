@@ -4,8 +4,8 @@
 //! Then read it back from Python (see scripts/zarr_interop.py) to confirm the
 //! Rust-written store is consumable by the zarr/xarray ecosystem.
 
-use datacube_core::{Cube, indices};
-use datacube_zarr::{GeoRef, write_zarr};
+use datacube_core::{Cube, GeoRef, indices};
+use datacube_zarr::write_zarr;
 use ndarray::Array4;
 use std::path::PathBuf;
 
@@ -30,16 +30,18 @@ fn main() {
         }
     }
     let time: Vec<f64> = (0..nt).map(|t| 2020.0 + t as f64 * 0.5).collect();
-    let cube = Cube::new(data, time, vec!["red".into(), "nir".into()]).unwrap();
+    let cube = Cube::new(data, time, vec!["red".into(), "nir".into()])
+        .unwrap()
+        .with_georef(GeoRef {
+            epsg: Some(32719),
+            transform: Some([300000.0, 10.0, 0.0, 6200000.0, 0.0, -10.0]),
+        });
 
-    // also derive NDVI in-engine and stack it as a third band for the demo
+    // NDVI derived in-engine inherits the cube's georef automatically
     let ndvi = indices::ndvi(&cube, "nir", "red").unwrap();
-    let geo = GeoRef {
-        epsg: Some(32719),
-        transform: Some([300000.0, 10.0, 0.0, 6200000.0, 0.0, -10.0]),
-    };
+    assert_eq!(ndvi.georef(), cube.georef());
 
-    write_zarr(&cube, &path, &geo).unwrap();
+    write_zarr(&cube, &path, &cube.georef().unwrap_or_default()).unwrap();
     println!(
         "wrote {} ({nb} bands {ny}x{nx} px, {nt} t); NDVI[0,0,0]={:.4}",
         path.display(),

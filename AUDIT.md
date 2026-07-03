@@ -431,5 +431,14 @@ publicable por sí sola.
    H4 (georef en core) → M2 (Zarr comprimido + f32) → H5 (ejecución por chunks
    sobre GeoZarr) → M3 (lecturas paralelas). En ese orden: cada paso habilita el
    siguiente y todos suman a la sección de arquitectura del paper.
+   **H4 ejecutado el 2026-07-02 (v0.7.0)**: `GeoRef { epsg, transform }` ahora
+   vive en `datacube_core::Cube` (`.georef()`/`.with_georef()`), propagado
+   automáticamente por `composite`/`gapfill_linear`/band-math
+   (`inherit_georef` interno); `datacube-io::stack()` lo adjunta al cubo;
+   `datacube-zarr` re-exporta el tipo de core en vez de duplicarlo; PyO3
+   expone `.epsg`/`.transform`/`.with_georef()`; el CLI ya no acarrea
+   `transform`/`epsg` a mano por toda la función — los lee de `cube.georef()`
+   justo antes de escribir el GeoTIFF, después de mask/grid/composite/index.
+   Verificado e2e: mismo GeoTIFF (origen, pixel size, EPSG) que antes de H4.
 4. **Ecosistema/adopción**: M6 (desacoplar surtgis), L6 (stubs + wheels PyPI),
    M9 (feature serde en core). Sin esto el motor es excelente pero solo tuyo.

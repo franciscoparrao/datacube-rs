@@ -5,7 +5,7 @@
 //! `datacube_rs` extension module (see the `python/` package and
 //! `maturin develop`).
 
-use datacube_core::{CompositeMethod, CompositeWindow, Cube as CoreCube, indices, stats};
+use datacube_core::{CompositeMethod, CompositeWindow, Cube as CoreCube, GeoRef, indices, stats};
 use ndarray::Array4;
 use numpy::{IntoPyArray, PyArray2, PyArray4, PyReadonlyArray1, PyReadonlyArray4};
 use pyo3::exceptions::{PyKeyError, PyValueError};
@@ -194,6 +194,29 @@ impl PyCube {
     /// The raw cube as a `(band, y, x, time)` NumPy array (copy).
     fn to_numpy<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray4<f64>> {
         self.inner.data().to_owned().into_pyarray(py)
+    }
+
+    /// EPSG code of the cube's grid, or `None` if it has no georeference.
+    #[getter]
+    fn epsg(&self) -> Option<u32> {
+        self.inner.georef().and_then(|g| g.epsg)
+    }
+
+    /// Affine geotransform `[a, b, c, d, e, f]` (GDAL convention: `x = a +
+    /// col*b + row*c`, `y = d + col*e + row*f`), or `None` if the cube has
+    /// no georeference or no transform was set.
+    #[getter]
+    fn transform(&self) -> Option<[f64; 6]> {
+        self.inner.georef().and_then(|g| g.transform)
+    }
+
+    /// Returns a copy of this cube with the given georeference attached
+    /// (`epsg` and/or `transform`, either may be omitted/`None`).
+    #[pyo3(signature = (epsg=None, transform=None))]
+    fn with_georef(&self, epsg: Option<u32>, transform: Option<[f64; 6]>) -> Self {
+        Self {
+            inner: self.inner.clone().with_georef(GeoRef { epsg, transform }),
+        }
     }
 
     /// Per-pixel trend maps for `band` (default 0): returns `(slope, p_value)`

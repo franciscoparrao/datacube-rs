@@ -109,7 +109,7 @@ impl Cube {
 
         let data = Array4::from_shape_vec((1, ny, nx, nt), out)
             .map_err(|e| CubeError::DimensionMismatch(e.to_string()))?;
-        Cube::new(data, self.time().to_vec(), vec![label.to_string()])
+        Ok(Cube::new(data, self.time().to_vec(), vec![label.to_string()])?.inherit_georef(self))
     }
 
     /// Element-wise binary op over two whole band volumes (each contiguous in
@@ -151,7 +151,7 @@ impl Cube {
 
         let data = Array4::from_shape_vec((1, ny, nx, nt), out)
             .map_err(|e| CubeError::DimensionMismatch(e.to_string()))?;
-        Cube::new(data, self.time().to_vec(), vec![label.to_string()])
+        Ok(Cube::new(data, self.time().to_vec(), vec![label.to_string()])?.inherit_georef(self))
     }
 }
 
@@ -220,6 +220,7 @@ pub mod indices {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cube::GeoRef;
     use ndarray::Array4;
 
     /// red, nir, blue cube: 1 pixel, 2 time steps; second step is masked NIR.
@@ -298,5 +299,20 @@ mod tests {
                 nbands: 3
             })
         ));
+    }
+
+    #[test]
+    fn indices_propagate_georef() {
+        let geo = GeoRef {
+            epsg: Some(32719),
+            transform: Some([300_000.0, 10.0, 0.0, 6_200_000.0, 0.0, -10.0]),
+        };
+        let c = rgbn_cube().with_georef(geo);
+        assert_eq!(indices::ndvi(&c, "nir", "red").unwrap().georef(), Some(geo));
+        assert_eq!(
+            indices::evi(&c, "nir", "red", "blue").unwrap().georef(),
+            Some(geo)
+        );
+        assert_eq!(c.band_ratio(0, 1, "r").unwrap().georef(), Some(geo));
     }
 }

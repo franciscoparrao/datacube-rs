@@ -17,6 +17,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use datacube_core::Cube;
+pub use datacube_core::GeoRef;
 use ndarray::Array4;
 use thiserror::Error;
 use zarrs::array::{Array, ArrayBuilder, ArraySubset, data_type};
@@ -27,16 +28,6 @@ use zarrs::group::GroupBuilder;
 const CUBE_PATH: &str = "/cube";
 /// Default spatial chunk edge (pixels); bands and time are single-chunked.
 const DEFAULT_CHUNK: u64 = 256;
-
-/// Optional spatial reference stored alongside the cube.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct GeoRef {
-    /// EPSG code of the cube CRS.
-    pub epsg: Option<u32>,
-    /// Affine geotransform `[a, b, c, d, e, f]` mapping pixel `(col, row)` to
-    /// world `(x, y)` as `x = a + col·b + row·c`, `y = d + col·e + row·f`.
-    pub transform: Option<[f64; 6]>,
-}
 
 /// Errors from reading or writing a Zarr-backed cube.
 #[derive(Debug, Error)]
@@ -53,6 +44,11 @@ pub enum ZarrError {
 
 /// Writes `cube` to a Zarr V3 store rooted at `path`; `geo` is persisted in
 /// the array attributes alongside the band labels and time coordinates.
+///
+/// `geo` is taken explicitly (rather than read from `cube.georef()`) so a
+/// store can be relocated in space without re-attaching anything to the
+/// cube first; pass `cube.georef().unwrap_or_default()` to persist whatever
+/// georeference the cube already carries.
 pub fn write_zarr(cube: &Cube, path: &Path, geo: &GeoRef) -> Result<(), ZarrError> {
     let store = Arc::new(FilesystemStore::new(path).map_err(|e| ZarrError::Store(e.to_string()))?);
 
@@ -109,7 +105,8 @@ pub fn write_zarr(cube: &Cube, path: &Path, geo: &GeoRef) -> Result<(), ZarrErro
 }
 
 /// Reads a Zarr V3 cube written by [`write_zarr`] back into a [`Cube`] and its
-/// georeference.
+/// georeference; the same `GeoRef` is also attached to the returned cube
+/// (`cube.georef()`) when it carries an EPSG or transform.
 pub fn read_zarr(path: &Path) -> Result<(Cube, GeoRef), ZarrError> {
     let store = Arc::new(FilesystemStore::new(path).map_err(|e| ZarrError::Store(e.to_string()))?);
     let array = Array::open(store, CUBE_PATH).map_err(|e| ZarrError::Array(e.to_string()))?;
@@ -150,7 +147,10 @@ pub fn read_zarr(path: &Path) -> Result<(Cube, GeoRef), ZarrError> {
         .map_err(|e| ZarrError::Array(e.to_string()))?;
     let data =
         Array4::from_shape_vec(dims, flat).map_err(|e| ZarrError::Metadata(e.to_string()))?;
-    let cube = Cube::new(data, time, bands)?;
+    let mut cube = Cube::new(data, time, bands)?;
+    if geo.epsg.is_some() || geo.transform.is_some() {
+        cube = cube.with_georef(geo);
+    }
     Ok((cube, geo))
 }
 

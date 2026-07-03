@@ -95,7 +95,7 @@ impl Cube {
 
         let data = Array4::from_shape_vec((nb, ny, nx, ng), out)
             .map_err(|e| CubeError::DimensionMismatch(e.to_string()))?;
-        Cube::new(data, times, self.bands().to_vec())
+        Ok(Cube::new(data, times, self.bands().to_vec())?.inherit_georef(self))
     }
 
     /// Fills temporal NaN gaps per pixel by linear interpolation between the
@@ -141,7 +141,7 @@ impl Cube {
             }
         });
 
-        Cube::new(data, time.to_vec(), self.bands().to_vec())
+        Ok(Cube::new(data, time.to_vec(), self.bands().to_vec())?.inherit_georef(self))
     }
 }
 
@@ -255,6 +255,7 @@ fn reduce(values: &mut [f64], method: CompositeMethod) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cube::GeoRef;
     use approx::assert_abs_diff_eq;
     use ndarray::Array4;
 
@@ -278,6 +279,30 @@ mod tests {
         assert_eq!(c.data()[[0, 0, 0, 0]], 2.0); // median(1, 9, 2)
         assert_eq!(c.data()[[0, 0, 0, 1]], 5.0); // median(4, 6)
         assert_abs_diff_eq!(c.time()[0], 2024.01, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn composite_and_gapfill_propagate_georef() {
+        let geo = GeoRef {
+            epsg: Some(32719),
+            transform: Some([300_000.0, 10.0, 0.0, 6_200_000.0, 0.0, -10.0]),
+        };
+        let cube = cube_1px(&[1.0, f64::NAN, 3.0], &[0.0, 1.0, 2.0]).with_georef(geo);
+        let composited = cube
+            .composite(CompositeWindow::SameTime, CompositeMethod::Mean)
+            .unwrap();
+        assert_eq!(composited.georef(), Some(geo));
+        let filled = cube.gapfill_linear(None).unwrap();
+        assert_eq!(filled.georef(), Some(geo));
+    }
+
+    #[test]
+    fn composite_without_georef_stays_geo_blind() {
+        let cube = cube_1px(&[1.0, 2.0], &[0.0, 1.0]);
+        let c = cube
+            .composite(CompositeWindow::SameTime, CompositeMethod::Mean)
+            .unwrap();
+        assert_eq!(c.georef(), None);
     }
 
     /// Fractional year of a calendar date, mirroring `datacube_io::fractional_year`.
