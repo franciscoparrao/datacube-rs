@@ -138,7 +138,7 @@ xarray/stackstac, sits).
   espacial). `StackedCube` y `datacube-zarr` pasan a consumirlo; `datacube-zarr`
   borra su copia. Exponer `.epsg`/`.transform` en PyO3.
 
-### [HIGH] H5 — Ejecución enteramente materializada: el streaming es solo de vistas ✅ resuelto v0.8.0 + v0.10.0 (parcial: pasos 1-2, falta paso 3)
+### [HIGH] H5 — Ejecución enteramente materializada: el streaming es solo de vistas ✅ resuelto v0.8.0 + v0.10.0 + v0.11.0
 
 - **Archivo**: `crates/datacube-io/src/stack.rs:255-274`,
   `crates/datacube-zarr/src/lib.rs:99-155`
@@ -186,6 +186,37 @@ xarray/stackstac, sits).
   Verificado e2e vs Planetary Computer: mismo cubo (dims/orden/skips/
   time_range) que antes del cambio, mismo tiempo de wall-clock (~48s, la
   paralelización de M3 no se vio afectada).
+- **Resuelto en v0.11.0 (paso 3, con alcance revisado)**: investigar el paso
+  3 mostró que el techo de RAM real hoy **no** está donde el planteamiento
+  original de H5 lo ubicaba. `stack()` (desde v0.10) ya escribe cada escena
+  directo en su slot final sin pico 2×, así que el techo de ingesta STAC/COG
+  no cambió con este paso (sigue siendo O(1x cubo); bajarlo requeriría
+  lecturas COG en ventana por chunk espacial con `GridSpec` obligatorio —
+  fuera de alcance, ver limitación abajo). El problema real y sin resolver
+  estaba **después** del stack: `stack_cmd.rs::run()` encadenaba
+  `cube.composite(...)` → `cube.gapfill_linear(...)` → `compute_index(...)`,
+  y cada llamada asignaba un `Array4` nuevo completo — el pico real de una
+  corrida con los tres pasos era ~4x el tamaño del cubo, no 1x.
+  `datacube_core::pipeline` (nuevo módulo) formaliza esa cadena como
+  `ChunkPipeline { composite, gapfill, index, stat }` y `Cube::run_chunked`
+  la corre de forma independiente sobre cada tile de `Cube::chunks()`,
+  acotando el pico a un chunk en vez de un `Array4` completo por etapa.
+  Todas las operaciones de la cadena (composite, gapfill_linear, band-math,
+  par_map_series/stats) son puramente por-píxel — trocear por `(y,x)` no
+  cambia ningún resultado numérico, solo cuánta memoria cuesta calcularlo
+  (verificado con un test de invarianza chunk-vs-cubo-completo y, en e2e
+  contra Planetary Computer, comparando GeoTIFFs con `--chunk-size` grande
+  vs chico: slope/pvalue idénticos byte a byte, breaks/first idénticos
+  incluida la máscara de NaN). El CLI (`datacube stack`) reemplazó por
+  completo el pipeline imperativo por esta cadena chunked (`--chunk-size`,
+  default 256, mismo default que el chunk espacial de Zarr); el reporte
+  JSON (`dims`/`bands`/`time_range`) ahora se deriva analíticamente sin
+  materializar el cubo cuando no se pide ningún `--output`.
+  **Limitación conocida, a propósito**: esto NO baja el techo de RAM de
+  `stack()` en sí — el ingest STAC/COG sigue siendo O(1x cubo). Bajar ese
+  techo (lectura en ventana por chunk sobre STAC/COG, con `GridSpec`
+  obligatorio) queda fuera de alcance; es un rediseño de mayor riesgo que
+  toca el paralelismo de M3, la reproyección cross-zone y la firma SAS.
 
 ### [MEDIUM] M1 — Los bindings Python retienen el GIL durante todo el cómputo Rayon
 
@@ -503,5 +534,14 @@ publicable por sí sola.
    con un solo ítem abierto: el grafo lazy `stack→mask→composite→index→
    trend` evaluado por chunk (H5 paso 3, v0.7+ en el roadmap original —
    rediseño arquitectónico mayor, no un quick win).
+   **H5 paso 3 ejecutado el 2026-07-03 (v0.11.0, alcance revisado)**: nuevo
+   módulo `datacube_core::pipeline` (`ChunkPipeline`/`Cube::run_chunked`)
+   corre composite→gapfill→index→trend/breaks por tile espacial, acotando el
+   pico de memoria post-stack de ~4x (una copia completa por etapa, sin
+   resolver hasta ahora) a ~1x + un chunk; el CLI reemplazó el pipeline
+   imperativo por esta cadena chunked (`--chunk-size`, default 256).
+   AUDIT grupo 3 queda completamente cerrado. Ver detalle y la limitación
+   conocida (el techo de RAM de la ingesta STAC/COG en sí, O(1x cubo), sigue
+   sin resolver a propósito) en el hallazgo H5 arriba.
 4. **Ecosistema/adopción**: M6 (desacoplar surtgis), L6 (stubs + wheels PyPI),
    M9 (feature serde en core). Sin esto el motor es excelente pero solo tuyo.

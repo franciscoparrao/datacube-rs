@@ -3,8 +3,12 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use datacube_core::{CompositeMethod, CompositeWindow, indices, stats};
+use datacube_core::{
+    ChunkPipeline, ChunkResult, CompositeMethod, CompositeWindow, GapfillSpec, IndexSpec, StatSpec,
+    TrendMethod, stats::BreakOptions,
+};
 use datacube_io::{GridSpec, MaskConfig, StackConfig, StackedCube, stack};
+use ndarray::{Array2, s};
 use surtgis_core::io::write_geotiff;
 use surtgis_core::{CRS, GeoTransform, Raster};
 
@@ -134,6 +138,12 @@ pub struct StackArgs {
     /// Significance level for per-pixel break detection
     #[arg(long, default_value_t = 0.05)]
     break_alpha: f64,
+    /// Spatial tile size for the composite/gapfill/index/trend/breaks chain:
+    /// each tile runs the whole chain independently, bounding peak memory to
+    /// one tile instead of one full-cube copy per stage (same default as the
+    /// GeoZarr chunk size)
+    #[arg(long, default_value_t = 256)]
+    chunk_size: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -221,19 +231,121 @@ pub fn run(args: &StackArgs) -> Result<()> {
     // survives composite/gapfill/index, so it's read back from the cube at
     // write time instead of being threaded through this function by hand.
     let StackedCube {
-        mut cube,
+        cube,
         slices,
         skipped,
         ..
     } = stack(&cfg).context("stacking failed")?;
-    {
-        let (nb, ny, nx, nt) = cube.dims();
-        eprintln!(
-            "stacked {nt} scenes ({nb} bands, {ny}x{nx} px), {} skipped",
-            skipped.len()
-        );
+    let (_, ny, nx, _) = cube.dims();
+    eprintln!(
+        "stacked {} scenes ({} bands, {ny}x{nx} px), {} skipped",
+        cube.dims().3,
+        cube.dims().0,
+        skipped.len()
+    );
+    let (transform, epsg) = cube_georef(&cube)?;
+
+    let wants_trend = args.output.is_some() || args.pvalue_output.is_some();
+    let wants_breaks = args.breaks_output.is_some() || args.first_break_output.is_some();
+
+    let pipeline = build_pipeline(args, wants_trend, wants_breaks)?;
+
+    let mut maps_written = Vec::new();
+    if wants_trend || wants_breaks {
+        let mut slope = wants_trend.then(|| Array2::from_elem((ny, nx), f64::NAN));
+        let mut pvalue = wants_trend.then(|| Array2::from_elem((ny, nx), f64::NAN));
+        let mut count = wants_breaks.then(|| Array2::from_elem((ny, nx), f64::NAN));
+        let mut first = wants_breaks.then(|| Array2::from_elem((ny, nx), f64::NAN));
+
+        for result in cube
+            .run_chunked(args.chunk_size, args.chunk_size, &pipeline)
+            .context("chunked pipeline failed")?
+        {
+            let ChunkResult { y0, x0, stat } = result.context("chunked pipeline failed")?;
+            if let Some((s, p)) = stat.trend {
+                let (ch, cw) = s.dim();
+                slope
+                    .as_mut()
+                    .unwrap()
+                    .slice_mut(s![y0..y0 + ch, x0..x0 + cw])
+                    .assign(&s);
+                pvalue
+                    .as_mut()
+                    .unwrap()
+                    .slice_mut(s![y0..y0 + ch, x0..x0 + cw])
+                    .assign(&p);
+            }
+            if let Some((c, f)) = stat.breaks {
+                let (ch, cw) = c.dim();
+                count
+                    .as_mut()
+                    .unwrap()
+                    .slice_mut(s![y0..y0 + ch, x0..x0 + cw])
+                    .assign(&c);
+                first
+                    .as_mut()
+                    .unwrap()
+                    .slice_mut(s![y0..y0 + ch, x0..x0 + cw])
+                    .assign(&f);
+            }
+        }
+
+        if let Some(path) = &args.output {
+            write_map(slope.as_ref().unwrap(), transform, epsg, path)?;
+            maps_written.push(path.display().to_string());
+        }
+        if let Some(path) = &args.pvalue_output {
+            write_map(pvalue.as_ref().unwrap(), transform, epsg, path)?;
+            maps_written.push(path.display().to_string());
+        }
+        if let Some(path) = &args.breaks_output {
+            write_map(count.as_ref().unwrap(), transform, epsg, path)?;
+            maps_written.push(path.display().to_string());
+        }
+        if let Some(path) = &args.first_break_output {
+            write_map(first.as_ref().unwrap(), transform, epsg, path)?;
+            maps_written.push(path.display().to_string());
+        }
     }
-    if let Some(kind) = args.composite {
+
+    // Report shape analytically: composite/gapfill/index never change the
+    // spatial extent, and the derived band set/time axis are known without
+    // running the pipeline (see `ChunkPipeline::output_time`) — so a report-
+    // only invocation (no --output/--*-output) never materializes the cube.
+    let out_bands: Vec<String> = match &pipeline.index {
+        Some(index) => vec![index.label().to_string()],
+        None => cube.bands().to_vec(),
+    };
+    let out_time = pipeline.output_time(&cube)?;
+    let report = serde_json::json!({
+        "scenes": slices.iter().map(|s| serde_json::json!({
+            "id": s.item_id,
+            "datetime": s.datetime,
+            "time": s.time,
+            "cloud_cover": s.cloud_cover,
+        })).collect::<Vec<_>>(),
+        "skipped": skipped,
+        "dims": { "bands": out_bands.len(), "height": ny, "width": nx, "times": out_time.len() },
+        "bands": out_bands,
+        "time_range": [out_time.first(), out_time.last()],
+        "epsg": epsg,
+        "maps_written": maps_written,
+    });
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+/// Builds the chunked pipeline (composite/gapfill/index/stat) from CLI args.
+/// The stat band is the index's fixed label when `--index` is given
+/// (`cube.bands()[0]` after applying it), otherwise `--band` or the first
+/// stacked asset — resolved against the cube as it exists right before the
+/// stat step, matching `stack_cmd`'s historical band-selection behavior.
+fn build_pipeline(
+    args: &StackArgs,
+    wants_trend: bool,
+    wants_breaks: bool,
+) -> Result<ChunkPipeline> {
+    let composite = args.composite.map(|kind| {
         let window = match kind {
             CompositeKind::SameTime => CompositeWindow::SameTime,
             CompositeKind::Monthly => CompositeWindow::CalendarMonth,
@@ -245,161 +357,61 @@ pub fn run(args: &StackArgs) -> Result<()> {
             CompositeAgg::Min => CompositeMethod::Min,
             CompositeAgg::Max => CompositeMethod::Max,
         };
-        cube = cube
-            .composite(window, method)
-            .context("compositing failed")?;
-        eprintln!("composited to {} slices", cube.dims().3);
-    }
-    if let Some(mg) = args.gapfill {
-        let max_gap = if mg > 0.0 { Some(mg) } else { None };
-        cube = cube.gapfill_linear(max_gap).context("gap-filling failed")?;
-    }
-    if let Some(kind) = args.index {
-        cube = compute_index(&cube, kind, args).context("spectral index failed")?;
-        eprintln!("computed index '{}' from stacked bands", cube.bands()[0]);
-    }
-    let (nb, ny, nx, nt) = cube.dims();
-    let (transform, epsg) = cube_georef(&cube)?;
-
-    let wants_trend = args.output.is_some() || args.pvalue_output.is_some();
-    let wants_breaks = args.breaks_output.is_some() || args.first_break_output.is_some();
-
-    let mut maps_written = Vec::new();
-    if wants_trend || wants_breaks {
-        // an index collapses the cube to its single derived band; otherwise
-        // pick the requested asset (defaulting to the first stacked one).
-        let band = if args.index.is_some() {
-            0
-        } else {
-            let band_key = args.band.as_deref().unwrap_or(&args.assets[0]);
-            cube.bands()
-                .iter()
-                .position(|b| b == band_key)
-                .with_context(|| format!("band '{band_key}' is not in the stacked assets"))?
-        };
-
-        if wants_trend {
-            let (slope, pvalue) = trend_maps(&cube, band, args.stat)?;
-            if let Some(path) = &args.output {
-                write_map(&slope, transform, epsg, path)?;
-                maps_written.push(path.display().to_string());
-            }
-            if let Some(path) = &args.pvalue_output {
-                write_map(&pvalue, transform, epsg, path)?;
-                maps_written.push(path.display().to_string());
-            }
-        }
-        if wants_breaks {
-            let (count, first) = break_maps(&cube, band, args.break_harmonics, args.break_alpha)?;
-            if let Some(path) = &args.breaks_output {
-                write_map(&count, transform, epsg, path)?;
-                maps_written.push(path.display().to_string());
-            }
-            if let Some(path) = &args.first_break_output {
-                write_map(&first, transform, epsg, path)?;
-                maps_written.push(path.display().to_string());
-            }
-        }
-    }
-
-    let report = serde_json::json!({
-        "scenes": slices.iter().map(|s| serde_json::json!({
-            "id": s.item_id,
-            "datetime": s.datetime,
-            "time": s.time,
-            "cloud_cover": s.cloud_cover,
-        })).collect::<Vec<_>>(),
-        "skipped": skipped,
-        "dims": { "bands": nb, "height": ny, "width": nx, "times": nt },
-        "bands": cube.bands(),
-        "time_range": [cube.time().first(), cube.time().last()],
-        "epsg": epsg,
-        "maps_written": maps_written,
+        (window, method)
     });
-    println!("{}", serde_json::to_string_pretty(&report)?);
-    Ok(())
-}
-
-/// Computes the requested spectral index from the stacked bands, returning a
-/// single-band cube on the same grid. Band roles come from the --nir/--red/…
-/// flags so the asset keys can differ from the Sentinel-2 defaults.
-fn compute_index(
-    cube: &datacube_core::Cube,
-    kind: IndexKind,
-    args: &StackArgs,
-) -> Result<datacube_core::Cube> {
-    let (nir, red, green, blue, swir) = (
-        args.nir.as_str(),
-        args.red.as_str(),
-        args.green.as_str(),
-        args.blue.as_str(),
-        args.swir.as_str(),
-    );
-    let out = match kind {
-        IndexKind::Ndvi => indices::ndvi(cube, nir, red),
-        IndexKind::Ndwi => indices::ndwi(cube, green, nir),
-        IndexKind::Nbr => indices::nbr(cube, nir, swir),
-        IndexKind::Ndbi => indices::ndbi(cube, swir, nir),
-        IndexKind::Evi => indices::evi(cube, nir, red, blue),
-        IndexKind::Savi => indices::savi(cube, nir, red, args.savi_l),
+    let gapfill = args.gapfill.map(|mg| GapfillSpec {
+        max_gap: if mg > 0.0 { Some(mg) } else { None },
+    });
+    let index = args.index.map(|kind| index_spec(kind, args));
+    let band = match &index {
+        Some(spec) => spec.label().to_string(),
+        None => args.band.clone().unwrap_or_else(|| args.assets[0].clone()),
     };
-    out.map_err(|e| anyhow::anyhow!("{e} (check the --nir/--red/… asset keys match --assets)"))
-}
-
-/// Per-pixel slope and p-value grids for the selected band.
-fn trend_maps(
-    cube: &datacube_core::Cube,
-    band: usize,
-    stat: TrendStat,
-) -> Result<(ndarray::Array2<f64>, ndarray::Array2<f64>)> {
-    let results = cube
-        .par_map_series(band, |t, y| match stat {
-            TrendStat::TheilSen => {
-                let slope = stats::theil_sen(t, y).map(|r| r.slope).unwrap_or(f64::NAN);
-                let p = stats::mann_kendall(y)
-                    .map(|r| r.p_value)
-                    .unwrap_or(f64::NAN);
-                (slope, p)
-            }
-            TrendStat::Ols => stats::linear_trend(t, y)
-                .map(|r| (r.slope, r.p_value))
-                .unwrap_or((f64::NAN, f64::NAN)),
-        })
-        .context("per-pixel trend computation failed")?;
-    let slope = results.mapv(|(s, _)| s);
-    let pvalue = results.mapv(|(_, p)| p);
-    Ok((slope, pvalue))
-}
-
-/// Per-pixel break-count and first-break-time grids (OLS-CUSUM).
-/// Pixels with too few finite observations yield `NaN`.
-fn break_maps(
-    cube: &datacube_core::Cube,
-    band: usize,
-    harmonics: usize,
-    alpha: f64,
-) -> Result<(ndarray::Array2<f64>, ndarray::Array2<f64>)> {
-    let opts = stats::BreakOptions {
-        alpha,
-        n_harmonics: harmonics,
+    let trend = wants_trend.then_some(match args.stat {
+        TrendStat::TheilSen => TrendMethod::TheilSenMannKendall,
+        TrendStat::Ols => TrendMethod::Ols,
+    });
+    let breaks = wants_breaks.then(|| BreakOptions {
+        alpha: args.break_alpha,
+        n_harmonics: args.break_harmonics,
         period: 1.0,
-        min_segment: stats::BreakOptions::default()
+        min_segment: BreakOptions::default()
             .min_segment
-            .max(2 * harmonics + 4),
-    };
-    let results = cube
-        .par_map_series(band, |t, y| match stats::detect_breaks(t, y, &opts) {
-            Ok(r) => {
-                let first = r.breaks.first().map(|b| b.time).unwrap_or(f64::NAN);
-                (r.breaks.len() as f64, first)
-            }
-            // too few observations / degenerate series → no break info
-            Err(_) => (f64::NAN, f64::NAN),
-        })
-        .context("per-pixel break detection failed")?;
-    let count = results.mapv(|(c, _)| c);
-    let first = results.mapv(|(_, f)| f);
-    Ok((count, first))
+            .max(2 * args.break_harmonics + 4),
+    });
+    Ok(ChunkPipeline {
+        composite,
+        gapfill,
+        index,
+        stat: StatSpec {
+            band,
+            trend,
+            breaks,
+        },
+    })
+}
+
+/// Maps `--index` and the `--nir/--red/…` band-role flags to an [`IndexSpec`].
+fn index_spec(kind: IndexKind, args: &StackArgs) -> IndexSpec {
+    let (nir, red, green, blue, swir) = (
+        args.nir.clone(),
+        args.red.clone(),
+        args.green.clone(),
+        args.blue.clone(),
+        args.swir.clone(),
+    );
+    match kind {
+        IndexKind::Ndvi => IndexSpec::Ndvi { nir, red },
+        IndexKind::Ndwi => IndexSpec::Ndwi { green, nir },
+        IndexKind::Nbr => IndexSpec::Nbr { nir, swir },
+        IndexKind::Ndbi => IndexSpec::Ndbi { swir, nir },
+        IndexKind::Evi => IndexSpec::Evi { nir, red, blue },
+        IndexKind::Savi => IndexSpec::Savi {
+            nir,
+            red,
+            l: args.savi_l,
+        },
+    }
 }
 
 /// Writes a float map on the stack's grid as GeoTIFF (f32, NaN nodata).

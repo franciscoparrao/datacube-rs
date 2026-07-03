@@ -181,14 +181,64 @@ proj) en vez de reinventar I/O. Diferenciador: cubo Rust nativo sobre GeoZarr.
 - Falta para GeoZarr-CF pleno (refinamiento): variables-coordenada separadas,
   `grid_mapping`/CRS WKT, atributos CF por-banda. Hoy es cubo-en-Zarr-V3 fiel.
 
-## Estado (2026-07-03) — v0.10
-**6 targets**: core (stats+temporal+bandmath+GeoRef), io (STAC/COG+cross-zone
-+mask SCL+GridSpec+lecturas paralelas+**escritura directa por-slot**), CLI,
-PyO3, WASM, zarr (comprimido zstd+f32 opcional, lectura/escritura por chunks).
-Validación estadística 103/103 a 1e-9; band-math vs numpy 1e-12; pytest
-16/16; zarr 8 tests + interop Python real; core 61 unit + 9 doctests, io 23.
-cargo test --workspace verde. Stacking ~6× más rápido en escenarios de red
-reales (M3) sin el pico de memoria 2× de antes (H5 paso 1).
+## Estado (2026-07-03) — v0.11
+**6 targets**: core (stats+temporal+bandmath+GeoRef+**pipeline chunked**), io
+(STAC/COG+cross-zone+mask SCL+GridSpec+lecturas paralelas+escritura directa
+por-slot), CLI (pipeline post-stack por chunk), PyO3, WASM, zarr (comprimido
+zstd+f32 opcional, lectura/escritura por chunks). Validación estadística
+103/103 a 1e-9; band-math vs numpy 1e-12; pytest 16/16; zarr 8 tests + interop
+Python real; core 67 unit + 9 doctests, io 23. cargo test --workspace verde.
+Stacking ~6× más rápido en escenarios de red reales (M3) sin el pico de
+memoria 2× de antes (H5 paso 1); pipeline post-stack (composite/gapfill/
+index/trend/breaks) acotado a ~1x + un chunk en vez de ~4x (H5 paso 3).
+AUDIT.md grupo 3 queda completamente cerrado.
+
+## AUDIT grupo 3 — H5 paso 3: pipeline chunked post-stack (v0.11.0, 2026-07-03)
+- Al retomar el único ítem abierto del grupo 3 (grafo lazy `stack→mask→
+  composite→index→trend` por chunk) se descubrió que el techo de RAM real
+  hoy no es el que describía el planteamiento original de H5: `stack()`
+  (desde v0.10) ya escribe cada escena directo en su slot final, así que el
+  ingest STAC/COG sigue siendo O(1x cubo) — sin cambios con este paso, y
+  bajarlo requeriría lecturas COG en ventana por chunk con `GridSpec`
+  obligatorio (fuera de alcance, riesgo alto: toca M3/cross-zone/firma SAS).
+  El problema real y sin resolver estaba **después** del stack:
+  `stack_cmd.rs::run()` encadenaba `composite→gapfill_linear→compute_index`,
+  cada uno asignando un `Array4` completo nuevo — pico real ~4x el cubo.
+- Nuevo módulo `datacube_core::pipeline`: `ChunkPipeline { composite,
+  gapfill: Option<GapfillSpec>, index: Option<IndexSpec>, stat: StatSpec }`
+  + `Cube::run_chunked(chunk_y, chunk_x, &pipeline) -> impl Iterator<Item =
+  Result<ChunkResult, CubeError>>` corre la cadena completa de forma
+  independiente en cada `CubeChunk` de `Cube::chunks()` (secuencial entre
+  chunks; el paralelismo real sigue viniendo de `par_map_series`/
+  `combine_bands` dentro de cada chunk). `StatSpec` calcula trend Y breaks
+  del mismo cubo procesado por chunk sin recomputar composite/gapfill/index
+  dos veces. `ChunkPipeline::output_time` (+ `temporal::composite_time_axis`,
+  extraída de `Cube::composite`) da el eje de tiempo post-composite sin
+  tocar datos de píxel — el reporte JSON del CLI ya no materializa el cubo
+  cuando no se pide ningún `--output`.
+  Todas las etapas (composite, gapfill_linear, band-math, par_map_series/
+  stats) son puramente por-píxel: trocear por `(y,x)` no cambia ningún
+  resultado numérico. Verificado con test de invarianza chunk-vs-cubo-
+  completo (core) y e2e vs Planetary Computer comparando `--chunk-size`
+  grande vs chico: slope/pvalue idénticos byte a byte, breaks/first
+  idénticos (incluida la máscara NaN).
+- CLI `datacube stack`: reemplazó por completo el pipeline imperativo
+  (`compute_index`/`trend_maps`/`break_maps` borrados, movidos a core) por
+  la cadena chunked; nuevo flag `--chunk-size` (default 256, igual al chunk
+  espacial de Zarr). Cambio de comportamiento documentado: si no se pide
+  ningún `--output`/`--pvalue-output`/`--breaks-output`/`--first-break-
+  output`, errores de `--index`/`--nir`/etc. ya no se validan eagerly (antes
+  se corría el índice igual con o sin output; caso de uso degenerado, se
+  documenta en vez de agregar validación extra para un camino que nadie usa).
+- **Limitación conocida, a propósito**: esto NO baja el techo de RAM de
+  `stack()` — el ingest STAC/COG sigue siendo O(1x cubo). Bajarlo es un
+  rediseño de mayor riesgo, descartado en esta sesión (ver arriba).
+- Verificación: 6 tests nuevos en `pipeline.rs` (core 61→67), clippy limpio,
+  cargo fmt aplicado, e2e Planetary Computer (Santiago, ene-abr 2024,
+  `--mask-scl --grid-epsg --grid-res --composite monthly --index ndvi
+  --breaks-output`) con `--chunk-size 100000` (1 chunk) vs `--chunk-size 17`
+  (multi-chunk): mismo reporte JSON, GeoTIFFs idénticos.
+- Workspace bump 0.11.0.
 
 ## Auditoría + quick wins (2026-07-02)
 - `AUDIT.md` (raíz): auditoría completa del motor — 0 critical, 5 HIGH de
@@ -375,19 +425,24 @@ reales (M3) sin el pico de memoria 2× de antes (H5 paso 1).
 
 ## Próximos pasos al retomar
 1. Paper (C&G/EMS): material listo + band-math + GeoZarr (comprimido+chunks)
-   + ARD (mask/grid) + georef unificado + stacking paralelo sin pico 2×.
-   Opciones: §4.4 NDVI in-engine; sección GeoZarr/arquitectura citando
-   `read_zarr_chunked` como el "cube_view + chunk streaming" de gdalcubes
-   hecho en Rust/Zarr V3; mencionar el ~6× de M3 como evidencia de perf.
+   + ARD (mask/grid) + georef unificado + stacking paralelo sin pico 2× +
+   pipeline post-stack chunked (H5 paso 3). Opciones: §4.4 NDVI in-engine;
+   sección GeoZarr/arquitectura citando `read_zarr_chunked`/`run_chunked`
+   como el "cube_view + chunk streaming" de gdalcubes hecho en Rust/Zarr V3;
+   mencionar el ~6× de M3 y el ~4x→1x del pipeline chunked como evidencia
+   de perf/memoria.
 2. Pendiente Zenodo DOI (gated en ORCID).
-3. AUDIT grupo 3 queda con UN solo ítem abierto: el grafo lazy
-   `stack→mask→composite→index→trend` evaluado por chunk (H5 paso 3,
-   v0.7+ en el roadmap original) — rediseño arquitectónico mayor, no un
-   quick win; requiere decidir la forma del DAG/API antes de tocar código.
+3. AUDIT grupo 3 queda **completamente cerrado** (H5 paso 3 resuelto en
+   v0.11.0, alcance revisado — ver sección arriba). El techo de RAM de la
+   ingesta STAC/COG en sí (`stack()`, O(1x cubo)) queda documentado como
+   limitación conocida, a propósito: bajarlo exigiría lecturas COG en
+   ventana por chunk con `GridSpec` obligatorio, un rediseño de mayor
+   riesgo que toca M3/cross-zone/firma SAS — no se justificó en esta sesión.
 4. Bug externo detectado en sesión anterior: paginación de `search_all` en
    surtgis-cloud repite items en Earth Search (dedup por id ya puesto como
    guard en `stack()`, pero el fix real es en surtgis).
 5. Opcional: GeoZarr-CF pleno (coord vars, grid_mapping); object-store
    (S3/HTTP) vía zarrs async; exponer datacube-io (stack STAC) a Python;
    sharding Zarr para object store (M2.c, no implementado — solo relevante
-   para S3/HTTP, no filesystem local).
+   para S3/HTTP, no filesystem local); si algún día se quiere bajar el techo
+   de RAM del ingest STAC/COG, ver punto 3.

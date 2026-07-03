@@ -27,10 +27,14 @@
 mod bandmath;
 mod cube;
 mod error;
+mod pipeline;
 pub mod stats;
 mod temporal;
 
 pub use bandmath::indices;
 pub use cube::{Cube, CubeChunk, GeoRef, PixelSeries};
 pub use error::CubeError;
+pub use pipeline::{
+    ChunkPipeline, ChunkResult, ChunkStat, GapfillSpec, IndexSpec, StatSpec, TrendMethod,
+};
 pub use temporal::{CompositeMethod, CompositeWindow};

@@ -75,10 +75,7 @@ impl Cube {
             .as_slice()
             .expect("cube data is standard layout (enforced by Cube::new)");
 
-        let times: Vec<f64> = groups
-            .iter()
-            .map(|g| g.iter().map(|&i| self.time()[i]).sum::<f64>() / g.len() as f64)
-            .collect();
+        let times = group_means(self.time(), &groups);
 
         // every pixel reduces its own series independently — parallelize over
         // pixels (the source and output pixel series are both contiguous).
@@ -143,6 +140,28 @@ impl Cube {
 
         Ok(Cube::new(data, time.to_vec(), self.bands().to_vec())?.inherit_georef(self))
     }
+}
+
+/// The mean time coordinate of each group, in group order.
+fn group_means(time: &[f64], groups: &[Vec<usize>]) -> Vec<f64> {
+    groups
+        .iter()
+        .map(|g| g.iter().map(|&i| time[i]).sum::<f64>() / g.len() as f64)
+        .collect()
+}
+
+/// The time coordinates [`Cube::composite`] would produce for `time` under
+/// `window`, without touching any pixel data. Composite/gapfill/index never
+/// change the spatial extent, so this plus the original `(height, width)`
+/// fully describe a pipeline's output shape without running it — used by
+/// [`crate::pipeline::ChunkPipeline::output_time`] to report chunked-pipeline
+/// output shape cheaply.
+pub(crate) fn composite_time_axis(
+    time: &[f64],
+    window: CompositeWindow,
+) -> Result<Vec<f64>, CubeError> {
+    let groups = group_times(time, window)?;
+    Ok(group_means(time, &groups))
 }
 
 /// Groups time indices according to the window; groups preserve time order.
