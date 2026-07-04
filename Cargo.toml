@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.11.0"
+version = "0.12.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/franciscoparrao/datacube-rs"
@@ -19,6 +19,7 @@ authors = ["Francisco Parra <francisco.parra.o@usach.cl>"]
 [workspace.dependencies]
 datacube-core = { path = "crates/datacube-core" }
 datacube-io = { path = "crates/datacube-io" }
+datacube-zarr = { path = "crates/datacube-zarr" }
 # Reuses the SurtGIS STAC client + COG reader (sibling checkout required:
 # ~/proyectos/surtgis next to this repo)
 surtgis-core = { path = "../surtgis/crates/core" }

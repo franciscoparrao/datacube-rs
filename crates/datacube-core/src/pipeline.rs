@@ -147,7 +147,12 @@ impl ChunkPipeline {
         }
     }
 
-    fn run_on(&self, cube: &Cube) -> Result<ChunkStat, CubeError> {
+    /// Runs the composite/gapfill/index prefix of the pipeline on `cube`,
+    /// without computing any statistic — the intermediate cube [`Cube::run_chunked`]
+    /// feeds to [`StatSpec`] internally, exposed for callers that want the
+    /// processed cube itself (e.g. to persist it, as [`crate::pipeline`]'s
+    /// stat step never materializes a full processed cube by design).
+    pub fn transform(&self, cube: &Cube) -> Result<Cube, CubeError> {
         let mut cube = match self.composite {
             Some((window, method)) => cube.composite(window, method)?,
             None => cube.clone(),
@@ -158,6 +163,11 @@ impl ChunkPipeline {
         if let Some(index) = &self.index {
             cube = index.apply(&cube)?;
         }
+        Ok(cube)
+    }
+
+    fn run_on(&self, cube: &Cube) -> Result<ChunkStat, CubeError> {
+        let cube = self.transform(cube)?;
         let band = cube.band(&self.stat.band)?;
 
         let trend = self
@@ -428,5 +438,19 @@ mod tests {
             iter.next().unwrap(),
             Err(CubeError::BandNotFound(_))
         ));
+    }
+
+    #[test]
+    fn transform_applies_composite_gapfill_index_without_a_stat() {
+        let cube = scene_cube(3, 2, 6);
+        let p = pipeline(); // gapfill + ndvi index, no composite
+        let transformed = p.transform(&cube).unwrap();
+        // gapfill (no composite here) keeps the time axis; index collapses to 1 band
+        assert_eq!(transformed.dims().0, 1);
+        assert_eq!(transformed.bands(), ["ndvi"]);
+        assert_eq!(transformed.dims().3, cube.dims().3);
+        // matches manually chaining the same steps on the whole cube
+        let manual = indices::ndvi(&cube.gapfill_linear(None).unwrap(), "nir", "red").unwrap();
+        assert_eq!(transformed.data(), manual.data());
     }
 }

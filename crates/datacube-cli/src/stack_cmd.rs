@@ -4,10 +4,11 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use datacube_core::{
-    ChunkPipeline, ChunkResult, CompositeMethod, CompositeWindow, GapfillSpec, IndexSpec, StatSpec,
-    TrendMethod, stats::BreakOptions,
+    ChunkPipeline, ChunkResult, CompositeMethod, CompositeWindow, Cube, GapfillSpec, GeoRef,
+    IndexSpec, StatSpec, TrendMethod, stats::BreakOptions,
 };
 use datacube_io::{GridSpec, MaskConfig, StackConfig, StackedCube, stack};
+use datacube_zarr::ZarrCubeWriter;
 use ndarray::{Array2, s};
 use surtgis_core::io::write_geotiff;
 use surtgis_core::{CRS, GeoTransform, Raster};
@@ -144,6 +145,11 @@ pub struct StackArgs {
     /// GeoZarr chunk size)
     #[arg(long, default_value_t = 256)]
     chunk_size: usize,
+    /// Persist the processed cube (after mask/composite/gapfill/index, before
+    /// the trend/breaks statistics) to a GeoZarr store at this path, written
+    /// one spatial tile at a time (--chunk-size)
+    #[arg(long)]
+    zarr_output: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -250,6 +256,29 @@ pub fn run(args: &StackArgs) -> Result<()> {
 
     let pipeline = build_pipeline(args, wants_trend, wants_breaks)?;
 
+    // Report shape analytically: composite/gapfill/index never change the
+    // spatial extent, and the derived band set/time axis are known without
+    // running the pipeline (see `ChunkPipeline::output_time`) — so a report-
+    // only invocation (no --output/--*-output/--zarr-output) never
+    // materializes the cube.
+    let out_bands: Vec<String> = match &pipeline.index {
+        Some(index) => vec![index.label().to_string()],
+        None => cube.bands().to_vec(),
+    };
+    let out_time = pipeline.output_time(&cube)?;
+
+    if let Some(path) = &args.zarr_output {
+        write_processed_zarr(
+            &cube,
+            &pipeline,
+            args.chunk_size,
+            &out_bands,
+            &out_time,
+            path,
+        )
+        .context("writing --zarr-output failed")?;
+    }
+
     let mut maps_written = Vec::new();
     if wants_trend || wants_breaks {
         let mut slope = wants_trend.then(|| Array2::from_elem((ny, nx), f64::NAN));
@@ -308,15 +337,6 @@ pub fn run(args: &StackArgs) -> Result<()> {
         }
     }
 
-    // Report shape analytically: composite/gapfill/index never change the
-    // spatial extent, and the derived band set/time axis are known without
-    // running the pipeline (see `ChunkPipeline::output_time`) — so a report-
-    // only invocation (no --output/--*-output) never materializes the cube.
-    let out_bands: Vec<String> = match &pipeline.index {
-        Some(index) => vec![index.label().to_string()],
-        None => cube.bands().to_vec(),
-    };
-    let out_time = pipeline.output_time(&cube)?;
     let report = serde_json::json!({
         "scenes": slices.iter().map(|s| serde_json::json!({
             "id": s.item_id,
@@ -434,7 +454,7 @@ fn write_map(
     values: &ndarray::Array2<f64>,
     transform: GeoTransform,
     epsg: Option<u32>,
-    path: &PathBuf,
+    path: &std::path::Path,
 ) -> Result<()> {
     let (ny, nx) = values.dim();
     let mut raster = Raster::<f32>::new(ny, nx);
@@ -449,4 +469,47 @@ fn write_map(
     raster.set_nodata(Some(f32::NAN));
     write_geotiff(&raster, path, None)
         .map_err(|e| anyhow::anyhow!("writing {} failed: {e}", path.display()))
+}
+
+/// Persists the pipeline's processed cube (composite/gapfill/index, no stat)
+/// to a GeoZarr store, one spatial tile at a time — the write-side
+/// counterpart of `Cube::run_chunked`, since the stat step never
+/// materializes a full processed cube by design (Section 4.8 of the paper).
+fn write_processed_zarr(
+    cube: &Cube,
+    pipeline: &ChunkPipeline,
+    chunk_size: usize,
+    out_bands: &[String],
+    out_time: &[f64],
+    path: &std::path::Path,
+) -> Result<()> {
+    let (_, ny, nx, _) = cube.dims();
+    let geo = cube.georef().unwrap_or(GeoRef {
+        epsg: None,
+        transform: None,
+    });
+    let writer = ZarrCubeWriter::create(
+        path,
+        (out_bands.len(), ny, nx, out_time.len()),
+        out_bands,
+        out_time,
+        &geo,
+        Default::default(),
+    )
+    .map_err(|e| anyhow::anyhow!("creating {} failed: {e}", path.display()))?;
+    for chunk in cube
+        .chunks(chunk_size, chunk_size)
+        .context("chunking failed")?
+    {
+        let sub = Cube::new(
+            chunk.data.to_owned(),
+            cube.time().to_vec(),
+            cube.bands().to_vec(),
+        )?;
+        let processed = pipeline.transform(&sub)?;
+        writer
+            .write_chunk(processed.data(), chunk.y0, chunk.x0)
+            .map_err(|e| anyhow::anyhow!("writing tile ({},{}) failed: {e}", chunk.y0, chunk.x0))?;
+    }
+    Ok(())
 }

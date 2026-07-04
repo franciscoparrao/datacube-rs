@@ -48,16 +48,21 @@ estimators in one compiled core. It models a cube on the
 $(\text{band}, y, x, \text{time})$ axes with the time dimension innermost,
 enabling zero-copy per-pixel and per-chunk streaming parallelised with Rayon;
 ingests satellite time series directly from STAC catalogues and Cloud-Optimized
-GeoTIFF assets with cross-UTM-zone mosaicking; and provides ordinary-least-squares
-trend, the Theil--Sen slope and tie-corrected Mann--Kendall test, harmonic
-regression for seasonality, and OLS-CUSUM structural-break detection. Every
-estimator is cross-validated to numerical parity against established reference
+GeoTIFF assets with per-pixel quality-band masking, an explicit reproducible
+target grid, and cross-UTM-zone mosaicking; derives spectral indices and
+provides ordinary-least-squares trend, the Theil--Sen slope and tie-corrected
+Mann--Kendall test, harmonic regression for seasonality, and OLS-CUSUM
+structural-break detection, all as native cube operators. Every estimator is
+cross-validated to numerical parity against established reference
 implementations (pyMannKendall, SciPy and statsmodels), passing 103 of 103
 checks at a relative tolerance of $10^{-9}$, and characterised against known
-ground truth. The same compiled core is delivered as a native Rust library, a
-command-line tool, a Python extension (PyO3) and a WebAssembly module that runs
-in the browser, with results agreeing across targets to $2.8\times10^{-15}$. We
-report parallel-scaling benchmarks and a case study that dates the February~2023
+ground truth. Cubes can be persisted to a compressed, chunked GeoZarr store,
+and the composite/gap-fill/index/trend/break chain runs one spatial tile at a
+time so its peak memory is bounded by a tile rather than the whole cube. The
+same compiled core is delivered as a native Rust library, a command-line tool,
+a Python extension (PyO3) and a WebAssembly module that runs in the browser,
+with results agreeing across targets to $2.8\times10^{-15}$. We report
+parallel-scaling benchmarks and a case study that dates the February~2023
 Chilean wildfires from a Sentinel-2 cube, recovering the timing to within days
 of an independent burned-area product.
 \end{abstract}
@@ -73,8 +78,8 @@ Mann--Kendall \sep Phenology \sep Structural breaks
 \begin{itemize}\setlength{\itemsep}{0pt}
   \item Open-source Rust engine for temporal analysis of satellite image time series.
   \item Trend, Mann--Kendall, harmonic and structural-break estimators as native operators.
-  \item Streaming (band,\,y,\,x,\,time) cube with zero-copy, Rayon-parallel per-pixel iteration.
-  \item Ingests STAC and Cloud-Optimized GeoTIFF with cross-UTM-zone mosaicking.
+  \item Ingests STAC/COG with per-pixel cloud masking and an explicit reproducible grid.
+  \item Compressed, chunked GeoZarr store; the analysis chain runs bounded-memory per tile.
   \item One core as library, CLI, Python and WebAssembly; validated to $10^{-9}$ parity.
 \end{itemize}
 
@@ -424,6 +429,23 @@ observations on each side, leaving gaps wider than a configurable limit (and the
 series ends) untouched, so that no value is extrapolated. Both transforms run in
 parallel over pixels.
 
+\subsection{Spectral indices}
+\label{sec:indices}
+Band arithmetic is a per-cell transform: given a band name it looks up the band
+index (\texttt{Cube::band}) and combines bands at each $(y, x, t)$ cell into a
+new single-band cube on the same spatial and temporal grid, propagating
+\texttt{NaN} whenever any input band is missing or the index is undefined (e.g.\
+a zero normalized-difference denominator). Two primitives cover the common
+cases: a normalized difference $(a-b)/(a+b)$ and a general per-cell combination
+over an arbitrary number of bands, evaluated in parallel over cells with a
+stack-allocated buffer for cubes of up to sixteen bands. NDVI, NDWI, NBR and
+NDBI are normalized differences of the appropriate band pair; EVI and SAVI are
+general combinations. The command-line tool exposes these as an
+\texttt{--index} option that runs the requested index on the stacked bands
+before the temporal estimators, with the spectral-band role
+(near-infrared, red, and so on) mapped to whichever asset keys the archive
+uses.
+
 \subsection{Cube ingestion from STAC and COG}
 \label{sec:ingest}
 The \texttt{datacube-io} crate assembles a cube directly from a satellite
@@ -433,12 +455,24 @@ asset (band) keys, it queries a STAC API---Microsoft Planetary Computer, Element
 cloud-cover threshold. For each retained scene it signs the asset URL when
 required (Planetary Computer shared-access signatures), reads the Cloud-Optimized
 GeoTIFF windowed to the bounding box (optionally at a coarser overview level for
-speed), and masks the nodata value to \texttt{NaN}. The first scene read defines
-a reference grid; subsequent scenes are reprojected and resampled onto it, and
-scenes lying in a neighbouring UTM zone are mosaicked across the zone boundary
-rather than discarded. Acquisition timestamps are converted to fractional years
-so that an annual cycle has unit period, matching the harmonic model of
-Section~\ref{sec:harmonic}. The heavy machinery---HTTP range reads, TIFF
+speed), and masks the nodata value to \texttt{NaN}. A per-pixel quality-band
+mask (e.g.\ the Sentinel-2 scene-classification layer) can be applied to each
+asset before resampling: pixels whose quality class is not in a configurable
+keep-set are set to \texttt{NaN} at the asset's native resolution, so cloud and
+shadow pixels do not bleed into neighbours under the subsequent resampling. By
+default the first successfully read scene defines the reference grid, so that
+grid depends on catalogue order and network outcomes; an explicit target-grid
+specification---CRS, resolution, extent and origin alignment---may instead be
+given upfront, making the cube's grid reproducible independently of which
+scenes are actually read, a precondition for comparing cubes built from
+different queries or dates. Scenes are read through a bounded worker pool once
+the reference grid is fixed, cutting wall-clock time roughly in proportion to
+the pool size for network-bound archives (Section~\ref{sec:perf}). Acquisition
+timestamps are converted to fractional years so that an annual cycle has unit
+period, matching the harmonic model of Section~\ref{sec:harmonic}, and slices
+may be composited into calendar-month or calendar-year bins recovered exactly
+from that axis (Section~\ref{sec:transforms}), independently of which scene a
+series happens to start on. The heavy machinery---HTTP range reads, TIFF
 decoding, signature handling, and UTM reprojection---is reused from the
 open-source SurtGIS engine's cloud stack \citep{surtgis}, keeping
 \texttt{datacube-io} a thin assembly layer; it is an optional build feature, so
@@ -452,13 +486,62 @@ neighbouring-zone tiles onto the reference grid yields $31$ usable time slices
 leaves only $15$---doubling the temporal depth for a study area that does not
 fit the satellite tiling.
 
+\subsection{Georeferenced results across transforms}
+\label{sec:georef}
+A cube optionally carries a georeference---an EPSG code and an affine
+transform---set once by the ingestion step. Every transform that preserves the
+spatial grid (compositing, gap-filling, and the spectral indices of
+Section~\ref{sec:indices}) copies it onto its output automatically, so a
+georeferenced trend or break map can be written directly from whatever cube the
+pipeline produced, without the caller re-threading a transform and CRS pair by
+hand through each intermediate step; a cube built only from an in-memory array,
+with no ingestion step, simply carries no georeference and behaves as before.
+
+\subsection{GeoZarr backing store}
+\label{sec:zarr}
+A cube can be serialised to and read back from a Zarr~V3 store on the
+$(\mathrm{band}, y, x, \mathrm{time})$ axes, with dimension names and
+band/time/CRS/transform attributes attached to the array, using a compressed
+(Zstandard) codec and an optional 32-bit encoding by default---an
+analysis-ready, cloud-native representation that several Sentinel and Landsat
+collections are converging on. Interoperability is verified directly: a store
+written by \texttt{datacube-rs} is read back independently with the Python
+\texttt{zarr} package and its NDVI recomputed there matches the value computed
+in Rust. The same crate reads and writes a store one spatial tile at a time,
+so a large store can be processed with memory bounded by a single tile rather
+than the whole cube; each tile's georeference has its origin shifted to the
+tile's own corner, so tile-wise output remains correctly georeferenced.
+
+\subsection{Bounded-memory chunked analysis}
+\label{sec:chunked}
+The compositing, gap-filling, spectral-index and per-pixel estimator stages of
+Sections~\ref{sec:transforms}--\ref{sec:indices} and~\ref{sec:methods} are all
+per-pixel-series transforms: none reads a neighbouring pixel. Run in sequence
+on a whole cube, each stage nonetheless allocates a full new cube, so a
+composite-then-index-then-trend pipeline holds several full-cube copies live
+at once. Because no stage depends on spatial neighbours, the same chain can
+instead be run independently on each spatial tile yielded by the chunking
+iterator of Section~\ref{sec:streaming}, bounding peak memory to one tile
+(plus whatever that tile's own stages allocate) instead of one full-cube copy
+per stage; results are identical to the whole-cube path, since the chain never
+crosses a tile boundary. The command-line tool exposes this as the unit of
+execution for its analysis chain, with the tile size a user-set parameter. This
+bounds the memory of the compositing-through-estimation chain, not of the STAC
+ingestion step that produces the initial cube, which still reads and holds one
+full cube before the chunked chain runs; removing that remaining ceiling would
+require reading each scene windowed to a spatial tile rather than to the whole
+bounding box, at the cost of many more, smaller network requests, and is left
+for future work (Section~\ref{sec:outlook}).
+
 \subsection{Deployment targets}
 \label{sec:targets}
 The same compiled core is delivered through four frontends. As a \emph{Rust
 library} it is embedded directly in other tools. The \emph{command-line}
 program exposes the per-series estimators on CSV input and, with the ingestion
-feature enabled, a \texttt{stack} command that searches, assembles, and writes
-GeoTIFF trend- and break-map products in one step. The \emph{Python} extension
+feature enabled, a \texttt{stack} command that searches, assembles, masks,
+composites, derives an index, and writes GeoTIFF trend- and break-map products
+in one step, with the target grid, quality mask, and chunk size all
+user-configurable. The \emph{Python} extension
 (built with PyO3) presents the estimators and a cube class over NumPy arrays;
 because the Rayon workers touch no Python objects, the global interpreter lock is
 released during per-pixel evaluation, so a trend map of a moderate cube completes
@@ -644,6 +727,41 @@ same estimators on the same data; the existing cube tools of
 Section~\ref{sec:related} do not provide these tests natively to compare
 against.
 
+The ingestion and analysis scalability claims of
+Sections~\ref{sec:ingest}--\ref{sec:chunked} are likewise measured, not only
+asserted. Reading scenes through the bounded worker pool of
+Section~\ref{sec:ingest} rather than one at a time cuts wall-clock time
+roughly in proportion to its size for network-bound archives: stacking $49$
+Sentinel-2 scenes over Santiago fell from $4$\,min~$41$\,s at a pool size of
+$1$ to $47$\,s at a pool size of $8$, a $6\times$ speed-up, with the same
+scenes, skips and cube produced either way. Separately, Table~\ref{tab:memory}
+reports peak resident memory (measured with \texttt{/usr/bin/time -v}) for the
+same real ingestion-plus-analysis run---a $1465\times1418$-pixel, $24$-scene,
+$3$-band Sentinel-2 cube over the same area at native ($10$\,m) resolution,
+masked, indexed to NDVI, and reduced to a Theil--Sen trend map---at a tile
+size that covers the whole cube in one tile versus one that tiles it into
+many. The smaller tile size cuts peak memory by $2.6\times$; the remaining
+floor is the STAC/COG ingestion step itself, which is not yet chunked
+(Section~\ref{sec:limitations}), so it is unaffected by the tile size and
+bounds how much further the same run could shrink.
+
+\begin{table}[t]
+\centering
+\caption{Peak resident memory (\texttt{/usr/bin/time -v}, real Sentinel-2
+ingestion) of the same masked, NDVI-indexed, Theil--Sen trend-map run at two
+tile sizes over a $1465\times1418$-pixel, $24$-scene, $3$-band cube.}
+\label{tab:memory}
+\small
+\begin{tabular}{@{}lc@{}}
+\toprule
+Tile size (\texttt{--chunk-size}) & Peak RSS \\
+\midrule
+$4000$ (whole cube in one tile) & $4.10$\,GB \\
+$64$ (many small tiles)         & $1.60$\,GB \\
+\bottomrule
+\end{tabular}
+\end{table}
+
 \subsection{Cross-target reproducibility}
 \label{sec:crosstarget}
 The defining property of the architecture---one validated core compiled to
@@ -690,17 +808,21 @@ OLS-CUSUM breaks   & $11.8$ & $12.3$ & $43.7$ \\
 To exercise the engine on a real problem we ask, over a forest landscape near
 Santa Juana (Biob\'io region, central-southern Chile) that was severely affected
 by the catastrophic wildfires of early February 2023: \emph{where and when did
-vegetation undergo abrupt loss, and how is it recovering?} We assembled a
-monthly Sentinel-2 L2A NDVI cube ($58 \times 55$ pixels at $100$\,m, $66$ time
-steps, September~2022 to March~2024) from the Microsoft Planetary Computer,
-masking clouds and shadows with the scene-classification band. For each pixel we
-ran the OLS-CUSUM break detector ($K=1$ harmonic) to locate and date the
-disturbance, and the Theil--Sen estimator on the post-disturbance window to map
-recovery. The index was assembled from the red and near-infrared assets with
-standard STAC tooling, because \texttt{datacube-io} stacks raw bands and
-band-arithmetic such as NDVI is a planned addition (Section~\ref{sec:limitations});
-the case study is thus reproducible independently of the optional ingestion
-crate, and the analysis---the part this paper contributes---is
+vegetation undergo abrupt loss, and how is it recovering?} The whole pipeline
+runs natively in \texttt{datacube-rs}: the command-line tool assembles a
+Sentinel-2 L2A NDVI cube ($57 \times 55$ pixels at $100$\,m, $66$ time steps,
+September~2022 to March~2024) from the Microsoft Planetary Computer onto an
+explicit target grid (Section~\ref{sec:ingest}), masking cloud, shadow and
+snow pixels with the scene-classification band and deriving NDVI
+(Section~\ref{sec:indices}) before running the OLS-CUSUM break detector
+($K=1$ harmonic) to locate and date the disturbance; a second invocation
+restricted to the post-disturbance months runs the Theil--Sen estimator to
+map recovery, on the same grid by construction (Section~\ref{sec:ingest}).
+The processed cube is also persisted to GeoZarr (Section~\ref{sec:zarr}) and
+read back only for the two things the engine does not expose as a built-in
+statistic---the example pixel series of panel~a and the NDVI drop magnitude
+across each pixel's detected break; the disturbance dating and recovery
+mapping that this paper contributes is computed entirely by
 \texttt{datacube-rs}.
 
 \begin{figure}[t]
@@ -718,14 +840,14 @@ of the scar, resolving the spatial pattern of regrowth.}
 \end{figure}
 
 Figure~\ref{fig:casestudy} shows the result. A burned pixel's NDVI collapses
-from $\sim\!0.5$ to $\sim\!0.05$ within a single month at the fire, against a
+from $\sim\!0.61$ to $\sim\!0.04$ within a single month at the fire, against a
 seasonally varying but stable unburned pixel (panel a). The break detector
-flags an abrupt change in $31\%$ of the pixels---the burned fraction of the
+flags an abrupt change in $28\%$ of the pixels---the burned fraction of the
 scene---and dates it to a median of $2023.09$, with $94\%$ of the detected
 breaks falling in January--March~2023, recovering the fire timing without any
-prior knowledge of the event; the median NDVI drop across the break is $-0.31$
+prior knowledge of the event; the median NDVI drop across the break is $-0.32$
 (panels a,b). The post-fire Theil--Sen slope is positive over most of the burn
-scar (median $+0.06\,\mathrm{NDVI\,yr^{-1}}$), quantifying the partial vegetation
+scar (median $+0.062\,\mathrm{NDVI\,yr^{-1}}$), quantifying the partial vegetation
 recovery through 2024 and resolving its spatial heterogeneity (panel c).
 
 The recovered dates agree with an independent source. The MODIS MCD64A1
@@ -733,9 +855,11 @@ burned-area product \citep{giglio2018mcd64}---a different sensor and detection
 algorithm---dates burning
 in this area to day-of-year $33$--$41$ (2--10~February~2023), a median of
 $2023.090$, against the \texttt{datacube-rs} median break time of $2023.09$; the
-burned fraction it reports ($38\%$ at $500$\,m) is consistent with the $31\%$
-found here at $100$\,m. The break detector thus recovers the fire timing to
-within days of an independent product, with no prior knowledge of the event. The
+burned fraction it reports ($38\%$ at $500$\,m) is consistent in order of
+magnitude with the $28\%$ found here at $100$\,m, the coarser MODIS pixels
+mixing burned and unburned land at the scar's ragged edge. The break detector
+thus recovers the fire timing to within days of an independent product, with no
+prior knowledge of the event. The
 analysis---dating a disturbance and mapping its recovery from a cloud-masked
 satellite time series---uses the two estimators that distinguish
 \texttt{datacube-rs} from the generic reducers of existing cube tools, and runs
@@ -817,13 +941,17 @@ Several limitations bound the current version. The break detector uses an
 OLS-CUSUM test with greedy binary segmentation; this is deliberately simpler than
 BFAST's OLS-MOSUM test with simultaneous Bai--Perron breakpoint estimation
 \citep{verbesselt2010bfast,baiperron2003}, and may be less powerful for closely
-spaced breaks. The set of estimators is fixed: unlike openEO's process graphs or
-the user-defined functions of gdalcubes and Earth Engine, extensibility is at the
-Rust API level rather than through a scripting interface. Ingestion stacks raw assets; band arithmetic such as
-NDVI must currently be computed before or after stacking (as in the case
-study), and a derived-index step in the ingestion path is planned. A GeoZarr
-backing store---an emerging analysis-ready standard that several Sentinel and
-Landsat collections are adopting---is likewise planned but not yet implemented. Cross-zone mosaicking handles UTM-to-UTM reprojection
+spaced breaks. The set of estimators and spectral indices is fixed at compile
+time: unlike openEO's process graphs or the user-defined functions of gdalcubes
+and Earth Engine, extensibility is at the Rust API level rather than through a
+scripting interface. The bounded-memory chunked chain of
+Section~\ref{sec:chunked} covers compositing through estimation; the STAC/COG
+ingestion step that builds the initial cube still reads and holds one full
+cube, so very large regions are bounded by that single ingest rather than by a
+tile. The GeoZarr store of Section~\ref{sec:zarr} is a faithful encoding of the
+cube on Zarr~V3---it does not yet carry separate coordinate variables or a
+CF grid-mapping attribute, so full GeoZarr-CF compliance remains future work.
+Cross-zone mosaicking handles UTM-to-UTM reprojection
 only, and the ingestion crate reuses the (open-source) SurtGIS cloud stack as an
 optional dependency. Finally, the wildfire case study
 (Section~\ref{sec:casestudy}) is a single-region application at coarse
@@ -833,10 +961,19 @@ the recovered burn dates against an independent fire perimeter product, are left
 to users of the tool.
 
 \subsection{Outlook}
-Planned work follows directly from these limitations: a GeoZarr/STAC-Zarr backing
-store and queryable GeoParquet output, additional estimators (seasonal and
-autocorrelation-corrected Mann--Kendall variants, further gap-filling methods),
-and tighter integration with the wider SurtGIS engine family so that temporal
+\label{sec:outlook}
+Planned work follows directly from these limitations: full GeoZarr-CF
+compliance (coordinate variables, a CF grid-mapping attribute); object-store
+(S3/HTTP) access through the Zarr backend's asynchronous store support;
+exposing the STAC/COG ingestion crate to the Python extension, which today
+covers only the in-memory cube; and, at greater implementation cost, extending
+the chunked chain of Section~\ref{sec:chunked} to the ingestion step itself, by
+reading each scene windowed to a spatial tile rather than to the whole bounding
+box---the change that would remove the one remaining memory ceiling, at the
+cost of many more, smaller network requests, and of fixing the target grid
+upfront for every tile to be well defined. Further additions include seasonal
+and autocorrelation-corrected Mann--Kendall variants, further gap-filling
+methods, and tighter integration with the wider SurtGIS engine family so that temporal
 analysis composes with its mono-temporal raster operations.
 
 \section{Conclusions}

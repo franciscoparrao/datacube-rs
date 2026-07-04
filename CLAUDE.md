@@ -181,17 +181,84 @@ proj) en vez de reinventar I/O. Diferenciador: cubo Rust nativo sobre GeoZarr.
 - Falta para GeoZarr-CF pleno (refinamiento): variables-coordenada separadas,
   `grid_mapping`/CRS WKT, atributos CF por-banda. Hoy es cubo-en-Zarr-V3 fiel.
 
-## Estado (2026-07-03) — v0.11
+## Estado (2026-07-03) — v0.12
 **6 targets**: core (stats+temporal+bandmath+GeoRef+**pipeline chunked**), io
 (STAC/COG+cross-zone+mask SCL+GridSpec+lecturas paralelas+escritura directa
-por-slot), CLI (pipeline post-stack por chunk), PyO3, WASM, zarr (comprimido
-zstd+f32 opcional, lectura/escritura por chunks). Validación estadística
-103/103 a 1e-9; band-math vs numpy 1e-12; pytest 16/16; zarr 8 tests + interop
-Python real; core 67 unit + 9 doctests, io 23. cargo test --workspace verde.
-Stacking ~6× más rápido en escenarios de red reales (M3) sin el pico de
-memoria 2× de antes (H5 paso 1); pipeline post-stack (composite/gapfill/
-index/trend/breaks) acotado a ~1x + un chunk en vez de ~4x (H5 paso 3).
-AUDIT.md grupo 3 queda completamente cerrado.
+por-slot), CLI (pipeline post-stack por chunk + **volcado a GeoZarr**), PyO3,
+WASM, zarr (comprimido zstd+f32 opcional, lectura/escritura por chunks).
+Validación estadística 103/103 a 1e-9; band-math vs numpy 1e-12; pytest
+16/16; zarr 8 tests + interop Python real; core 68 unit + 9 doctests, io 23.
+cargo test --workspace verde. Stacking ~6× más rápido en escenarios de red
+reales (M3) sin el pico de memoria 2× de antes (H5 paso 1); pipeline
+post-stack (composite/gapfill/index/trend/breaks) acotado a ~1x + un chunk
+en vez de ~4x (H5 paso 3). AUDIT.md grupo 3 queda completamente cerrado.
+
+## `datacube stack --zarr-output` (v0.12.0, 2026-07-03)
+- Motivado por el paper: el caso de estudio (case_study.py) usaba odc-stac +
+  máscara/NDVI manuales en Python porque la ingesta no exponía el cubo
+  procesado; con `--index`/`--mask-scl` ya nativos (v0.4/v0.6) faltaba una
+  forma de sacar el cubo resultante (post mask/composite/gapfill/index) de
+  vuelta a Python sin materializarlo completo en memoria.
+- `ChunkPipeline::transform(&self, cube: &Cube) -> Result<Cube, CubeError>`
+  (`datacube-core::pipeline`): extrae el prefijo composite→gapfill→index de
+  `run_on` como método público reusable — `run_on` ahora es
+  `self.transform(cube)?` + banda + stats, mismo comportamiento (tests
+  existentes sin cambios, +1 test nuevo que compara `transform` contra
+  encadenar `gapfill_linear`+`indices::ndvi` a mano).
+- CLI: nuevo flag `--zarr-output <path>` en `datacube stack`. Cuando está
+  seteado, `write_processed_zarr` (`stack_cmd.rs`) crea un
+  `datacube_zarr::ZarrCubeWriter` con las dims/bands/time que
+  `ChunkPipeline::output_time`/el label del índice ya dan analíticamente, e
+  itera `cube.chunks(chunk_size, chunk_size)` escribiendo cada tile
+  procesado (`pipeline.transform(&sub)`) — es la contraparte de escritura de
+  `Cube::run_chunked`, ya que el paso de stats por diseño nunca materializa
+  un cubo procesado completo (H5 paso 3). `datacube-zarr` pasa a ser
+  dependencia opcional de `datacube-cli` bajo el feature `stac`.
+- Verificado e2e contra Planetary Computer: `--mask-scl --grid-epsg
+  --grid-res --index ndvi --zarr-output cube.zarr` produce un store leído
+  correctamente con `zarr` desde Python (shape/attrs/geotransform/EPSG
+  correctos, NDVI en rango esperado, fracción finita ~83% consistente con
+  la máscara).
+- Workspace bump 0.12.0.
+
+## Paper: motor real reflejado + caso de estudio nativo (2026-07-03)
+- `papers/draft/datacube-rs.tex` (target C&G) estaba desactualizado desde
+  2026-06-29 (Limitations decía "NDVI planned"/"GeoZarr planned but not
+  implemented", ambos hechos desde v0.4/v0.5). Reescritas Abstract/Highlights/
+  Limitations/Outlook y agregadas 4 subsecciones nuevas a §4 (Spectral
+  indices, Georeferenced results across transforms, GeoZarr backing store,
+  Bounded-memory chunked analysis) + actualizada Cube ingestion (máscara SCL,
+  GridSpec, M3). Encuadre: máscara/índices se presentan como "cierre de
+  brecha ARD" vs gdalcubes/FORCE, no como diferenciador nuevo (evita
+  sobreventa ante reviewer).
+- `scripts/case_study.py` reescrito: ya no usa odc-stac/xarray para
+  ingesta+máscara+NDVI (motivo original del hedge en el paper) — corre
+  `datacube stack` dos veces (período completo con `--mask-scl --mask-keep
+  2,4,5,6,7 --grid-epsg 32718 --grid-bbox <fijo> --composite same-time
+  --index ndvi --breaks-output --first-break-output --zarr-output`; ventana
+  post-incendio con `--stat theil-sen --output` para la recuperación, mismo
+  grid vía `--grid-bbox` fijo → alineación garantizada entre ambas corridas)
+  y lee el Zarr/GeoTIFFs resultantes solo para lo que el motor no expone
+  como stat (magnitud de caída NDVI en el quiebre, series de 2 píxeles para
+  el panel a). `--limit 500` obligatorio (default 100 trunca un archivo de
+  19 meses — encontrado al regenerar: el primer intento con default dio un
+  cubo empezando en 2023.38 en vez de 2022.69, silenciosamente cortado).
+  Resultado casi idéntico al original (Python manual): 28% píxeles con
+  quiebre (antes 31%), mediana 2023.09 (igual), 94% ene-mar 2023 (igual),
+  caída NDVI -0.32 (antes -0.31), recuperación +0.062 NDVI/yr (antes +0.06).
+  Fig. 4 y prosa de `sec:casestudy` actualizadas con los números nuevos;
+  quitado el hedge "reproducible independently of the optional ingestion
+  crate" — la ingesta ahora es 100% nativa.
+- Nueva tabla en Validation/Performance (`tab:memory`): RSS medido
+  (`/usr/bin/time -v`) del mismo run real (Sentinel-2 1465×1418px, 24
+  escenas, 3 bandas, 10m nativo, máscara+NDVI+Theil-Sen) a `--chunk-size
+  4000` (1 chunk, todo el cubo) vs `--chunk-size 64` (multi-chunk): 4.10GB
+  vs 1.60GB, ~2.6x — evidencia cuantitativa nueva para el pipeline chunked
+  (H5 paso 3), con la limitación honesta de que el piso restante es la
+  ingesta STAC/COG no chunked. También agregada mención del ~6x de M3 en
+  Performance (ya medido en v0.9, no re-corrido).
+- Sin cambios de código en el motor (solo `.tex`/`.py`); no ameritó bump de
+  versión del workspace.
 
 ## AUDIT grupo 3 — H5 paso 3: pipeline chunked post-stack (v0.11.0, 2026-07-03)
 - Al retomar el único ítem abierto del grupo 3 (grafo lazy `stack→mask→
@@ -424,13 +491,12 @@ AUDIT.md grupo 3 queda completamente cerrado.
 - Workspace bump 0.10.0.
 
 ## Próximos pasos al retomar
-1. Paper (C&G/EMS): material listo + band-math + GeoZarr (comprimido+chunks)
-   + ARD (mask/grid) + georef unificado + stacking paralelo sin pico 2× +
-   pipeline post-stack chunked (H5 paso 3). Opciones: §4.4 NDVI in-engine;
-   sección GeoZarr/arquitectura citando `read_zarr_chunked`/`run_chunked`
-   como el "cube_view + chunk streaming" de gdalcubes hecho en Rust/Zarr V3;
-   mencionar el ~6× de M3 y el ~4x→1x del pipeline chunked como evidencia
-   de perf/memoria.
+1. Paper (C&G): draft ya actualizado al estado real del motor (2026-07-03) —
+   §4 con band-math/máscara+GridSpec/georef/GeoZarr/pipeline chunked,
+   Limitations/Outlook honestas, caso de estudio 100% nativo (sin
+   odc-stac/xarray), tabla de RSS medida para el pipeline chunked. Pendiente:
+   revisión final de estilo/longitud antes de someter (ver `/paper-style` y
+   `/paper-review-computers-geosciences` para una pasada de calibración).
 2. Pendiente Zenodo DOI (gated en ORCID).
 3. AUDIT grupo 3 queda **completamente cerrado** (H5 paso 3 resuelto en
    v0.11.0, alcance revisado — ver sección arriba). El techo de RAM de la

@@ -1,72 +1,107 @@
 #!/usr/bin/env python3
-"""Real case study for datacube-rs (Computers & Geosciences §4.4).
+"""Real case study for datacube-rs (Computers & Geosciences, Section 4.8 /
+case study). Builds an NDVI data cube over an area of the central-southern
+Chile forest landscape affected by the catastrophic February 2023 wildfires,
+runs the OLS-CUSUM break detector to date the disturbance per pixel and the
+Theil-Sen estimator on the post-disturbance window to map recovery.
 
-Builds an NDVI data cube over an area of the central-southern Chile forest
-landscape affected by the catastrophic February 2023 wildfires, and uses the
-datacube-rs estimators (via the Python bindings) to (i) date the disturbance
-per pixel with the OLS-CUSUM break detector and (ii) map the post-disturbance
-recovery trend with Theil-Sen. Ingestion uses standard STAC tooling so the case
-study is reproducible without the optional datacube-io path; the analysis is
-datacube-rs.
+Ingestion, per-pixel cloud/shadow masking, NDVI computation and break
+detection all run natively in `datacube stack` (the CLI, `--features stac`);
+this script only invokes the CLI twice (full period for masking+NDVI+breaks,
+post-fire window for the recovery slope), reads the resulting GeoZarr cube
+and GeoTIFF maps back into NumPy, and does the two bespoke per-pixel
+computations the engine does not expose as a built-in statistic: the NDVI
+drop magnitude across each pixel's detected break, and picking the two
+example pixels for the time-series panel. No Python geospatial stack
+(odc-stac/xarray) is used for the analysis; only `zarr`/`rasterio` to read
+back what `datacube-rs` already computed.
 
-Run: .venv-validate/bin/python scripts/case_study.py [--verify]
+Run: .venv-validate/bin/python scripts/case_study.py [--modis]
+Requires a `datacube` binary built with `--features stac`
+(`cargo build --release -p datacube-cli --features stac`); override its path
+with the DATACUBE_BIN environment variable if not at the default location.
 """
 
+import json
+import os
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
-import planetary_computer as pc
-import pystac_client
-from odc.stac import load as odc_load
-
-import datacube_rs as dc
+import rasterio
+import zarr
 
 REPO = Path(__file__).resolve().parent.parent
 FIGDIR = REPO / "papers" / "draft" / "figures"
 FIGDIR.mkdir(parents=True, exist_ok=True)
 
 # Forest landscape near Santa Juana (Biobio, Chile), severely burned Feb 2023.
-BBOX = [-72.96, -37.20, -72.90, -37.15]
-DATE = "2022-09-01/2024-03-31"
-RES = 100             # metres (native UTM grid); coarse for a tractable demo
+BBOX = [-72.96, -37.20, -72.90, -37.15]           # WGS84 west,south,east,north
+UTM_BBOX = [681045.05, 5880875.12, 686493.47, 5886539.28]  # same, in EPSG:32718
+GRID_EPSG = 32718
+RES = 100             # metres; coarse for a tractable demo
 FIRE_T = 2023.10      # early February 2023
+POST_FIRE_START = "2023-03-01"     # safely after FIRE_T + 0.05 (recovery window)
+FULL_RANGE = "2022-09-01/2024-03-31"
+
+DATACUBE_BIN = os.environ.get(
+    "DATACUBE_BIN", str(REPO / "target" / "release" / "datacube")
+)
 
 
-def load_ndvi_cube():
-    cat = pystac_client.Client.open(
-        "https://planetarycomputer.microsoft.com/api/stac/v1",
-        modifier=pc.sign_inplace,
-    )
-    items = list(cat.search(collections=["sentinel-2-l2a"], bbox=BBOX,
-                            datetime=DATE,
-                            query={"eo:cloud_cover": {"lt": 40}}).items())
-    ds = odc_load(items, bands=["B04", "B08", "SCL"], bbox=BBOX,
-                  resolution=RES, groupby="solar_day")
-    # cloud / shadow / snow mask from the scene classification layer
-    scl = ds["SCL"]
-    clear = ~scl.isin([0, 1, 3, 8, 9, 10, 11])
-    red = ds["B04"].where(clear).astype("float32")
-    nir = ds["B08"].where(clear).astype("float32")
-    ndvi = (nir - red) / (nir + red)
-    ndvi = ndvi.where(np.isfinite(ndvi))
-    t = np.array([np.datetime64(v) for v in ndvi.time.values])
-    # fractional years
-    year = t.astype("datetime64[Y]").astype(int) + 1970
-    frac = ((t - t.astype("datetime64[Y]")) / np.timedelta64(1, "D"))
-    days = np.where((year % 4 == 0) & ((year % 100 != 0) | (year % 400 == 0)), 366, 365)
-    tfrac = year + frac / days
-    return ndvi, tfrac
+def run_stack(datetime_range, extra_args, workdir):
+    """Invokes `datacube stack` and returns its parsed JSON report."""
+    cmd = [
+        DATACUBE_BIN, "stack",
+        "--catalog", "pc", "--collection", "sentinel-2-l2a",
+        "--assets", "B04,B08,SCL",
+        "--bbox", ",".join(str(v) for v in BBOX),
+        "--datetime", datetime_range,
+        "--max-cloud", "40",
+        "--mask-scl", "--mask-keep", "2,4,5,6,7",
+        "--grid-epsg", str(GRID_EPSG), "--grid-res", str(RES),
+        "--grid-bbox", ",".join(str(v) for v in UTM_BBOX),
+        "--composite", "same-time",
+        "--index", "ndvi", "--nir", "B08", "--red", "B04",
+        "--chunk-size", "24",
+        "--limit", "500",  # default 100 truncates a 19-month S2 archive
+    ] + extra_args
+    result = subprocess.run(cmd, cwd=workdir, capture_output=True, text=True)
+    if result.returncode != 0:
+        sys.exit(f"datacube stack failed:\n{result.stderr}")
+    print(result.stderr.strip())
+    return json.loads(result.stdout)
+
+
+def read_geotiff(path):
+    with rasterio.open(path) as src:
+        return src.read(1)
+
+
+def read_ndvi_zarr(path):
+    z = zarr.open(str(path), mode="r")
+    arr = z["cube"]
+    data = np.asarray(arr[0])          # single band (ndvi): (y, x, time)
+    t = np.asarray(arr.attrs["time"], dtype=np.float64)
+    return data, t
 
 
 def validate_modis():
     """External check: MODIS MCD64A1 burn dates over the AOI (independent
-    product). Confirms the datacube-rs break dates (run with --modis)."""
+    product, different sensor/algorithm). Confirms the datacube-rs break
+    dates. Uses standard STAC tooling directly -- MODIS is not part of the
+    datacube-rs pipeline being validated, so no native ingestion applies."""
+    import planetary_computer as pc
+    import pystac_client
+    from odc.stac import load as odc_load
+
     cat = pystac_client.Client.open(
         "https://planetarycomputer.microsoft.com/api/stac/v1",
         modifier=pc.sign_inplace)
     items = list(cat.search(collections=["modis-64A1-061"], bbox=BBOX,
-                            datetime="2023-01-01/2023-06-30").items())
+                             datetime="2023-01-01/2023-06-30").items())
     ds = odc_load(items, bands=["Burn_Date"], bbox=BBOX, resolution=500,
                   groupby="solar_day")
     bd = ds["Burn_Date"].values
@@ -81,65 +116,56 @@ def main():
     if "--modis" in sys.argv:
         validate_modis()
         return
-    verify = "--verify" in sys.argv
-    ndvi, t = load_ndvi_cube()
-    # estimators expect f64; NDVI is computed as f32
-    arr = np.ascontiguousarray(ndvi.transpose("y", "x", "time").values, dtype=np.float64)
-    t = t.astype(np.float64)
-    ny, nx, nt = arr.shape
-    print(f"NDVI cube: {ny}x{nx} px, {nt} time steps, {t.min():.2f}-{t.max():.2f}")
 
-    if verify:
-        # area-mean NDVI vs time, and the pre/post-fire change, to confirm signal
-        m = np.nanmean(arr.reshape(-1, nt), axis=0)
-        pre = np.nanmean(m[t < FIRE_T]); post = np.nanmean(m[(t > FIRE_T) & (t < FIRE_T + 0.5)])
-        print(f"area-mean NDVI pre-fire {pre:.2f} -> 6 months post {post:.2f} (drop {pre-post:.2f})")
-        for ti, mi in zip(t, m):
-            print(f"  {ti:.2f}: {mi:.2f}" + ("  <-- fire" if abs(ti - FIRE_T) < 0.05 else ""))
-        return
+    with tempfile.TemporaryDirectory() as workdir:
+        workdir = Path(workdir)
 
-    # datacube-rs analysis: build a (band, y, x, time) cube and run the estimators
-    data = arr[None, :, :, :].astype("float64")          # 1 band
-    cube = dc.Cube(np.ascontiguousarray(data), t.astype("float64"), ["ndvi"])
+        report = run_stack(FULL_RANGE, [
+            "--breaks-output", str(workdir / "breaks_count.tif"),
+            "--first-break-output", str(workdir / "first_break.tif"),
+            "--break-harmonics", "1", "--break-alpha", "0.05",
+            "--zarr-output", str(workdir / "ndvi_cube.zarr"),
+        ], workdir)
+        arr, t = read_ndvi_zarr(workdir / "ndvi_cube.zarr")
+        first_break = read_geotiff(workdir / "first_break.tif")
+        ny, nx, nt = arr.shape
+        print(f"NDVI cube: {ny}x{nx} px, {nt} time steps, {t.min():.2f}-{t.max():.2f} "
+              f"({len(report['scenes'])} scenes, {len(report['skipped'])} skipped)")
 
-    band = 0
-    first_break = np.full((ny, nx), np.nan)
-    drop_mag = np.full((ny, nx), np.nan)
-    recov = np.full((ny, nx), np.nan)
-    for y in range(ny):
-        for x in range(nx):
-            s = arr[y, x, :]
-            tv = t[np.isfinite(s)]; sv = s[np.isfinite(s)]
-            if sv.size < 20:
-                continue
-            try:
-                r = dc.detect_breaks(tv, sv, 0.05, 1, 1.0, 12)
-            except Exception:
-                continue
-            if r["breaks"]:
-                bt = r["breaks"][0]["time"]
-                first_break[y, x] = bt
-                # NDVI change across the first break (mean 0.3 yr each side)
-                before = np.nanmean(sv[(tv > bt - 0.3) & (tv <= bt)])
-                after = np.nanmean(sv[(tv > bt) & (tv <= bt + 0.3)])
+        run_stack(f"{POST_FIRE_START}/2024-03-31", [
+            "--stat", "theil-sen",
+            "--output", str(workdir / "recovery_slope.tif"),
+        ], workdir)
+        recov = read_geotiff(workdir / "recovery_slope.tif")
+        if recov.shape != (ny, nx):
+            sys.exit(f"recovery grid {recov.shape} does not match NDVI grid {(ny, nx)}")
+
+        # NDVI drop magnitude across each pixel's first break: the one
+        # per-pixel computation the engine does not expose as a built-in
+        # statistic (mean NDVI in a +/-0.3 yr window around the break time).
+        drop_mag = np.full((ny, nx), np.nan)
+        for y in range(ny):
+            for x in range(nx):
+                bt = first_break[y, x]
+                if not np.isfinite(bt):
+                    continue
+                s = arr[y, x, :]
+                before = np.nanmean(s[(t > bt - 0.3) & (t <= bt)])
+                after = np.nanmean(s[(t > bt) & (t <= bt + 0.3)])
                 drop_mag[y, x] = after - before
-            # post-fire recovery slope (Theil-Sen on the post-window)
-            post = (tv > FIRE_T + 0.05)
-            if post.sum() >= 6:
-                recov[y, x] = dc.theil_sen(tv[post], sv[post])["slope"]
 
-    nb = np.isfinite(first_break)
-    print(f"pixels with a detected break: {nb.sum()}/{ny*nx} ({100*nb.sum()/(ny*nx):.0f}%)")
-    if nb.sum():
-        bt = first_break[nb]
-        feb = ((bt >= 2023.0) & (bt <= 2023.25)).sum()
-        print(f"first-break median {np.median(bt):.2f}; {100*feb/nb.sum():.0f}% in Jan-Mar 2023")
-        print(f"NDVI drop at break: median {np.nanmedian(drop_mag):.2f}")
-        print(f"post-fire recovery slope: median {np.nanmedian(recov):.3f} NDVI/yr")
+        nb = np.isfinite(first_break)
+        print(f"pixels with a detected break: {nb.sum()}/{ny*nx} ({100*nb.sum()/(ny*nx):.0f}%)")
+        if nb.sum():
+            bt = first_break[nb]
+            feb = ((bt >= 2023.0) & (bt <= 2023.25)).sum()
+            print(f"first-break median {np.median(bt):.2f}; {100*feb/nb.sum():.0f}% in Jan-Mar 2023")
+            print(f"NDVI drop at break: median {np.nanmedian(drop_mag):.2f}")
+            print(f"post-fire recovery slope: median {np.nanmedian(recov):.3f} NDVI/yr")
 
-    np.savez(REPO / "papers" / "draft" / "figures" / "case_arrays.npz",
-             arr=arr, t=t, first_break=first_break, drop_mag=drop_mag, recov=recov)
-    plot(arr, t, first_break, drop_mag, recov)
+        np.savez(FIGDIR / "case_arrays.npz",
+                 arr=arr, t=t, first_break=first_break, drop_mag=drop_mag, recov=recov)
+        plot(arr, t, first_break, drop_mag, recov)
 
 
 def plot(arr, t, first_break, drop_mag, recov):
