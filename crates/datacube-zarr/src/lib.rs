@@ -14,9 +14,19 @@
 //! stream a store one spatial tile at a time, so processing a cube is
 //! bounded by tile size rather than the whole store's size — the primitive
 //! behind "cubo Rust nativo sobre GeoZarr" executing on modest hardware.
-//! Full GeoZarr CF conventions (separate coordinate variables, `grid_mapping`)
-//! are a planned refinement; this layer round-trips a cube losslessly (at
-//! `f64`) and stores enough metadata to relocate it in space and time.
+//! Alongside the `/cube` array, every store carries GeoZarr-CF companions:
+//! `/time` (and `/y`/`/x` when the transform is axis-aligned) as proper 1-D
+//! coordinate arrays sharing their dimension's name, and — when a
+//! georeference is present — a `/spatial_ref` grid-mapping variable
+//! (`crs_wkt`/`spatial_ref`/`GeoTransform` attributes, EPSG looked up
+//! through the offline [`crs-definitions`](https://docs.rs/crs-definitions)
+//! table) referenced from `/cube`'s `grid_mapping` attribute, the CF
+//! convention xarray/rioxarray use to locate a variable's CRS. `/cube`
+//! itself keeps the flat `bands`/`time`/`epsg`/`geotransform` attributes
+//! from earlier versions for backward compatibility, plus a
+//! `band_long_names` attribute for the handful of spectral indices this
+//! crate knows by name. This layer round-trips a cube losslessly (at `f64`)
+//! and stores enough metadata to relocate it in space and time.
 
 use std::ops::Range;
 use std::path::Path;
@@ -35,6 +45,11 @@ use zarrs::group::GroupBuilder;
 const CUBE_PATH: &str = "/cube";
 /// Default spatial chunk edge (pixels); bands and time are single-chunked.
 const DEFAULT_CHUNK: u64 = 256;
+/// Paths of the GeoZarr-CF companion arrays written alongside `/cube`.
+const Y_PATH: &str = "/y";
+const X_PATH: &str = "/x";
+const TIME_PATH: &str = "/time";
+const GRID_MAPPING_PATH: &str = "/spatial_ref";
 
 /// On-disk element type for a Zarr-backed cube (see [`ZarrOptions::dtype`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -277,14 +292,23 @@ fn create_array(
         nt as u64,
     ];
 
+    let has_grid_mapping = geo.epsg.is_some() || geo.transform.is_some();
+
     let mut attrs = serde_json::Map::new();
     attrs.insert("bands".into(), serde_json::to_value(bands).unwrap());
     attrs.insert("time".into(), serde_json::to_value(time).unwrap());
+    attrs.insert(
+        "band_long_names".into(),
+        serde_json::to_value(band_long_names(bands)).unwrap(),
+    );
     if let Some(epsg) = geo.epsg {
         attrs.insert("epsg".into(), serde_json::json!(epsg));
     }
     if let Some(t) = geo.transform {
         attrs.insert("geotransform".into(), serde_json::json!(t));
+    }
+    if has_grid_mapping {
+        attrs.insert("grid_mapping".into(), serde_json::json!("spatial_ref"));
     }
 
     // ArrayBuilder::new(shape, chunk_shape, data_type, fill_value)
@@ -299,12 +323,215 @@ fn create_array(
         builder.bytes_to_bytes_codecs(vec![Arc::new(ZstdCodec::new(level, false))]);
     }
     let array = builder
-        .build(store, CUBE_PATH)
+        .build(store.clone(), CUBE_PATH)
         .map_err(|e| ZarrError::Array(e.to_string()))?;
     array
         .store_metadata()
         .map_err(|e| ZarrError::Array(e.to_string()))?;
+
+    write_coord_array(&store, TIME_PATH, "time", time, coord_attrs("time"))?;
+    if let Some(transform) = geo.transform
+        && let Some((y, x)) = axis_aligned_coords(transform, ny, nx)
+    {
+        write_coord_array(&store, Y_PATH, "y", &y, coord_attrs("y"))?;
+        write_coord_array(&store, X_PATH, "x", &x, coord_attrs("x"))?;
+    }
+    if has_grid_mapping {
+        write_grid_mapping(&store, geo)?;
+    }
+
     Ok(array)
+}
+
+/// CF `standard_name`/`axis`/`units` attributes for a coordinate array. Time
+/// is stored as a fractional (decimal) year — not a CF-standard "since a
+/// reference date" unit, since this crate deliberately avoids a calendar
+/// dependency (see [`datacube_core`] time handling) — so its `units` says so
+/// explicitly rather than claiming a compliance it doesn't have. `y`/`x`
+/// assume a projected CRS (`metre`); a geographic cube's coordinates are
+/// still numerically correct (degrees) but keep the same attribute name for
+/// simplicity, since this crate doesn't track per-axis units separately from
+/// the EPSG code.
+fn coord_attrs(axis: &str) -> serde_json::Map<String, serde_json::Value> {
+    let mut attrs = serde_json::Map::new();
+    match axis {
+        "time" => {
+            attrs.insert("standard_name".into(), serde_json::json!("time"));
+            attrs.insert("axis".into(), serde_json::json!("T"));
+            attrs.insert("units".into(), serde_json::json!("year"));
+            attrs.insert(
+                "comment".into(),
+                serde_json::json!("fractional (decimal) year, not a CF-standard calendar unit"),
+            );
+        }
+        "y" => {
+            attrs.insert(
+                "standard_name".into(),
+                serde_json::json!("projection_y_coordinate"),
+            );
+            attrs.insert("axis".into(), serde_json::json!("Y"));
+            attrs.insert("units".into(), serde_json::json!("metre"));
+        }
+        "x" => {
+            attrs.insert(
+                "standard_name".into(),
+                serde_json::json!("projection_x_coordinate"),
+            );
+            attrs.insert("axis".into(), serde_json::json!("X"));
+            attrs.insert("units".into(), serde_json::json!("metre"));
+        }
+        _ => unreachable!("coord_attrs called with an unknown axis"),
+    }
+    attrs
+}
+
+/// Writes a 1-D CF coordinate array (`/y`, `/x` or `/time`) as its own Zarr
+/// array in a single chunk, named after and `dimension_names`-tagged with
+/// `dim_name` — the convention xarray's Zarr V3 backend uses to recognize an
+/// array as the coordinate for that dimension.
+fn write_coord_array(
+    store: &Arc<FilesystemStore>,
+    path: &str,
+    dim_name: &str,
+    values: &[f64],
+    attrs: serde_json::Map<String, serde_json::Value>,
+) -> Result<(), ZarrError> {
+    let n = values.len() as u64;
+    let mut builder = ArrayBuilder::new(vec![n], vec![n.max(1)], data_type::float64(), f64::NAN);
+    builder.dimension_names(Some([dim_name])).attributes(attrs);
+    let array = builder
+        .build(store.clone(), path)
+        .map_err(|e| ZarrError::Array(e.to_string()))?;
+    array
+        .store_metadata()
+        .map_err(|e| ZarrError::Array(e.to_string()))?;
+    // A 1-D subset is legitimately a single-`Range` slice, not a
+    // mis-typed `vec![start..end]` value list.
+    #[allow(clippy::single_range_in_vec_init)]
+    let subset = ArraySubset::new_with_ranges(&[0..n]);
+    array
+        .store_array_subset(&subset, values)
+        .map_err(|e| ZarrError::Array(e.to_string()))?;
+    Ok(())
+}
+
+/// Writes the CF grid-mapping variable `/spatial_ref`: a 1-element dummy
+/// array (rioxarray/GDAL convention — its data has no meaning, only its
+/// attributes matter) carrying `crs_wkt`/`spatial_ref` (from the offline
+/// EPSG table when the code is known), `grid_mapping_name` (when the
+/// projection is recognized) and `GeoTransform` (GDAL's space-separated
+/// six-number convention, matching [`GeoRef::transform`]'s own).
+fn write_grid_mapping(store: &Arc<FilesystemStore>, geo: &GeoRef) -> Result<(), ZarrError> {
+    let mut attrs = serde_json::Map::new();
+    let wkt = geo.epsg.and_then(crs_wkt_for);
+    if let Some(epsg) = geo.epsg {
+        attrs.insert("epsg".into(), serde_json::json!(epsg));
+        if let Some(name) = grid_mapping_name(epsg, wkt) {
+            attrs.insert("grid_mapping_name".into(), serde_json::json!(name));
+        }
+    }
+    if let Some(w) = wkt {
+        attrs.insert("crs_wkt".into(), serde_json::json!(w));
+        attrs.insert("spatial_ref".into(), serde_json::json!(w));
+    }
+    if let Some(t) = geo.transform {
+        let gt = t
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        attrs.insert("GeoTransform".into(), serde_json::json!(gt));
+    }
+
+    let mut builder = ArrayBuilder::new(vec![1u64], vec![1u64], data_type::int32(), 0i32);
+    // A dummy dimension of its own, not shared with any real axis: its data
+    // never matters (rioxarray/GDAL convention), only the attributes do, but
+    // xarray's Zarr V3 backend requires `dimension_names` on every array.
+    builder
+        .dimension_names(Some(["spatial_ref"]))
+        .attributes(attrs);
+    let array = builder
+        .build(store.clone(), GRID_MAPPING_PATH)
+        .map_err(|e| ZarrError::Array(e.to_string()))?;
+    array
+        .store_metadata()
+        .map_err(|e| ZarrError::Array(e.to_string()))?;
+    #[allow(clippy::single_range_in_vec_init)]
+    let subset = ArraySubset::new_with_ranges(&[0..1]);
+    array
+        .store_array_subset(&subset, [0i32].as_slice())
+        .map_err(|e| ZarrError::Array(e.to_string()))?;
+    Ok(())
+}
+
+/// The real EPSG WKT2 string for `epsg`, from the offline
+/// [`crs-definitions`] table (pure Rust, no libproj/GDAL). `None` for codes
+/// outside the table (e.g. `> u16::MAX`, or simply not one of the ~5000
+/// entries it carries) — the grid-mapping variable still gets the numeric
+/// EPSG code and geotransform in that case, just not `crs_wkt`.
+fn crs_wkt_for(epsg: u32) -> Option<&'static str> {
+    u16::try_from(epsg)
+        .ok()
+        .and_then(crs_definitions::from_code)
+        .map(|def| def.wkt)
+}
+
+/// `true` for EPSG codes in the geographic-2D block (4326 and friends) —
+/// the same heuristic the SurtGIS family uses elsewhere in this ecosystem.
+fn is_geographic(epsg: u32) -> bool {
+    (4000..5000).contains(&epsg)
+}
+
+/// A CF `grid_mapping_name` for `epsg`, when it can be determined without
+/// guessing: geographic codes are `latitude_longitude`; a WKT mentioning
+/// `Transverse Mercator` (UTM's projection method) is `transverse_mercator`.
+/// Anything else is left unset rather than asserted incorrectly.
+fn grid_mapping_name(epsg: u32, wkt: Option<&str>) -> Option<&'static str> {
+    if is_geographic(epsg) {
+        return Some("latitude_longitude");
+    }
+    if wkt.is_some_and(|w| w.contains("Transverse Mercator")) {
+        return Some("transverse_mercator");
+    }
+    None
+}
+
+/// Pixel-center `(y, x)` coordinate arrays for an axis-aligned transform
+/// (`c == 0` and `e == 0` in `x = a + col·b + row·c`, `y = d + col·e +
+/// row·f`) — `None` for a rotated/sheared grid, which CF 1-D coordinate
+/// variables cannot represent (every cube this engine produces today is
+/// axis-aligned, but a rotated transform is still technically representable
+/// in [`GeoRef`], so this stays a graceful skip rather than a panic).
+fn axis_aligned_coords(transform: [f64; 6], ny: usize, nx: usize) -> Option<(Vec<f64>, Vec<f64>)> {
+    let [a, b, c, d, e, f] = transform;
+    if c != 0.0 || e != 0.0 {
+        return None;
+    }
+    let y: Vec<f64> = (0..ny).map(|row| d + (row as f64 + 0.5) * f).collect();
+    let x: Vec<f64> = (0..nx).map(|col| a + (col as f64 + 0.5) * b).collect();
+    Some((y, x))
+}
+
+/// A human-readable `long_name` for the spectral indices
+/// [`datacube_core::indices`] knows how to compute; any other band name
+/// (raw asset key, unrecognized label) falls back to itself, so the
+/// returned list always has the same length as `bands`.
+fn band_long_names(bands: &[String]) -> Vec<String> {
+    bands
+        .iter()
+        .map(|b| {
+            match b.to_ascii_lowercase().as_str() {
+                "ndvi" => "Normalized Difference Vegetation Index",
+                "ndwi" => "Normalized Difference Water Index",
+                "nbr" => "Normalized Burn Ratio",
+                "ndbi" => "Normalized Difference Built-up Index",
+                "evi" => "Enhanced Vegetation Index",
+                "savi" => "Soil-Adjusted Vegetation Index",
+                _ => return b.clone(),
+            }
+            .to_string()
+        })
+        .collect()
 }
 
 /// Writes `view` (in the cube's `(band, y, x, time)` element order) into the
@@ -649,5 +876,142 @@ mod tests {
             read_zarr_chunked(&path, 0, 10),
             Err(ZarrError::Metadata(_))
         ));
+    }
+
+    /// Opens a companion array (`/y`, `/x`, `/time`, `/spatial_ref`) written
+    /// next to `/cube` and returns its attributes, for asserting on the
+    /// GeoZarr-CF metadata without going through the `Cube`/`GeoRef` API.
+    fn open_companion(store_path: &Path, array_path: &str) -> Array<FilesystemStore> {
+        let store = Arc::new(FilesystemStore::new(store_path).unwrap());
+        Array::open(store, array_path).unwrap()
+    }
+
+    #[test]
+    fn coordinate_arrays_match_pixel_centers_and_declare_cf_axes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cube.zarr");
+        let cube = sample_cube(); // 300x4 px, 5 t
+        let geo = sample_geo(); // origin (300000, 6200000), pixel size 10 (y negative)
+        write_zarr(&cube, &path, &geo).unwrap();
+
+        let y = open_companion(&path, Y_PATH);
+        let x = open_companion(&path, X_PATH);
+        let time = open_companion(&path, TIME_PATH);
+
+        assert_eq!(y.attributes().get("axis").unwrap(), "Y");
+        assert_eq!(x.attributes().get("axis").unwrap(), "X");
+        assert_eq!(time.attributes().get("axis").unwrap(), "T");
+        assert_eq!(time.attributes().get("units").unwrap(), "year");
+
+        #[allow(clippy::single_range_in_vec_init)]
+        let (y_range, x_range, t_range) = (
+            ArraySubset::new_with_ranges(&[0..300]),
+            ArraySubset::new_with_ranges(&[0..4]),
+            ArraySubset::new_with_ranges(&[0..5]),
+        );
+        let y_vals: Vec<f64> = y.retrieve_array_subset::<Vec<f64>>(&y_range).unwrap();
+        let x_vals: Vec<f64> = x.retrieve_array_subset::<Vec<f64>>(&x_range).unwrap();
+        let t_vals: Vec<f64> = time.retrieve_array_subset::<Vec<f64>>(&t_range).unwrap();
+        assert_abs_diff_eq!(y_vals[0], 6200000.0 - 5.0, epsilon = 1e-9); // row 0 center
+        assert_abs_diff_eq!(x_vals[0], 300000.0 + 5.0, epsilon = 1e-9); // col 0 center
+        assert_eq!(t_vals, cube.time());
+    }
+
+    #[test]
+    fn grid_mapping_variable_carries_wkt_and_geotransform() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cube.zarr");
+        write_zarr(&sample_cube(), &path, &sample_geo()).unwrap();
+
+        let spatial_ref = open_companion(&path, GRID_MAPPING_PATH);
+        let attrs = spatial_ref.attributes();
+        assert_eq!(attrs.get("epsg").unwrap(), 32719);
+        assert_eq!(
+            attrs.get("grid_mapping_name").unwrap(),
+            "transverse_mercator"
+        );
+        let wkt = attrs.get("crs_wkt").unwrap().as_str().unwrap();
+        assert!(wkt.contains("32719"));
+        assert!(wkt.contains("UTM zone 19S"));
+        assert_eq!(attrs.get("spatial_ref").unwrap().as_str().unwrap(), wkt);
+        assert_eq!(
+            attrs.get("GeoTransform").unwrap().as_str().unwrap(),
+            "300000 10 0 6200000 0 -10"
+        );
+
+        let cube_array = open_companion(&path, CUBE_PATH);
+        assert_eq!(
+            cube_array.attributes().get("grid_mapping").unwrap(),
+            "spatial_ref"
+        );
+        let long_names = cube_array
+            .attributes()
+            .get("band_long_names")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(long_names, &["red", "nir"]); // unknown band names fall back to themselves
+    }
+
+    #[test]
+    fn geographic_epsg_maps_to_latitude_longitude() {
+        assert_eq!(grid_mapping_name(4326, None), Some("latitude_longitude"));
+        assert_eq!(
+            grid_mapping_name(32719, crs_wkt_for(32719)),
+            Some("transverse_mercator")
+        );
+        assert_eq!(grid_mapping_name(999999, None), None); // unknown, not guessed
+    }
+
+    #[test]
+    fn band_long_names_fill_known_indices_and_fall_back_otherwise() {
+        let bands: Vec<String> = ["ndvi", "NDWI", "B04", "evi"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            band_long_names(&bands),
+            vec![
+                "Normalized Difference Vegetation Index",
+                "Normalized Difference Water Index",
+                "B04",
+                "Enhanced Vegetation Index",
+            ]
+        );
+    }
+
+    #[test]
+    fn rotated_transform_skips_xy_coordinate_arrays_but_still_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cube.zarr");
+        let geo = GeoRef {
+            epsg: Some(32719),
+            transform: Some([300000.0, 10.0, 1.0, 6200000.0, 0.0, -10.0]), // c != 0: sheared
+        };
+        write_zarr(&sample_cube(), &path, &geo).unwrap();
+
+        assert!(axis_aligned_coords(geo.transform.unwrap(), 300, 4).is_none());
+        let store = Arc::new(FilesystemStore::new(&path).unwrap());
+        assert!(Array::open(store.clone(), Y_PATH).is_err());
+        assert!(Array::open(store.clone(), X_PATH).is_err());
+        // time and the grid mapping (which doesn't depend on axis alignment)
+        // are unaffected.
+        assert!(Array::open(store.clone(), TIME_PATH).is_ok());
+        assert!(Array::open(store, GRID_MAPPING_PATH).is_ok());
+    }
+
+    #[test]
+    fn no_georef_skips_grid_mapping_but_still_writes_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cube.zarr");
+        write_zarr(&sample_cube(), &path, &GeoRef::default()).unwrap();
+
+        let store = Arc::new(FilesystemStore::new(&path).unwrap());
+        assert!(Array::open(store.clone(), GRID_MAPPING_PATH).is_err());
+        assert!(Array::open(store.clone(), Y_PATH).is_err());
+        assert!(Array::open(store, TIME_PATH).is_ok());
+
+        let cube_array = open_companion(&path, CUBE_PATH);
+        assert!(cube_array.attributes().get("grid_mapping").is_none());
     }
 }

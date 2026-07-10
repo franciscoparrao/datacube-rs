@@ -13,6 +13,9 @@ ndarray = { workspace = true }
 thiserror = { workspace = true }
 serde_json = { workspace = true }
 zarrs = "0.23"
+# Static EPSG -> WKT/PROJ4 lookup table (no_std, no libproj/GDAL) for the
+# GeoZarr-CF grid_mapping variable; keeps this crate offline-testable.
+crs-definitions = "0.4"
 
 [dev-dependencies]
 tempfile = "3"

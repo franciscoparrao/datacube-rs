@@ -490,13 +490,85 @@ en vez de ~4x (H5 paso 3). AUDIT.md grupo 3 queda completamente cerrado.
   (~48s) — la paralelización de M3 no se vio afectada por el cambio.
 - Workspace bump 0.10.0.
 
+## GeoZarr-CF pleno (v0.13.0, 2026-07-09)
+- Primer opcional del roadmap post-AUDIT resuelto: `datacube-zarr` ya no solo
+  guarda `bands`/`time`/`epsg`/`geotransform` como atributos planos del array
+  `/cube` — ahora escribe las tres piezas que le faltaban para GeoZarr-CF
+  real (ver nota en el doc del crate, antes decía "planned refinement"):
+  1. **Variables-coordenada separadas**: `/y`, `/x` (cuando el transform es
+     axis-aligned, `c==0 && e==0` en la convención GDAL — chequeo explícito,
+     se saltea sin fallar si algún día hay rotación) y `/time` siempre, cada
+     una como array Zarr propio de 1-D con `dimension_names` igual al nombre
+     de la dimensión que representa — la convención que el backend Zarr V3
+     de xarray usa para reconocer automáticamente una coordenada sin flags
+     extra. Atributos CF (`standard_name`/`axis`/`units`) por eje;
+     `time` documenta honestamente que sus unidades son "year" fraccional,
+     no un `"days since ..."` CF-estándar (el crate evita `chrono` a
+     propósito, ver nota histórica de `datacube-io`).
+  2. **`grid_mapping`/CRS WKT real**: `/spatial_ref` (variable CF
+     grid-mapping, convención rioxarray/GDAL — un array dummy de 1 elemento,
+     solo importan sus atributos) con `crs_wkt`/`spatial_ref`/
+     `GeoTransform`/`grid_mapping_name`. El WKT sale de la tabla estática
+     **`crs-definitions`** (crate pure-Rust, `no_std`, ~5000 EPSG codes con
+     WKT/PROJ4 reales tomados del registro EPSG — sin libproj/GDAL, mantiene
+     el crate offline-testable) en vez de reinventar un generador de WKT a
+     mano; `/cube` gana el atributo `grid_mapping: "spatial_ref"` apuntando
+     a la variable (convención CF que xarray/rioxarray usan para ubicar el
+     CRS de una data variable).
+  3. **Atributos CF por-banda** (alcance modesto, honesto): `band_long_names`
+     en `/cube`, un `long_name` legible para los seis índices espectrales
+     que el motor sabe computar nativamente (ndvi/ndwi/nbr/ndbi/evi/savi);
+     cualquier otro nombre de banda (asset key crudo, etc.) cae de vuelta a
+     sí mismo — no se inventan `standard_name` CF que no existen para
+     índices espectrales.
+- Todo esto es **aditivo sobre el `create_array` compartido** por
+  `write_zarr_with_options` y `ZarrCubeWriter::create` — ni `read_zarr` ni
+  `read_zarr_chunked` cambiaron (siguen leyendo solo los atributos planos de
+  `/cube`), así que el roundtrip Rust↔Rust y los 8 tests previos pasan sin
+  tocarlos. CLI (`--zarr-output`) hereda el enriquecimiento gratis, sin
+  cambios propios, porque solo llama a `ZarrCubeWriter::create`.
+- Verificación real (no solo tests unitarios): `scripts/zarr_interop.py`
+  ahora además abre `/y`/`/x`/`/time`/`spatial_ref` con `zarr` 3.2.1, parsea
+  `crs_wkt` con **pyproj** (`CRS.from_wkt(...).to_epsg() == 32719`, nombre
+  "WGS 84 / UTM zone 19S" correcto) y abre el store completo con
+  **`xr.open_zarr()`** — xarray reconoce `y`/`x`/`time` como coordenadas
+  automáticamente sin ningún hint de decodificación manual (el pago real de
+  las variables-coordenada separadas). Encontrado en el camino: `zarrs`
+  exige `dimension_names` en *todo* array del grupo para que el backend
+  Zarr V3 de xarray no falle con `KeyError` al abrir — `/spatial_ref`
+  necesitó su propia dimensión dummy (`dimension_names: ["spatial_ref"]`)
+  aunque su dato no signifique nada.
+- Tests: zarr 8→14 (+6: coordenadas coinciden con centros de píxel y
+  declaran ejes CF, grid_mapping trae WKT/GeoTransform correctos,
+  EPSG geográfico → `latitude_longitude` vs UTM → `transverse_mercator`,
+  `band_long_names` rellena conocidos y cae a sí mismo en desconocidos,
+  transform rotado saltea `/y`/`/x` sin romper `/time`/`spatial_ref`, sin
+  georef saltea `spatial_ref` pero igual escribe `/time`). `cargo test
+  --workspace` y `clippy -D warnings` verdes.
+- **Nota de sesión, no de código**: agregar `crs-definitions` disparó un
+  re-resuelto completo de `Cargo.lock` que además — sin relación con el
+  cambio real — reasignó el edge `numpy → ndarray` de `0.16.1` a `0.17.2`
+  (ambas versiones ya convivían en el grafo por `zarrs`; el rango de
+  `numpy` 0.29 es `>=0.15,<=0.17` así que las dos satisfacen). Eso rompía
+  `datacube-python` (`into_pyarray` no encontrado, porque `datacube-core`
+  sigue fijo en ndarray 0.16 vía `workspace.dependencies`) en
+  `cargo test --workspace`, aunque compilaba bien aislado
+  (`cargo test -p datacube-python`). Fix: edición manual del lockfile para
+  devolver ese edge a `0.16.1` (confirmado estable con `cargo build/test
+  --workspace --locked`, no se revirtió solo). Vale la pena recordarlo si
+  vuelve a pasar al tocar `datacube-zarr`/`datacube-python` en la misma
+  sesión — revisar `git diff Cargo.lock` completo, no asumir que solo
+  cambió lo que uno tocó.
+- Workspace bump 0.13.0.
+
 ## Próximos pasos al retomar
-1. Paper (C&G): draft ya actualizado al estado real del motor (2026-07-03) —
-   §4 con band-math/máscara+GridSpec/georef/GeoZarr/pipeline chunked,
-   Limitations/Outlook honestas, caso de estudio 100% nativo (sin
-   odc-stac/xarray), tabla de RSS medida para el pipeline chunked. Pendiente:
+1. Paper (C&G): draft con la pasada de estilo de `/paper-style audit`
+   commiteada (2026-07-05, prosa más corta/menos run-ons en Abstract/§4/
+   Performance/case study, sin cambios de contenido/números). Pendiente:
    revisión final de estilo/longitud antes de someter (ver `/paper-style` y
-   `/paper-review-computers-geosciences` para una pasada de calibración).
+   `/paper-review-computers-geosciences` para una pasada de calibración) —
+   y decidir si vale la pena mencionar GeoZarr-CF en §4.4 (hoy dice
+   "planned refinement", ya no es cierto tras v0.13.0).
 2. Pendiente Zenodo DOI (gated en ORCID).
 3. AUDIT grupo 3 queda **completamente cerrado** (H5 paso 3 resuelto en
    v0.11.0, alcance revisado — ver sección arriba). El techo de RAM de la
@@ -507,8 +579,8 @@ en vez de ~4x (H5 paso 3). AUDIT.md grupo 3 queda completamente cerrado.
 4. Bug externo detectado en sesión anterior: paginación de `search_all` en
    surtgis-cloud repite items en Earth Search (dedup por id ya puesto como
    guard en `stack()`, pero el fix real es en surtgis).
-5. Opcional: GeoZarr-CF pleno (coord vars, grid_mapping); object-store
-   (S3/HTTP) vía zarrs async; exponer datacube-io (stack STAC) a Python;
-   sharding Zarr para object store (M2.c, no implementado — solo relevante
-   para S3/HTTP, no filesystem local); si algún día se quiere bajar el techo
-   de RAM del ingest STAC/COG, ver punto 3.
+5. Opcionales post-AUDIT, 1 de 4 resuelto: **GeoZarr-CF pleno ✓ (v0.13.0)**.
+   Quedan: object-store (S3/HTTP) vía zarrs async; exponer datacube-io
+   (stack STAC) a Python; sharding Zarr para object store (M2.c — solo
+   relevante una vez exista el backend object-store, no antes). Si algún
+   día se quiere bajar el techo de RAM del ingest STAC/COG, ver punto 3.

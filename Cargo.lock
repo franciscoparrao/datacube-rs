@@ -438,6 +438,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 
 [[package]]
+name = "crs-definitions"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5229c5b63bdc8e24d60e5c4b6115fbb4d11a8978661b4ecc57d6068ddb073983"
+
+[[package]]
 name = "crunchy"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -445,7 +451,7 @@ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
 name = "datacube-cli"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -459,7 +465,7 @@ dependencies = [
 
 [[package]]
 name = "datacube-core"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "approx",
  "criterion",
@@ -471,7 +477,7 @@ dependencies = [
 
 [[package]]
 name = "datacube-io"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "approx",
  "datacube-core",
@@ -485,7 +491,7 @@ dependencies = [
 
 [[package]]
 name = "datacube-python"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "datacube-core",
  "ndarray 0.16.1",
@@ -495,7 +501,7 @@ dependencies = [
 
 [[package]]
 name = "datacube-wasm"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "datacube-core",
  "js-sys",
@@ -507,9 +513,10 @@ dependencies = [
 
 [[package]]
 name = "datacube-zarr"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "approx",
+ "crs-definitions",
  "datacube-core",
  "ndarray 0.16.1",
  "serde_json",
@@ -2336,6 +2343,7 @@ name = "surtgis-core"
 version = "0.17.0"
 dependencies = [
  "anyhow",
+ "flate2",
  "geo",
  "geo-types",
  "ndarray 0.16.1",
@@ -2397,7 +2405,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
