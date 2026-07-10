@@ -602,6 +602,79 @@ en vez de ~4x (H5 paso 3). AUDIT.md grupo 3 queda completamente cerrado.
   sin este step quedaría sin cubrir en CI.
 - Workspace bump 0.14.0.
 
+## Object-store (S3/HTTP) backend vía zarrs async (v0.15.0, 2026-07-09)
+- Tercer y último opcional independiente del roadmap post-AUDIT resuelto
+  (queda solo sharding, que depende de este). `datacube-zarr` ganó
+  `remote::write_zarr_to_store`/`remote::read_zarr_from_store`, gated
+  detrás de un nuevo feature Cargo **`object-store`** (`zarrs/async` +
+  `dep:zarrs_object_store` + `dep:tokio`), off por default — el crate sigue
+  siendo pure-Rust/offline-testable sin él, mismo principio que `stac` en
+  `datacube-cli`/`datacube-python`.
+- **Diseño**: `zarrs_object_store` (crate oficial del ecosistema zarrs,
+  cacheado localmente en el registry — resultó estar ya disponible sin
+  fetch de red) envuelve `object_store` (crate de Apache Arrow: S3/GCS/
+  Azure/HTTP/local) en las traits async de zarrs vía
+  `AsyncObjectStore::new(store)`. Este crate **no reimplementa** los
+  builders de credenciales/región/endpoint de `object_store` — los
+  reexporta (`datacube_zarr::remote::object_store`, mismo módulo
+  re-exportado por `zarrs_object_store` para evitar el choque de versión
+  semver-incompatible que su propio doc advierte) y deja que el caller
+  construya el store con la API ergonómica que `object_store` ya tiene
+  (`object_store::aws::AmazonS3Builder`, `object_store::http::HttpBuilder`),
+  igual que `datacube-io` reusa el stack de SurtGIS en vez de reinventar
+  I/O ("thin assembly layer").
+- **Sync por fuera, async por dentro**: igual que `StacClientBlocking` de
+  surtgis-cloud, las funciones públicas de `remote` son 100% síncronas —
+  nada más en datacube-rs (core/CLI/PyO3) quiere ser async. Un
+  `shared_runtime()` (Tokio multi-thread, 2 workers, `OnceLock` process-wide)
+  calca literalmente el patrón `shared_runtime` de
+  `surtgis_cloud::blocking::sync_api` (mismo doc de advertencia: no llamar
+  desde contexto async, `block_on` entra en pánico si se hace).
+- **Cero duplicación de la semántica GeoZarr-CF**: en vez de reescribir la
+  lógica de atributos CF para el path async, se extrajeron del `create_array`
+  sync (v0.13.0) dos funciones puras sin I/O — `cube_attrs(bands, time, geo)`
+  y `grid_mapping_attrs(geo)` — y se generalizaron `read_meta`/`dtype_of` a
+  `<TStorage: ?Sized>` (ya eran agnósticas al tipo de storage, solo leían
+  metadata ya resuelta). `remote::create_array_async` llama a las mismas
+  funciones puras que el path filesystem y solo difiere en las llamadas
+  `.async_store_metadata()`/`.async_store_array_subset()` vs sus
+  contrapartes síncronas — cero riesgo de que las dos rutas diverjan en qué
+  CF-metadata escriben, porque literalmente comparten el código que la
+  calcula. `zarrs::array::Array<TStorage>`/`ArrayBuilder::build` resultaron
+  genéricos sobre el tipo de storage sin I/O de por medio (confirmado
+  leyendo el fuente vendored de zarrs 0.23.13), lo que hizo el refactor
+  viable sin duplicar media librería.
+- No hay contraparte object-store de `read_zarr_chunked`/`ZarrCubeWriter`
+  (el streaming por-tile queda solo filesystem por ahora) — alcance
+  deliberadamente acotado a "existe el backend", que es lo que pedía el
+  ítem del roadmap; el streaming por tile sobre object-store queda para
+  cuando/si se justifica (repite el patrón de "cierro lo que pide el ítem,
+  no más" de las dos sesiones anteriores).
+- Verificación: 4 tests nuevos en `remote.rs` (roundtrip cubo+georef, f32,
+  metadata GeoZarr-CF completa inspeccionada vía `Array::async_open` directo
+  — epsg/crs_wkt/grid_mapping_name/GeoTransform/ejes CF, error en array
+  ausente) contra `object_store::memory::InMemory` — backend real (no un
+  mock: el mismo trait `ObjectStore` que implementan S3/HTTP), offline,
+  ejercitando exactamente el mismo código async que un store remoto vería;
+  el doctest del módulo (con `AmazonS3Builder`) compila, confirmando que
+  los builders de S3 quedan accesibles y tipan correctamente. zarr 14→18
+  tests con el feature (14 sin él, sin cambios). `cargo test -p
+  datacube-zarr --features object-store` y su clippy quedan en CI (nuevos
+  steps, ambos pueden correr de verdad — a diferencia de `stac`, este
+  feature no necesita red/GDAL/sibling checkout, así que CI corre los
+  tests, no solo clippy).
+- **Nota de sesión repetida**: agregar `zarrs_object_store` volvió a
+  disparar el mismo re-resuelto de `Cargo.lock` que reasigna
+  `numpy → ndarray` de `0.16.1` a `0.17.2` (ver nota idéntica en la sesión
+  de GeoZarr-CF, v0.13.0) — mismo fix manual, mismo diagnóstico
+  (`cargo build --workspace --locked` para confirmar que no se revierte
+  solo). Van dos de dos veces que tocar `datacube-zarr` con una dependencia
+  nueva dispara esto; si pasa una tercera vez, vale la pena investigar por
+  qué el resolver prefiere 0.17.2 en vez de simplemente no tocar un edge
+  que ninguna de las dos ediciones necesitaba cambiar, en vez de seguir
+  parcheando a mano cada vez.
+- Workspace bump 0.15.0.
+
 ## Próximos pasos al retomar
 1. Paper (C&G): draft con la pasada de estilo de `/paper-style audit`
    commiteada (2026-07-05, prosa más corta/menos run-ons en Abstract/§4/
@@ -620,9 +693,12 @@ en vez de ~4x (H5 paso 3). AUDIT.md grupo 3 queda completamente cerrado.
 4. Bug externo detectado en sesión anterior: paginación de `search_all` en
    surtgis-cloud repite items en Earth Search (dedup por id ya puesto como
    guard en `stack()`, pero el fix real es en surtgis).
-5. Opcionales post-AUDIT, 2 de 4 resueltos: **GeoZarr-CF pleno ✓ (v0.13.0)**,
-   **exponer datacube-io a Python ✓ (v0.14.0)**. Quedan: object-store
-   (S3/HTTP) vía zarrs async; sharding Zarr para object store (M2.c — solo
-   relevante una vez exista el backend object-store, no antes — de hecho el
-   único que queda que no depende de otro). Si algún día se quiere bajar el
-   techo de RAM del ingest STAC/COG, ver punto 3.
+5. Opcionales post-AUDIT, 3 de 4 resueltos: **GeoZarr-CF pleno ✓ (v0.13.0)**,
+   **exponer datacube-io a Python ✓ (v0.14.0)**, **object-store S3/HTTP ✓
+   (v0.15.0)**. Queda solo **sharding Zarr para object store (M2.c)** — el
+   único pendiente, ahora sin bloqueo (el backend object-store ya existe);
+   agruparía chunks pequeños en shards para reducir requests a S3/HTTP.
+   Fuera de eso, sin contraparte object-store de `read_zarr_chunked`/
+   `ZarrCubeWriter` (streaming por-tile sigue solo filesystem — alcance
+   deliberadamente dejado afuera en v0.15.0, ver esa sección). Si algún día
+   se quiere bajar el techo de RAM del ingest STAC/COG, ver punto 3.

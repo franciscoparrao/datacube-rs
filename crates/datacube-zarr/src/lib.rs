@@ -27,6 +27,13 @@
 //! `band_long_names` attribute for the handful of spectral indices this
 //! crate knows by name. This layer round-trips a cube losslessly (at `f64`)
 //! and stores enough metadata to relocate it in space and time.
+//!
+//! The `object-store` feature adds [`remote::write_zarr_to_store`]/
+//! [`remote::read_zarr_from_store`]: the same store, backed by S3/HTTP (or
+//! any [`object_store::ObjectStore`](https://docs.rs/object_store)) instead
+//! of the local filesystem, via zarrs' async storage API. Off by default —
+//! it pulls in `tokio` and network I/O, which the rest of this crate
+//! deliberately avoids so it stays offline-testable.
 
 use std::ops::Range;
 use std::path::Path;
@@ -40,6 +47,9 @@ use zarrs::array::codec::ZstdCodec;
 use zarrs::array::{Array, ArrayBuilder, ArraySubset, data_type};
 use zarrs::filesystem::FilesystemStore;
 use zarrs::group::GroupBuilder;
+
+#[cfg(feature = "object-store")]
+pub mod remote;
 
 /// Path of the cube array within the Zarr group.
 const CUBE_PATH: &str = "/cube";
@@ -292,24 +302,7 @@ fn create_array(
         nt as u64,
     ];
 
-    let has_grid_mapping = geo.epsg.is_some() || geo.transform.is_some();
-
-    let mut attrs = serde_json::Map::new();
-    attrs.insert("bands".into(), serde_json::to_value(bands).unwrap());
-    attrs.insert("time".into(), serde_json::to_value(time).unwrap());
-    attrs.insert(
-        "band_long_names".into(),
-        serde_json::to_value(band_long_names(bands)).unwrap(),
-    );
-    if let Some(epsg) = geo.epsg {
-        attrs.insert("epsg".into(), serde_json::json!(epsg));
-    }
-    if let Some(t) = geo.transform {
-        attrs.insert("geotransform".into(), serde_json::json!(t));
-    }
-    if has_grid_mapping {
-        attrs.insert("grid_mapping".into(), serde_json::json!("spatial_ref"));
-    }
+    let (attrs, has_grid_mapping) = cube_attrs(bands, time, geo);
 
     // ArrayBuilder::new(shape, chunk_shape, data_type, fill_value)
     let mut builder = match options.dtype {
@@ -341,6 +334,36 @@ fn create_array(
     }
 
     Ok(array)
+}
+
+/// The `/cube` array's attributes (`bands`/`time`/`band_long_names`, plus
+/// `epsg`/`geotransform`/`grid_mapping` when a georeference is present) and
+/// whether a `/spatial_ref` grid-mapping variable should be written —
+/// storage-agnostic, shared by the filesystem and object-store write paths.
+fn cube_attrs(
+    bands: &[String],
+    time: &[f64],
+    geo: &GeoRef,
+) -> (serde_json::Map<String, serde_json::Value>, bool) {
+    let has_grid_mapping = geo.epsg.is_some() || geo.transform.is_some();
+
+    let mut attrs = serde_json::Map::new();
+    attrs.insert("bands".into(), serde_json::to_value(bands).unwrap());
+    attrs.insert("time".into(), serde_json::to_value(time).unwrap());
+    attrs.insert(
+        "band_long_names".into(),
+        serde_json::to_value(band_long_names(bands)).unwrap(),
+    );
+    if let Some(epsg) = geo.epsg {
+        attrs.insert("epsg".into(), serde_json::json!(epsg));
+    }
+    if let Some(t) = geo.transform {
+        attrs.insert("geotransform".into(), serde_json::json!(t));
+    }
+    if has_grid_mapping {
+        attrs.insert("grid_mapping".into(), serde_json::json!("spatial_ref"));
+    }
+    (attrs, has_grid_mapping)
 }
 
 /// CF `standard_name`/`axis`/`units` attributes for a coordinate array. Time
@@ -415,13 +438,13 @@ fn write_coord_array(
     Ok(())
 }
 
-/// Writes the CF grid-mapping variable `/spatial_ref`: a 1-element dummy
-/// array (rioxarray/GDAL convention — its data has no meaning, only its
-/// attributes matter) carrying `crs_wkt`/`spatial_ref` (from the offline
-/// EPSG table when the code is known), `grid_mapping_name` (when the
-/// projection is recognized) and `GeoTransform` (GDAL's space-separated
-/// six-number convention, matching [`GeoRef::transform`]'s own).
-fn write_grid_mapping(store: &Arc<FilesystemStore>, geo: &GeoRef) -> Result<(), ZarrError> {
+/// Attributes for the CF grid-mapping variable `/spatial_ref`: `crs_wkt`/
+/// `spatial_ref` (from the offline EPSG table when the code is known),
+/// `grid_mapping_name` (when the projection is recognized) and
+/// `GeoTransform` (GDAL's space-separated six-number convention, matching
+/// [`GeoRef::transform`]'s own) — storage-agnostic, shared by the
+/// filesystem and object-store write paths.
+fn grid_mapping_attrs(geo: &GeoRef) -> serde_json::Map<String, serde_json::Value> {
     let mut attrs = serde_json::Map::new();
     let wkt = geo.epsg.and_then(crs_wkt_for);
     if let Some(epsg) = geo.epsg {
@@ -442,6 +465,14 @@ fn write_grid_mapping(store: &Arc<FilesystemStore>, geo: &GeoRef) -> Result<(), 
             .join(" ");
         attrs.insert("GeoTransform".into(), serde_json::json!(gt));
     }
+    attrs
+}
+
+/// Writes the CF grid-mapping variable `/spatial_ref`: a 1-element dummy
+/// array (rioxarray/GDAL convention — its data has no meaning, only its
+/// attributes matter) carrying the attributes from [`grid_mapping_attrs`].
+fn write_grid_mapping(store: &Arc<FilesystemStore>, geo: &GeoRef) -> Result<(), ZarrError> {
+    let attrs = grid_mapping_attrs(geo);
 
     let mut builder = ArrayBuilder::new(vec![1u64], vec![1u64], data_type::int32(), 0i32);
     // A dummy dimension of its own, not shared with any real axis: its data
@@ -586,7 +617,10 @@ fn retrieve_region(
 }
 
 /// The on-disk element type, detected from the array's Zarr data type.
-fn dtype_of(array: &Array<FilesystemStore>) -> Result<ZarrDType, ZarrError> {
+/// Generic over the storage type so both the filesystem ([`Array::open`])
+/// and object-store ([`Array::async_open`](Array::async_open)) paths share
+/// it — this only reads already-fetched metadata, no storage I/O of its own.
+fn dtype_of<TStorage: ?Sized>(array: &Array<TStorage>) -> Result<ZarrDType, ZarrError> {
     let dt = array.data_type();
     if *dt == data_type::float64() {
         Ok(ZarrDType::F64)
@@ -603,9 +637,10 @@ fn dtype_of(array: &Array<FilesystemStore>) -> Result<ZarrDType, ZarrError> {
 type CubeMeta = (Vec<String>, Vec<f64>, GeoRef, (usize, usize, usize, usize));
 
 /// Bands, time, georeference and `(band, y, x, time)` dims from an opened
-/// array's metadata (no cell data read). Shared by [`read_zarr`] and
-/// [`read_zarr_chunked`].
-fn read_meta(array: &Array<FilesystemStore>) -> Result<CubeMeta, ZarrError> {
+/// array's metadata (no cell data read). Shared by [`read_zarr`],
+/// [`read_zarr_chunked`] and the object-store equivalents — generic over the
+/// storage type for the same reason as [`dtype_of`].
+fn read_meta<TStorage: ?Sized>(array: &Array<TStorage>) -> Result<CubeMeta, ZarrError> {
     let shape = array.shape();
     if shape.len() != 4 {
         return Err(ZarrError::Metadata(format!(

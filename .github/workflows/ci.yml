@@ -40,6 +40,12 @@ jobs:
       - name: clippy (python with stac)
         working-directory: datacube-rs
         run: cargo clippy -p datacube-python --features stac -- -D warnings
+      - name: clippy (zarr with object-store)
+        working-directory: datacube-rs
+        run: cargo clippy -p datacube-zarr --all-targets --features object-store -- -D warnings
       - name: test
         working-directory: datacube-rs
         run: cargo test --workspace
+      - name: test (zarr with object-store)
+        working-directory: datacube-rs
+        run: cargo test -p datacube-zarr --features object-store

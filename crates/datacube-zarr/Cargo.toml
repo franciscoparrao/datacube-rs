@@ -16,7 +16,27 @@ zarrs = "0.23"
 # Static EPSG -> WKT/PROJ4 lookup table (no_std, no libproj/GDAL) for the
 # GeoZarr-CF grid_mapping variable; keeps this crate offline-testable.
 crs-definitions = "0.4"
+# S3/HTTP object-store backend, opt-in via the `object-store` feature (see
+# below) — wraps `object_store` (Apache Arrow's storage crate: S3/GCS/
+# Azure/HTTP/local) into zarrs' async storage traits. `object_store` itself
+# is only reached through this crate's re-export (its own doc recommends
+# this, to avoid a semver-incompatible direct dependency drifting from the
+# version zarrs_object_store resolves to).
+zarrs_object_store = { version = "0.6", features = [
+    "aws",
+    "http",
+], optional = true }
+# Blocking wrapper around the async object-store I/O, mirroring the shared-
+# runtime pattern surtgis-cloud uses for its own blocking API — keeps this
+# crate's public functions synchronous like the rest of datacube-rs.
+tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"
 approx = { workspace = true }
+
+[features]
+# `write_zarr_to_store`/`read_zarr_from_store`: S3/HTTP backing store via
+# zarrs' async storage API. Off by default so the crate stays pure-Rust/
+# offline-testable (no tokio, no network) otherwise.
+object-store = ["zarrs/async", "dep:zarrs_object_store", "dep:tokio"]
