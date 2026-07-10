@@ -561,6 +561,47 @@ en vez de ~4x (H5 paso 3). AUDIT.md grupo 3 queda completamente cerrado.
   cambió lo que uno tocó.
 - Workspace bump 0.13.0.
 
+## Exponer datacube-io (STAC/COG stack) a Python (v0.14.0, 2026-07-09)
+- Segundo opcional del roadmap post-AUDIT: hasta ahora `datacube-python`
+  solo envolvía el `Cube` in-memory — la ingesta STAC/COG (`datacube-io::
+  stack`) vivía solo en Rust nativo y en el CLI. Mismo motivo que bloqueaba
+  esto documentado en la sesión de 2026-06-16 ("datacube-io NO se expone
+  aún — pulls surtgis/red"): agregarlo sin cuidado convierte el wheel de
+  Python, hoy standalone (sin sibling checkout ni GDAL de sistema), en algo
+  que exige ambos.
+- Solución: mismo patrón que ya usa `datacube-cli` para este problema
+  exacto — un feature Cargo **`stac`** (`dep:datacube-io`,
+  `dep:surtgis-core`), off por default. `cargo build -p datacube-python`
+  (y el wheel que `pyproject.toml` construye, que fija
+  `features = ["extension-module"]`) siguen sin tocar surtgis/GDAL; opt-in
+  explícito con
+  `VIRTUAL_ENV=... maturin develop --release --features stac,extension-module`.
+- `dc.stack(catalog, collection, assets, bbox, datetime, ...)` (nueva
+  `#[pyfunction]`, gated `#[cfg(feature = "stac")]`) expone los knobs de
+  `StackConfig` como kwargs (cloud cover, overview, scale/offset,
+  cross-zone mosaicking, concurrency, máscara SCL, `GridSpec`) y devuelve
+  `dict(cube=Cube, scenes=[dict(id, datetime, time, cloud_cover), ...],
+  skipped=[str, ...])` — mismas claves que el reporte JSON del CLI
+  (`"scenes"`/`"id"`, no `"slices"`/`"item_id"` como el struct Rust
+  interno, por consistencia entre las dos interfaces del motor).
+  Deliberadamente **no** reimplementa composite/gapfill/index/trend/breaks
+  en el binding: esas ya son métodos de `Cube` (`composite`, `gapfill`,
+  `ndvi`, `trend_map`, ...), así que se encadenan sobre `result["cube"]` en
+  vez de duplicar lógica — verificado e2e que la cadena completa
+  `dc.stack(...) → cube.ndvi(...) → ndvi.trend_map(...)` funciona sobre
+  Sentinel-2 real (Planetary Computer, Santiago, ene-feb 2024, `mask_scl`).
+- Test nuevo en pytest (`test_stack_against_planetary_computer`) con
+  `pytest.mark.skipif(not hasattr(dc, "stack"))` — corre solo contra un
+  build con el feature, se salta limpio en el build default (16→17 tests,
+  16 pasan/1 skip sin el feature; 17/17 pasan con `--features stac`).
+  Mismo espíritu que el test de red ignorado del lado Rust
+  (`datacube-io::stacks_sentinel2_red_band`).
+- CI: nuevo step `clippy (python with stac)` (mismo patrón que el step ya
+  existente `clippy (cli with stac)`) — el feature no está en el
+  `cargo clippy --workspace`/`cargo test --workspace` por defecto, así que
+  sin este step quedaría sin cubrir en CI.
+- Workspace bump 0.14.0.
+
 ## Próximos pasos al retomar
 1. Paper (C&G): draft con la pasada de estilo de `/paper-style audit`
    commiteada (2026-07-05, prosa más corta/menos run-ons en Abstract/§4/
@@ -579,8 +620,9 @@ en vez de ~4x (H5 paso 3). AUDIT.md grupo 3 queda completamente cerrado.
 4. Bug externo detectado en sesión anterior: paginación de `search_all` en
    surtgis-cloud repite items en Earth Search (dedup por id ya puesto como
    guard en `stack()`, pero el fix real es en surtgis).
-5. Opcionales post-AUDIT, 1 de 4 resuelto: **GeoZarr-CF pleno ✓ (v0.13.0)**.
-   Quedan: object-store (S3/HTTP) vía zarrs async; exponer datacube-io
-   (stack STAC) a Python; sharding Zarr para object store (M2.c — solo
-   relevante una vez exista el backend object-store, no antes). Si algún
-   día se quiere bajar el techo de RAM del ingest STAC/COG, ver punto 3.
+5. Opcionales post-AUDIT, 2 de 4 resueltos: **GeoZarr-CF pleno ✓ (v0.13.0)**,
+   **exponer datacube-io a Python ✓ (v0.14.0)**. Quedan: object-store
+   (S3/HTTP) vía zarrs async; sharding Zarr para object store (M2.c — solo
+   relevante una vez exista el backend object-store, no antes — de hecho el
+   único que queda que no depende de otro). Si algún día se quiere bajar el
+   techo de RAM del ingest STAC/COG, ver punto 3.

@@ -37,6 +37,9 @@ jobs:
       - name: clippy (cli with stac)
         working-directory: datacube-rs
         run: cargo clippy -p datacube-cli --features stac -- -D warnings
+      - name: clippy (python with stac)
+        working-directory: datacube-rs
+        run: cargo clippy -p datacube-python --features stac -- -D warnings
       - name: test
         working-directory: datacube-rs
         run: cargo test --workspace

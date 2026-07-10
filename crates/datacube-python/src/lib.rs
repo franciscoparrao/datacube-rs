@@ -4,6 +4,12 @@
 //! `datacube-core` to Python, with NumPy array interop. Built as the
 //! `datacube_rs` extension module (see the `python/` package and
 //! `maturin develop`).
+//!
+//! `dc.stack(...)` (STAC/COG ingestion, [`stack`]) is opt-in behind the
+//! `stac` Cargo feature — it needs the SurtGIS sibling checkout and a
+//! system GDAL, so the default build (and the wheel `pyproject.toml`
+//! builds) stays standalone. Opt in with:
+//! `VIRTUAL_ENV=.venv maturin develop --release --features stac,extension-module`.
 
 use datacube_core::{CompositeMethod, CompositeWindow, Cube as CoreCube, GeoRef, indices, stats};
 use ndarray::Array4;
@@ -372,6 +378,106 @@ impl PyCube {
     }
 }
 
+/// Searches a STAC catalog and stacks the matching scenes into a [`Cube`]
+/// (only built with the `stac` feature — needs the SurtGIS sibling checkout
+/// and a system GDAL, so it's off by default and the wheel still builds
+/// standalone otherwise; see `datacube-io::stack` for the full semantics of
+/// each option).
+///
+/// Returns `dict(cube=Cube, scenes=[dict(id, datetime, time, cloud_cover),
+/// ...], skipped=[str, ...])` — the same shape as `datacube stack`'s JSON
+/// report, minus the fields that come from post-processing the CLI does
+/// itself (composite/index/trend/breaks all live as `Cube` methods, so
+/// chain them on `result["cube"]` instead of re-exposing them here).
+#[cfg(feature = "stac")]
+#[pyfunction]
+#[pyo3(signature = (
+    catalog, collection, assets, bbox, datetime,
+    max_cloud_cover=None, max_items=100, overview=None,
+    scale=1.0, offset=0.0, cross_zone_mosaic=true, concurrency=8,
+    mask_scl=false, mask_asset="SCL", mask_keep=vec![4, 5, 6, 7, 11],
+    grid_epsg=None, grid_res=None, grid_bbox=None, grid_align=None,
+))]
+#[allow(clippy::too_many_arguments)]
+fn stack<'py>(
+    py: Python<'py>,
+    catalog: &str,
+    collection: &str,
+    assets: Vec<String>,
+    bbox: [f64; 4],
+    datetime: &str,
+    max_cloud_cover: Option<f64>,
+    max_items: usize,
+    overview: Option<usize>,
+    scale: f64,
+    offset: f64,
+    cross_zone_mosaic: bool,
+    concurrency: usize,
+    mask_scl: bool,
+    mask_asset: &str,
+    mask_keep: Vec<u16>,
+    grid_epsg: Option<u32>,
+    grid_res: Option<f64>,
+    grid_bbox: Option<[f64; 4]>,
+    grid_align: Option<f64>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let asset_refs: Vec<&str> = assets.iter().map(String::as_str).collect();
+    let [w, s, e, n] = bbox;
+    let mut cfg = datacube_io::StackConfig::new(catalog, collection, &asset_refs)
+        .bbox(w, s, e, n)
+        .datetime(datetime)
+        .max_items(max_items)
+        .overview(overview)
+        .scaling(scale, offset)
+        .cross_zone_mosaic(cross_zone_mosaic)
+        .concurrency(concurrency);
+    if let Some(pct) = max_cloud_cover {
+        cfg = cfg.max_cloud_cover(pct);
+    }
+    if mask_scl {
+        cfg = cfg.mask(datacube_io::MaskConfig {
+            asset: mask_asset.to_string(),
+            keep: mask_keep,
+            resample: surtgis_core::ResampleMethod::NearestNeighbor,
+        });
+    }
+    if let (Some(epsg), Some(res)) = (grid_epsg, grid_res) {
+        let mut grid = datacube_io::GridSpec::new(epsg, res);
+        if let Some([gw, gs, ge, gn]) = grid_bbox {
+            grid = grid.bbox(gw, gs, ge, gn);
+        }
+        if let Some(step) = grid_align {
+            grid = grid.align(step);
+        }
+        cfg = cfg.grid(grid);
+    }
+
+    let stacked = py.detach(|| datacube_io::stack(&cfg)).map_err(err)?;
+
+    let d = PyDict::new(py);
+    d.set_item(
+        "cube",
+        PyCube {
+            inner: stacked.cube,
+        },
+    )?;
+    let scenes: Vec<Bound<'py, PyDict>> = stacked
+        .slices
+        .iter()
+        .map(|s| {
+            let sd = PyDict::new(py);
+            sd.set_item("id", &s.item_id)?;
+            sd.set_item("datetime", &s.datetime)?;
+            sd.set_item("time", s.time)?;
+            sd.set_item("cloud_cover", s.cloud_cover)?;
+            Ok(sd)
+        })
+        .collect::<PyResult<_>>()?;
+    d.set_item("scenes", scenes)?;
+    d.set_item("skipped", stacked.skipped)?;
+    Ok(d)
+}
+
 #[pymodule]
 fn datacube_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
@@ -381,5 +487,7 @@ fn datacube_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(harmonic_regression, m)?)?;
     m.add_function(wrap_pyfunction!(detect_breaks, m)?)?;
     m.add_class::<PyCube>()?;
+    #[cfg(feature = "stac")]
+    m.add_function(wrap_pyfunction!(stack, m)?)?;
     Ok(())
 }

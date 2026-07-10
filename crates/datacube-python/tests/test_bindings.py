@@ -3,11 +3,16 @@
 Run with the build venv:
     VIRTUAL_ENV=.venv-validate maturin develop --release
     .venv-validate/bin/python -m pytest crates/datacube-python/tests
+
+The stack() test additionally needs a build with the 'stac' feature and
+network access to Planetary Computer (see its skip reason):
+    VIRTUAL_ENV=.venv-validate maturin develop --release --features stac,extension-module
 """
 
 import math
 
 import numpy as np
+import pytest
 import datacube_rs as dc
 
 
@@ -199,3 +204,39 @@ def test_cube_normalized_difference_generic():
     cube = _rgbn_cube()
     nd = cube.normalized_difference("nir", "red", "myidx")
     assert nd.bands == ["myidx"]
+
+
+@pytest.mark.skipif(
+    not hasattr(dc, "stack"),
+    reason="built without the 'stac' feature "
+    "(VIRTUAL_ENV=... maturin develop --release --features stac,extension-module)",
+)
+def test_stack_against_planetary_computer():
+    """Network e2e: STAC search -> COG reads -> masked cube -> NDVI -> trend.
+
+    Mirrors the Rust-side ignored network test (datacube-io's
+    stacks_sentinel2_red_band) and the CLI's e2e verification convention —
+    run manually, not part of `cargo test`/CI.
+    """
+    result = dc.stack(
+        catalog="pc",
+        collection="sentinel-2-l2a",
+        assets=["B04", "B08"],
+        bbox=(-70.75, -33.55, -70.65, -33.45),
+        datetime="2024-01-01/2024-02-28",
+        max_cloud_cover=30.0,
+        max_items=20,
+        overview=4,
+        mask_scl=True,
+    )
+    cube = result["cube"]
+    assert cube.bands == ["B04", "B08"]
+    assert cube.epsg == 32719
+    assert len(result["scenes"]) > 0
+    assert all({"id", "datetime", "time", "cloud_cover"} <= s.keys() for s in result["scenes"])
+
+    ndvi = cube.ndvi("B08", "B04")
+    assert ndvi.bands == ["ndvi"]
+    slope, pvalue = ndvi.trend_map(0, method="theil_sen")
+    assert slope.shape == cube.dims[1:3]
+    assert np.isfinite(slope).any()
