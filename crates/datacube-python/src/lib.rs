@@ -13,7 +13,10 @@
 
 use datacube_core::{CompositeMethod, CompositeWindow, Cube as CoreCube, GeoRef, indices, stats};
 use ndarray::Array4;
-use numpy::{IntoPyArray, PyArray2, PyArray4, PyReadonlyArray1, PyReadonlyArray4};
+use numpy::{
+    PyArray1, PyArray2, PyArray4, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray4,
+    PyUntypedArrayMethods,
+};
 use pyo3::exceptions::{PyKeyError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -23,6 +26,35 @@ fn err<E: std::fmt::Display>(e: E) -> PyErr {
 }
 
 /// A pair of `(height, width)` NumPy grids (e.g. slope + p-value).
+// The `numpy` crate resolves its own `ndarray` (any of 0.15..=0.17 satisfy
+// its range), while this workspace is pinned to the `ndarray` that
+// `datacube-core` and the `surtgis` path deps share. Only plain `Vec`s and
+// shapes cross the boundary here, so whichever `ndarray` the lockfile ends
+// up assigning to `numpy` cannot break the build.
+fn array4_from_py(data: &PyReadonlyArray4<'_, f64>) -> PyResult<Array4<f64>> {
+    let shape = data.shape();
+    let dims = (shape[0], shape[1], shape[2], shape[3]);
+    let flat: Vec<f64> = data.as_array().iter().copied().collect();
+    Array4::from_shape_vec(dims, flat)
+        .map_err(|e| PyValueError::new_err(format!("cannot build cube from array: {e}")))
+}
+
+fn array2_to_py<'py>(
+    py: Python<'py>,
+    a: &ndarray::Array2<f64>,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    let (ny, nx) = a.dim();
+    PyArray1::from_vec(py, a.iter().copied().collect()).reshape([ny, nx])
+}
+
+fn array4_to_py<'py>(
+    py: Python<'py>,
+    a: ndarray::ArrayView4<'_, f64>,
+) -> PyResult<Bound<'py, PyArray4<f64>>> {
+    let (b, ny, nx, nt) = a.dim();
+    PyArray1::from_vec(py, a.iter().copied().collect()).reshape([b, ny, nx, nt])
+}
+
 type GridPair<'py> = (Bound<'py, PyArray2<f64>>, Bound<'py, PyArray2<f64>>);
 
 /// OLS linear trend → dict(slope, intercept, r_squared, std_err, p_value, n).
@@ -176,7 +208,7 @@ impl PyCube {
         time: PyReadonlyArray1<'_, f64>,
         bands: Vec<String>,
     ) -> PyResult<Self> {
-        let data: Array4<f64> = data.as_array().to_owned();
+        let data = array4_from_py(&data)?;
         let inner = CoreCube::new(data, time.as_slice()?.to_vec(), bands).map_err(err)?;
         Ok(Self { inner })
     }
@@ -193,13 +225,13 @@ impl PyCube {
     }
 
     #[getter]
-    fn time<'py>(&self, py: Python<'py>) -> Bound<'py, numpy::PyArray1<f64>> {
-        self.inner.time().to_vec().into_pyarray(py)
+    fn time<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
+        PyArray1::from_vec(py, self.inner.time().to_vec())
     }
 
     /// The raw cube as a `(band, y, x, time)` NumPy array (copy).
-    fn to_numpy<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray4<f64>> {
-        self.inner.data().to_owned().into_pyarray(py)
+    fn to_numpy<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray4<f64>>> {
+        array4_to_py(py, self.inner.data().view())
     }
 
     /// EPSG code of the cube's grid, or `None` if it has no georeference.
@@ -260,7 +292,7 @@ impl PyCube {
         .map_err(err)?;
         let slope = grid.mapv(|(s, _)| s);
         let pvalue = grid.mapv(|(_, p)| p);
-        Ok((slope.into_pyarray(py), pvalue.into_pyarray(py)))
+        Ok((array2_to_py(py, &slope)?, array2_to_py(py, &pvalue)?))
     }
 
     /// Aggregate time slices into composites. `window` is "same_time",

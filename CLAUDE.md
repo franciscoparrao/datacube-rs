@@ -663,17 +663,37 @@ en vez de ~4x (H5 paso 3). AUDIT.md grupo 3 queda completamente cerrado.
   steps, ambos pueden correr de verdad — a diferencia de `stac`, este
   feature no necesita red/GDAL/sibling checkout, así que CI corre los
   tests, no solo clippy).
-- **Nota de sesión repetida**: agregar `zarrs_object_store` volvió a
-  disparar el mismo re-resuelto de `Cargo.lock` que reasigna
-  `numpy → ndarray` de `0.16.1` a `0.17.2` (ver nota idéntica en la sesión
-  de GeoZarr-CF, v0.13.0) — mismo fix manual, mismo diagnóstico
-  (`cargo build --workspace --locked` para confirmar que no se revierte
-  solo). Van dos de dos veces que tocar `datacube-zarr` con una dependencia
-  nueva dispara esto; si pasa una tercera vez, vale la pena investigar por
-  qué el resolver prefiere 0.17.2 en vez de simplemente no tocar un edge
-  que ninguna de las dos ediciones necesitaba cambiar, en vez de seguir
-  parcheando a mano cada vez.
+- **Nota de sesión repetida (RESUELTA 2026-08-29, ver sección siguiente)**:
+  agregar `zarrs_object_store` volvió a disparar el re-resuelto de
+  `Cargo.lock` que reasigna `numpy → ndarray` de `0.16.1` a `0.17.2`; en
+  su momento se parcheó a mano por segunda vez.
 - Workspace bump 0.15.0.
+
+## Fix durable del edge `numpy → ndarray` en Cargo.lock (2026-08-29)
+- Tercera aparición del problema documentado en v0.13.0/v0.15.0, esta vez
+  sin haber tocado `datacube-zarr`: `surtgis` (path dep sibling) pasó de
+  0.17.0 a **1.2.5** y bumpeó `lru` 0.16→0.18 (RUSTSEC-2026-0253), así que
+  el `Cargo.lock` commiteado quedó legítimamente desactualizado
+  (`--locked` fallaba) y cualquier re-resuelto reasignaba
+  `numpy → ndarray 0.17.2`. Diagnóstico: no es un bug del resolver, es que
+  `numpy` 0.29 admite `ndarray >=0.15,<=0.17` y cargo elige la más alta ya
+  presente en el grafo (0.17 entra por `zarrs`); el workspace no puede
+  subir a 0.17 porque `datacube-io` cruza `Array2` con `surtgis-core`
+  (fijo en 0.16), ni bajar `zarrs`. Las dos versiones **deben** convivir.
+- Fix real (en vez de parchear el lock por tercera vez): `datacube-python`
+  ya no usa tipos `ndarray` de `numpy` en la frontera — helpers
+  `array4_from_py` (itera `as_array()` a `Vec` + `Array4::from_shape_vec`,
+  agnóstico al layout: C/F-order/transpuesto verificados) y
+  `array2_to_py`/`array4_to_py` (`PyArray1::from_vec(..).reshape(dims)`)
+  reemplazan `as_array().to_owned()`/`into_pyarray`. Solo `Vec` y shapes
+  cruzan, así que el edge que el lockfile asigne a `numpy` ya no puede
+  romper el build. `Cargo.lock` re-resuelto y commiteado tal cual lo deja
+  cargo (con `ndarray 0.17.2` bajo numpy). Costo: una copia extra por
+  conversión (ya existía `to_owned()` antes; mismo orden de magnitud).
+- Verificación: `cargo test --workspace --locked` verde (core 68, io 23,
+  zarr 14), clippy `--no-deps` limpio (default y `--features stac`),
+  maturin develop + pytest 16 pass/1 skip, roundtrip exacto con arrays
+  no contiguos. `maturin` vive en `~/.local/bin`, no en `.venv-validate`.
 
 ## Próximos pasos al retomar
 1. Paper (C&G): draft con la pasada de estilo de `/paper-style audit`
