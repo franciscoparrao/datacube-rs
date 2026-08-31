@@ -12,13 +12,14 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 datacube-core = { workspace = true }
+ndarray = { workspace = true }
+js-sys = "0.3"
 wasm-bindgen = "0.2"
 serde = { workspace = true }
 serde-wasm-bindgen = "0.6"
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
-js-sys = "0.3"
 
 [lints.rust]
 # wasm-bindgen 0.2 emits this lint on generated glue under newer rustc

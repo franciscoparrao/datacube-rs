@@ -695,6 +695,50 @@ en vez de ~4x (H5 paso 3). AUDIT.md grupo 3 queda completamente cerrado.
   maturin develop + pytest 16 pass/1 skip, roundtrip exacto con arrays
   no contiguos. `maturin` vive en `~/.local/bin`, no en `.venv-validate`.
 
+## cube_stats: estadísticos por cubo en WASM (v0.16.0, 2026-08-30)
+- Motivado por el visor de Territorio Digital (territorio-digital.cl/visor/),
+  que ya usa datacube-wasm por serie (clic en un píxel) y necesitaba mapas de
+  tendencia/quiebres sin cruzar la frontera JS↔WASM una vez por píxel
+  (180×180 = 32.400 llamadas).
+- Solo plomería, cero estadística nueva: `ChunkPipeline::run_on` (core,
+  `pipeline.rs`) pasó de privada a `pub` con doc — es exactamente lo que el
+  CLI ya corre por chunk, y produce las 4 grillas que el mapa necesita
+  (`ChunkStat`: slope/p_value + break_count/first_break).
+- `datacube-wasm::cube_stats(values, n_times, height, width, times, method,
+  breaks_alpha, min_segment, min_valid)` → `{ slope, p_value, break_count,
+  first_break, width, height }` con grillas `Float64Array` (via js_sys
+  directo, no serde — serde-wasm-bindgen serializa Vec<f64> como Array JS).
+  - **Contrato de aplanado (explícito)**: entrada time-major,
+    `values[t*height*width + y*width + x]` — concatenación de las grillas
+    por fecha, cada una row-major. Se reordena a `(band,y,x,time)` con
+    `Array3::from_shape_vec + permuted_axes([1,2,0]) + insert_axis`;
+    `Cube::new` copia a layout estándar.
+  - NaN = nodata (máscara SCL del visor); las stats de core ya filtran
+    pairwise. `min_valid` (parámetro, sugerido 5 por el visor) enmascara
+    a NaN TODAS las grillas de un píxel con menos observaciones finitas —
+    necesario porque p.ej. OLS con 3 puntos devuelve números sin sentido.
+  - `method`: "theil_sen" (Theil-Sen + Mann-Kendall) | "ols".
+    `breaks_alpha` en [0,1): 0 desactiva breaks (grillas null); el modelo
+    de segmento es trend-only (n_harmonics=0). Validación eager de dims/
+    método/alpha con JsError.
+- **Rayon funciona en wasm32-unknown-unknown**: `par_map_series` (que
+  run_on usa) cae a ejecución secuencial en el thread actual sin pánico
+  (rayon 1.10, verificado empíricamente con wasm-pack test --node — era el
+  riesgo principal del diseño y no se materializó).
+- Convención heredada visible: `detect_breaks` ancla el quiebre en el
+  ÚLTIMO índice del segmento anterior al shift (serie con salto en t=30 →
+  first_break = 29.0), igual que el binding por serie.
+- Tests wasm 3→7 (paridad exacta grilla-vs-por-serie en theil_sen/MK y
+  OLS con NaN intercalados (10 de 12 válidas, el caso Maipo), min_valid
+  enmascara, level shift detectado en el píxel correcto y null con
+  alpha=0, rechazo de dims/método/alpha inválidos). cargo test --workspace
+  --locked y clippy --no-deps -D warnings verdes.
+- Build browser: `wasm-pack build crates/datacube-wasm --target web
+  --release` → 205 KB (antes 95 KB con solo las 5 funciones por serie; el
+  binario ahora arrastra pipeline/temporal/bandmath de core). El pkg/ del
+  repo sigue siendo target bundler; el visor debe compilar con --target web.
+- Workspace bump 0.16.0.
+
 ## Próximos pasos al retomar
 1. Paper (C&G): draft con la pasada de estilo de `/paper-style audit`
    commiteada (2026-07-05, prosa más corta/menos run-ons en Abstract/§4/

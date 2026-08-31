@@ -166,7 +166,12 @@ impl ChunkPipeline {
         Ok(cube)
     }
 
-    fn run_on(&self, cube: &Cube) -> Result<ChunkStat, CubeError> {
+    /// Runs the full chain (composite → gapfill → index → stats) on `cube`
+    /// in one go and returns the per-pixel statistic grids. This is what
+    /// [`Cube::run_chunked`] calls per tile; it is public for callers that
+    /// already hold one in-memory cube of workable size and want the grids
+    /// without chunking (e.g. the WASM binding's whole-cube stats).
+    pub fn run_on(&self, cube: &Cube) -> Result<ChunkStat, CubeError> {
         let cube = self.transform(cube)?;
         let band = cube.band(&self.stat.band)?;
 
