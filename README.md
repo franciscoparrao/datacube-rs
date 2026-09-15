@@ -17,11 +17,12 @@ Part of the SurtGIS family of Rust geospatial engines.
   this repository.
 - `crates/datacube-cli` — `datacube` binary; `datacube trend series.csv`
   reports all three estimators as JSON. Build with `--features stac` to
-  enable `datacube stack`.
+  enable `datacube stack` and `datacube zonal`.
 - `crates/datacube-python` — PyO3 bindings (`datacube_rs` module): the cube
   model and statistics over NumPy arrays. See its
-  [README](crates/datacube-python/README.md). I/O stacking is not exposed to
-  Python yet — use the CLI (`datacube stack`) for STAC/COG ingestion.
+  [README](crates/datacube-python/README.md). STAC/COG ingestion (`dc.stack`)
+  and zonal aggregation (`Cube.zonal`) are exposed when the wheel is built
+  with the `stac` feature (needs the SurtGIS sibling checkout).
 - `crates/datacube-wasm` — WebAssembly bindings + a browser demo that fits
   harmonics and detects breaks live. See its
   [README](crates/datacube-wasm/README.md).
@@ -58,6 +59,61 @@ Missing observations are `NaN` and dropped pairwise; Theil-Sen and OLS use the
 real time coordinates, so irregular sampling (cloud-masked scenes) is handled
 correctly.
 
+## Zonal aggregation by polygon
+
+When the unit of analysis is a polygon (a wetland, a field, a catchment) rather
+than the cube's bounding box, `datacube zonal` reduces each polygon of a vector
+layer to a tidy scalar series `(polygon_id, time, band, reducer, value,
+n_valid, n_total)`:
+
+```bash
+# annual median NDVI per wetland, straight from a stacked Sentinel-2 cube
+cargo run -p datacube-cli --features stac -- zonal \
+  --collection sentinel-2-l2a --assets B04,B08 \
+  --bbox -71.0,-33.9,-70.9,-33.8 --datetime 2022-01-01/2023-12-31 \
+  --mask scl --index ndvi --nir B08 --red B04 \
+  --vector wetlands.shp --id-field ID \
+  --composite yearly --reduce median --inclusion center \
+  --format csv --out ndvi_by_wetland.csv
+
+# ...or over a cube already materialized to GeoZarr (offline)
+cargo run -p datacube-cli --features stac -- zonal --cube cube.zarr \
+  --vector wetlands.geojson --id-field ID --reduce mean --format json
+```
+
+- **Reading** (`.shp` / `.geojson`) and **rasterization** reuse SurtGIS's
+  vector stack; polygons are **reprojected to the cube CRS** (pure-Rust
+  WGS84↔UTM / UTM↔UTM — the geometry is reprojected, never the raster).
+- **`--inclusion`** picks how a polygon selects pixels — `center` (pixel
+  centre inside, the rasterio default), `all-touched` (any cell the polygon
+  touches), or `area-fraction` (area-weighted coverage). This is semantically
+  significant, so it is explicit.
+- **`--reduce`** is NaN-aware: `mean median min max std sum count
+  fraction-above`; `n_valid`/`n_total` report coverage for QC.
+- **`--composite`** bins time with the same calendar windows as `composite`.
+- **`--format`** is `csv` or `json`; `parquet` is available when the CLI is
+  built with `--features parquet` (`ZonalTable::write_parquet`, a lightweight
+  Snappy Parquet writer with no Arrow dependency).
+- In Python: `cube.zonal("wetlands.shp", id_field="ID", reducer="median",
+  inclusion="center", window="yearly")` returns a dict of columns ready for
+  `pandas.DataFrame`.
+
+## Cloud/quality masking
+
+`--mask` decodes the per-scene quality band before grid alignment, so rejected
+pixels never bleed into their neighbours:
+
+- **`scl`** — Sentinel-2 L2A scene classification; keep the clear classes with
+  `--mask-keep` (default `4,5,6,7,11`).
+- **`qa-pixel`** — Landsat Collection-2 Level-2 `QA_PIXEL` bitmask; reject bits
+  with `--qa-reject-bits` (default `fill,dilated-cloud,cirrus,cloud,cloud-shadow`)
+  and optionally a cloud-confidence floor with `--qa-min-confidence`.
+- **`auto`** — SCL for Sentinel-2 collections, QA_PIXEL for Landsat.
+
+Band asset keys differ between sensors: Sentinel-2 uses `B04`/`B08` (red/NIR),
+Landsat C2 L2 uses `SR_B4`/`SR_B5`. The band→role mapping is the caller's
+(`--red`/`--nir`/… or the `--assets` order); set it to match the collection.
+
 ## Numerical parity
 
 `scripts/validate_stats.py` cross-checks every reported field against
@@ -82,6 +138,12 @@ Documented divergences from the references:
 - `pymannkendall.sens_slope` assumes unit spacing after dropping NaN; we keep
   the true time gaps.
 
+`scripts/validate_zonal.py` cross-checks zonal aggregation against
+`rasterio.features.geometry_mask` (Center / AllTouched pixel sets, exact) and
+`shapely` intersection areas (AreaFraction weights, `1e-6` relative — geo's
+`BooleanOps` snaps to a fixed-precision integer grid), across every reducer.
+Needs the `stac`-enabled binding plus `rasterio`/`shapely` in the venv.
+
 ## Roadmap
 
 - [x] Cube model + streaming per-pixel/chunk iterators
@@ -101,6 +163,11 @@ Documented divergences from the references:
   reference grid instead of skipping them)
 - [x] PyO3 bindings (`datacube_rs` module: cube + statistics over NumPy)
 - [x] WASM bindings + browser time-series demo (harmonic fit + live breaks)
+- [x] Zonal aggregation by polygon (Shapefile/GeoJSON → tidy per-polygon
+  series; centre / all-touched / area-fraction inclusion; NaN-aware reducers;
+  CLI + library + Python)
+- [x] Landsat Collection-2 `QA_PIXEL` bitmask masking, alongside Sentinel-2
+  SCL (auto-selected by collection)
 
 ## Performance
 

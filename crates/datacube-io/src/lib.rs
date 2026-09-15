@@ -29,9 +29,20 @@
 
 mod stack;
 mod time;
+mod vector;
 
-pub use stack::{GridSpec, MaskConfig, SliceMeta, StackConfig, StackedCube, stack};
+pub use stack::{
+    Confidence, GridSpec, MaskConfig, QaFlags, SliceMeta, StackConfig, StackedCube, stack,
+};
 pub use time::fractional_year;
+pub use vector::{
+    PixelInclusion, Reducer, ZonalConfig, ZonalRow, ZonalTable, read_zones, zonal_reduce,
+};
+
+/// The vector feature collection type ([`surtgis_core::vector::FeatureCollection`]),
+/// re-exported so callers of [`zonal_reduce`] need not depend on SurtGIS
+/// directly.
+pub use surtgis_core::vector::FeatureCollection;
 
 use thiserror::Error;
 
@@ -62,4 +73,9 @@ pub enum StackError {
     /// The search returned no items, or none survived the filters.
     #[error("no usable scenes: {0}")]
     Empty(String),
+
+    /// Zonal aggregation failure (bad id field, unsupported CRS pair,
+    /// non-axis-aligned grid, vector/output I/O).
+    #[error("zonal aggregation error: {0}")]
+    Zonal(String),
 }

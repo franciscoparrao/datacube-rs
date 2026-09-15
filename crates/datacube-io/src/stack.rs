@@ -11,34 +11,170 @@ use surtgis_core::{CRS, GeoTransform, Raster, ResampleMethod, resample_to_grid};
 use crate::StackError;
 use crate::time::fractional_year;
 
+/// Confidence level encoded in a Landsat QA_PIXEL 2-bit sub-field
+/// (`00` = none, `01` = low, `10` = medium, `11` = high).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Confidence {
+    Low,
+    Medium,
+    High,
+}
+
+impl Confidence {
+    /// The 2-bit numeric level (`Low`=1, `Medium`=2, `High`=3).
+    fn level(self) -> u16 {
+        match self {
+            Confidence::Low => 1,
+            Confidence::Medium => 2,
+            Confidence::High => 3,
+        }
+    }
+}
+
+/// A bitmask over the single-bit flags of a Landsat Collection-2 `QA_PIXEL`
+/// band (bits 0–7). Combine flags with `|`.
+///
+/// Bit layout (USGS C2): 0 fill, 1 dilated cloud, 2 cirrus, 3 cloud,
+/// 4 cloud shadow, 5 snow, 6 clear, 7 water.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QaFlags(pub u16);
+
+impl QaFlags {
+    pub const FILL: u16 = 1 << 0;
+    pub const DILATED_CLOUD: u16 = 1 << 1;
+    pub const CIRRUS: u16 = 1 << 2;
+    pub const CLOUD: u16 = 1 << 3;
+    pub const CLOUD_SHADOW: u16 = 1 << 4;
+    pub const SNOW: u16 = 1 << 5;
+    pub const CLEAR: u16 = 1 << 6;
+    pub const WATER: u16 = 1 << 7;
+
+    /// USGS-typical rejection: fill | dilated cloud | cirrus | cloud | cloud
+    /// shadow (keeps clear land, water and snow).
+    pub fn default_reject() -> Self {
+        QaFlags(Self::FILL | Self::DILATED_CLOUD | Self::CIRRUS | Self::CLOUD | Self::CLOUD_SHADOW)
+    }
+
+    /// The raw bitmask.
+    pub fn bits(self) -> u16 {
+        self.0
+    }
+}
+
 /// Per-pixel quality masking applied to every scene before grid alignment.
 ///
-/// The mask asset (e.g. the Sentinel-2 `SCL` scene-classification band) is
-/// read with the same window as the data assets, resampled to each band's
-/// grid, and every pixel whose class is **not** in [`keep`] becomes `NaN`.
-/// Masking happens before the (NaN-tolerant) resampling to the reference
-/// grid, so cloudy values never bleed into their neighbours.
+/// The mask asset is read with the same window as the data assets, resampled
+/// (nearest, categorical) to each band's grid, and every rejected pixel
+/// becomes `NaN`. Masking happens before the (NaN-tolerant) resampling to the
+/// reference grid, so rejected values never bleed into their neighbours.
 ///
-/// [`keep`]: MaskConfig::keep
+/// Two decoding modes cover the two dominant ARD sources:
+/// - [`MaskConfig::Scl`] — Sentinel-2 L2A categorical scene classification.
+/// - [`MaskConfig::QaBits`] — Landsat Collection-2 `QA_PIXEL` bitmask.
 #[derive(Debug, Clone)]
-pub struct MaskConfig {
-    /// Asset key of the quality band, e.g. `"SCL"`.
-    pub asset: String,
-    /// Class values to keep; every other class (and mask nodata) → `NaN`.
-    pub keep: Vec<u16>,
-    /// How the mask is aligned to each band's grid. Class bands are
-    /// categorical, so this should stay [`ResampleMethod::NearestNeighbor`].
-    pub resample: ResampleMethod,
+pub enum MaskConfig {
+    /// Categorical scene-classification mask (Sentinel-2 `SCL`): keep the
+    /// listed class values, mask every other class (and mask nodata/NaN).
+    Scl {
+        /// Asset key of the class band, e.g. `"SCL"`.
+        asset: String,
+        /// Class values to keep.
+        keep: Vec<u16>,
+        /// Alignment to each band's grid (keep [`ResampleMethod::NearestNeighbor`]).
+        resample: ResampleMethod,
+    },
+    /// Bit-packed QA mask (Landsat C2 `QA_PIXEL`): reject a pixel if it sets
+    /// any bit in `reject`, or — when `min_confidence` is set — if its cloud
+    /// confidence (bits 8–9) reaches that level.
+    QaBits {
+        /// Asset key of the QA band, e.g. `"QA_PIXEL"` (`"qa_pixel"` on the
+        /// Planetary Computer collection).
+        asset: String,
+        /// Single-bit flags whose presence rejects the pixel.
+        reject: QaFlags,
+        /// If set, also reject pixels whose cloud-confidence field is at or
+        /// above this level.
+        min_confidence: Option<Confidence>,
+        /// Alignment to each band's grid (keep [`ResampleMethod::NearestNeighbor`]).
+        resample: ResampleMethod,
+    },
 }
 
 impl MaskConfig {
     /// Sentinel-2 L2A scene classification mask keeping vegetation (4),
     /// bare soil (5), water (6), unclassified (7) and snow/ice (11).
     pub fn scl() -> Self {
-        Self {
+        MaskConfig::Scl {
             asset: "SCL".to_string(),
             keep: vec![4, 5, 6, 7, 11],
             resample: ResampleMethod::NearestNeighbor,
+        }
+    }
+
+    /// Landsat Collection-2 Level-2 `QA_PIXEL` mask with the USGS-typical
+    /// rejection ([`QaFlags::default_reject`]) and no confidence threshold.
+    pub fn qa_pixel() -> Self {
+        MaskConfig::QaBits {
+            asset: "QA_PIXEL".to_string(),
+            reject: QaFlags::default_reject(),
+            min_confidence: None,
+            resample: ResampleMethod::NearestNeighbor,
+        }
+    }
+
+    /// The default mask for a collection id: SCL for Sentinel-2, QA_PIXEL for
+    /// Landsat, `None` otherwise (used by the CLI/Python `mask=auto` mode).
+    pub fn for_collection(collection: &str) -> Option<Self> {
+        let c = collection.to_ascii_lowercase();
+        if c.contains("sentinel-2") || c.contains("sentinel2") {
+            Some(Self::scl())
+        } else if c.contains("landsat") {
+            Some(Self::qa_pixel())
+        } else {
+            None
+        }
+    }
+
+    /// Asset key of the quality band.
+    pub fn asset(&self) -> &str {
+        match self {
+            MaskConfig::Scl { asset, .. } | MaskConfig::QaBits { asset, .. } => asset,
+        }
+    }
+
+    /// How the mask is aligned to each band's grid.
+    pub fn resample(&self) -> ResampleMethod {
+        match self {
+            MaskConfig::Scl { resample, .. } | MaskConfig::QaBits { resample, .. } => *resample,
+        }
+    }
+
+    /// Whether a pixel with raw mask value `raw` should be kept (non-finite
+    /// mask values are always rejected).
+    fn keep_pixel(&self, raw: f64) -> bool {
+        if !raw.is_finite() {
+            return false;
+        }
+        match self {
+            MaskConfig::Scl { keep, .. } => keep.contains(&(raw as u16)),
+            MaskConfig::QaBits {
+                reject,
+                min_confidence,
+                ..
+            } => {
+                let q = raw as u16;
+                if q & reject.bits() != 0 {
+                    return false;
+                }
+                if let Some(min) = min_confidence {
+                    // cloud confidence is the 2-bit field at bits 8–9.
+                    let cloud_conf = (q >> 8) & 0b11;
+                    if cloud_conf >= min.level() {
+                        return false;
+                    }
+                }
+                true
+            }
         }
     }
 }
@@ -229,10 +365,12 @@ impl StackConfig {
             return Err(StackError::Config("datetime range is required".into()));
         }
         if let Some(mask) = &self.mask {
-            if mask.asset.is_empty() {
+            if mask.asset().is_empty() {
                 return Err(StackError::Config("mask asset key is empty".into()));
             }
-            if mask.keep.is_empty() {
+            if let MaskConfig::Scl { keep, .. } = mask
+                && keep.is_empty()
+            {
                 return Err(StackError::Config(
                     "mask keep-list is empty (every pixel would be masked)".into(),
                 ));
@@ -603,7 +741,7 @@ fn read_scene(
                 client,
                 item,
                 collection,
-                &mc.asset,
+                mc.asset(),
                 cfg,
                 wgs_bbox,
                 needs_signing,
@@ -682,9 +820,10 @@ fn read_asset(
     Ok(reader.read_bbox(&read_bbox, cfg.overview)?)
 }
 
-/// Masks `band` in place: pixels whose mask class is not in the keep-list
-/// become `NaN`. The mask is aligned to the band's grid first (nearest
-/// neighbour for categorical bands); mask nodata/NaN also masks the pixel.
+/// Masks `band` in place: pixels the mask rejects (SCL class not kept, or a
+/// QA_PIXEL reject bit / confidence threshold) become `NaN`. The mask is
+/// aligned to the band's grid first (nearest neighbour for categorical bands);
+/// mask nodata/NaN also masks the pixel.
 fn apply_mask(
     band: &mut Raster<f64>,
     mask: &Raster<f64>,
@@ -692,14 +831,13 @@ fn apply_mask(
 ) -> Result<(), StackError> {
     let aligned;
     let mask = if needs_resample(mask, band) {
-        aligned = resample_to_grid(mask, band, cfg.resample)?;
+        aligned = resample_to_grid(mask, band, cfg.resample())?;
         &aligned
     } else {
         mask
     };
-    let keep = &cfg.keep;
-    band.data_mut().zip_mut_with(mask.data(), |v, &class| {
-        if !(class.is_finite() && keep.contains(&(class as u16))) {
+    band.data_mut().zip_mut_with(mask.data(), |v, &raw| {
+        if !cfg.keep_pixel(raw) {
             *v = f64::NAN;
         }
     });
@@ -931,10 +1069,12 @@ mod tests {
                 .datetime("2024-01-01/2024-12-31")
         };
         assert!(ok().mask(MaskConfig::scl()).validate().is_ok());
+        assert!(ok().mask(MaskConfig::qa_pixel()).validate().is_ok());
 
-        let empty_keep = MaskConfig {
+        let empty_keep = MaskConfig::Scl {
+            asset: "SCL".into(),
             keep: vec![],
-            ..MaskConfig::scl()
+            resample: ResampleMethod::NearestNeighbor,
         };
         assert!(matches!(
             ok().mask(empty_keep).validate(),
@@ -1000,6 +1140,70 @@ mod tests {
                 assert_eq!(d[[r, c]].is_nan(), !clear, "pixel ({r},{c})");
             }
         }
+    }
+
+    #[test]
+    fn qa_pixel_decodes_canonical_usgs_values() {
+        // Canonical Landsat C2 QA_PIXEL values (USGS) with the default
+        // rejection (fill|dilated|cirrus|cloud|cloud shadow).
+        let qa = MaskConfig::qa_pixel();
+        assert!(qa.keep_pixel(21824.0), "21824 = clear land → keep");
+        assert!(qa.keep_pixel(21952.0), "21952 = clear water → keep");
+        assert!(!qa.keep_pixel(22280.0), "22280 = cloud → reject");
+        assert!(!qa.keep_pixel(23888.0), "23888 = cloud shadow → reject");
+        assert!(!qa.keep_pixel(1.0), "1 = fill → reject");
+        assert!(!qa.keep_pixel(f64::NAN), "non-finite mask → reject");
+    }
+
+    #[test]
+    fn qa_pixel_confidence_threshold() {
+        // A clear pixel (bit 6) with high cloud confidence (bits 8–9 = 0b11).
+        let value = f64::from(QaFlags::CLEAR | (0b11 << 8)); // 0x40 | 0x300 = 832
+        let no_conf = MaskConfig::qa_pixel();
+        assert!(no_conf.keep_pixel(value), "no confidence threshold → keep");
+        let strict = MaskConfig::QaBits {
+            asset: "QA_PIXEL".into(),
+            reject: QaFlags::default_reject(),
+            min_confidence: Some(Confidence::High),
+            resample: ResampleMethod::NearestNeighbor,
+        };
+        assert!(!strict.keep_pixel(value), "high cloud confidence → reject");
+    }
+
+    #[test]
+    fn mask_for_collection_auto_selects() {
+        assert!(matches!(
+            MaskConfig::for_collection("sentinel-2-l2a"),
+            Some(MaskConfig::Scl { .. })
+        ));
+        assert!(matches!(
+            MaskConfig::for_collection("landsat-c2-l2"),
+            Some(MaskConfig::QaBits { .. })
+        ));
+        assert!(MaskConfig::for_collection("modis-13Q1").is_none());
+    }
+
+    #[test]
+    fn qa_bits_mask_application() {
+        // 2x2 band, mask holds clear/cloud/fill/water → cloud & fill rejected.
+        let mut band = raster_at(
+            Array2::from_shape_vec((2, 2), vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
+            0.0,
+            20.0,
+            10.0,
+        );
+        let mask = raster_at(
+            Array2::from_shape_vec((2, 2), vec![21824.0, 22280.0, 1.0, 21952.0]).unwrap(),
+            0.0,
+            20.0,
+            10.0,
+        );
+        apply_mask(&mut band, &mask, &MaskConfig::qa_pixel()).unwrap();
+        let d = band.data();
+        assert_eq!(d[[0, 0]], 1.0); // clear kept
+        assert!(d[[0, 1]].is_nan()); // cloud masked
+        assert!(d[[1, 0]].is_nan()); // fill masked
+        assert_eq!(d[[1, 1]], 4.0); // water kept
     }
 
     #[test]

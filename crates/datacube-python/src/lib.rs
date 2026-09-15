@@ -408,6 +408,106 @@ impl PyCube {
                 .map_err(err)?,
         })
     }
+
+    /// Reduce each polygon of a vector layer (`.shp`/`.geojson`) to a tidy
+    /// table, returned as a dict of equal-length columns (feed straight to
+    /// `pandas.DataFrame`): `polygon_id`, `time`, `band`, `reducer`, `value`,
+    /// `n_valid`, `n_total`.
+    ///
+    /// `reducer`: mean|median|min|max|std|sum|count|fraction_above (the last
+    /// needs `threshold`). `inclusion`: center|all_touched|area_fraction.
+    /// `window`: same_time|monthly|yearly|period:<w>. `source_epsg` overrides
+    /// the vector's declared CRS. The cube must carry a georeference.
+    /// (Only available when built with the `stac` feature.)
+    #[cfg(feature = "stac")]
+    #[pyo3(signature = (vector_path, id_field, reducer="mean", inclusion="center",
+                        window="same_time", source_epsg=None, threshold=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn zonal<'py>(
+        &self,
+        py: Python<'py>,
+        vector_path: &str,
+        id_field: &str,
+        reducer: &str,
+        inclusion: &str,
+        window: &str,
+        source_epsg: Option<u32>,
+        threshold: Option<f64>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        use datacube_io::{PixelInclusion, Reducer, ZonalConfig, read_zones, zonal_reduce};
+
+        let incl = match inclusion {
+            "center" => PixelInclusion::Center,
+            "all_touched" => PixelInclusion::AllTouched,
+            "area_fraction" => PixelInclusion::AreaFraction,
+            other => return Err(PyValueError::new_err(format!("bad inclusion '{other}'"))),
+        };
+        let red = match reducer {
+            "mean" => Reducer::Mean,
+            "median" => Reducer::Median,
+            "min" => Reducer::Min,
+            "max" => Reducer::Max,
+            "std" => Reducer::Std,
+            "sum" => Reducer::Sum,
+            "count" => Reducer::Count,
+            "fraction_above" => Reducer::FractionAbove(threshold.ok_or_else(|| {
+                PyValueError::new_err("reducer 'fraction_above' needs a threshold")
+            })?),
+            other => return Err(PyValueError::new_err(format!("bad reducer '{other}'"))),
+        };
+        let cfg = ZonalConfig::new(id_field, incl, red)
+            .window(parse_window(window)?)
+            .source_epsg(source_epsg);
+
+        let features = read_zones(std::path::Path::new(vector_path)).map_err(err)?;
+        let inner = &self.inner;
+        let table = py
+            .detach(|| zonal_reduce(inner, &features, &cfg))
+            .map_err(err)?;
+
+        let d = PyDict::new(py);
+        d.set_item(
+            "polygon_id",
+            table
+                .rows
+                .iter()
+                .map(|r| r.polygon_id.clone())
+                .collect::<Vec<_>>(),
+        )?;
+        d.set_item(
+            "time",
+            table.rows.iter().map(|r| r.time).collect::<Vec<f64>>(),
+        )?;
+        d.set_item(
+            "band",
+            table
+                .rows
+                .iter()
+                .map(|r| r.band.clone())
+                .collect::<Vec<_>>(),
+        )?;
+        d.set_item(
+            "reducer",
+            table
+                .rows
+                .iter()
+                .map(|r| r.reducer.to_string())
+                .collect::<Vec<_>>(),
+        )?;
+        d.set_item(
+            "value",
+            table.rows.iter().map(|r| r.value).collect::<Vec<f64>>(),
+        )?;
+        d.set_item(
+            "n_valid",
+            table.rows.iter().map(|r| r.n_valid).collect::<Vec<u64>>(),
+        )?;
+        d.set_item(
+            "n_total",
+            table.rows.iter().map(|r| r.n_total).collect::<Vec<u64>>(),
+        )?;
+        Ok(d)
+    }
 }
 
 /// Searches a STAC catalog and stacks the matching scenes into a [`Cube`]
@@ -427,7 +527,8 @@ impl PyCube {
     catalog, collection, assets, bbox, datetime,
     max_cloud_cover=None, max_items=100, overview=None,
     scale=1.0, offset=0.0, cross_zone_mosaic=true, concurrency=8,
-    mask_scl=false, mask_asset="SCL", mask_keep=vec![4, 5, 6, 7, 11],
+    mask=None, mask_scl=false, mask_asset=None, mask_keep=vec![4, 5, 6, 7, 11],
+    qa_reject_bits=None, qa_min_confidence=None,
     grid_epsg=None, grid_res=None, grid_bbox=None, grid_align=None,
 ))]
 #[allow(clippy::too_many_arguments)]
@@ -445,9 +546,12 @@ fn stack<'py>(
     offset: f64,
     cross_zone_mosaic: bool,
     concurrency: usize,
+    mask: Option<&str>,
     mask_scl: bool,
-    mask_asset: &str,
+    mask_asset: Option<&str>,
     mask_keep: Vec<u16>,
+    qa_reject_bits: Option<Vec<String>>,
+    qa_min_confidence: Option<&str>,
     grid_epsg: Option<u32>,
     grid_res: Option<f64>,
     grid_bbox: Option<[f64; 4]>,
@@ -466,12 +570,19 @@ fn stack<'py>(
     if let Some(pct) = max_cloud_cover {
         cfg = cfg.max_cloud_cover(pct);
     }
-    if mask_scl {
-        cfg = cfg.mask(datacube_io::MaskConfig {
-            asset: mask_asset.to_string(),
-            keep: mask_keep,
-            resample: surtgis_core::ResampleMethod::NearestNeighbor,
-        });
+    // `mask` ("scl" | "qa_pixel" | "auto") wins; `mask_scl=True` is the legacy
+    // alias for `mask="scl"`.
+    let mask_kind = mask.or(if mask_scl { Some("scl") } else { None });
+    if let Some(kind) = mask_kind {
+        let mc = build_mask_py(
+            kind,
+            collection,
+            mask_asset,
+            mask_keep,
+            qa_reject_bits,
+            qa_min_confidence,
+        )?;
+        cfg = cfg.mask(mc);
     }
     if let (Some(epsg), Some(res)) = (grid_epsg, grid_res) {
         let mut grid = datacube_io::GridSpec::new(epsg, res);
@@ -508,6 +619,103 @@ fn stack<'py>(
     d.set_item("scenes", scenes)?;
     d.set_item("skipped", stacked.skipped)?;
     Ok(d)
+}
+
+/// Resolves the Python masking kwargs into a [`datacube_io::MaskConfig`].
+#[cfg(feature = "stac")]
+fn build_mask_py(
+    kind: &str,
+    collection: &str,
+    asset: Option<&str>,
+    keep: Vec<u16>,
+    qa_reject_bits: Option<Vec<String>>,
+    qa_min_confidence: Option<&str>,
+) -> PyResult<datacube_io::MaskConfig> {
+    use datacube_io::MaskConfig;
+    let nn = surtgis_core::ResampleMethod::NearestNeighbor;
+    let mask = match kind.to_ascii_lowercase().as_str() {
+        "scl" => MaskConfig::Scl {
+            asset: asset.unwrap_or("SCL").to_string(),
+            keep,
+            resample: nn,
+        },
+        "qa_pixel" | "qa-pixel" => MaskConfig::QaBits {
+            asset: asset.unwrap_or("QA_PIXEL").to_string(),
+            reject: parse_qa_flags(qa_reject_bits.as_deref())?,
+            min_confidence: parse_confidence(qa_min_confidence)?,
+            resample: nn,
+        },
+        "auto" => {
+            let mut m = MaskConfig::for_collection(collection).ok_or_else(|| {
+                PyValueError::new_err(format!("mask='auto' has no default for '{collection}'"))
+            })?;
+            if let Some(a) = asset {
+                match &mut m {
+                    MaskConfig::Scl { asset, .. } | MaskConfig::QaBits { asset, .. } => {
+                        *asset = a.to_string();
+                    }
+                }
+            }
+            m
+        }
+        other => return Err(PyValueError::new_err(format!("unknown mask '{other}'"))),
+    };
+    Ok(mask)
+}
+
+#[cfg(feature = "stac")]
+fn parse_qa_flags(names: Option<&[String]>) -> PyResult<datacube_io::QaFlags> {
+    use datacube_io::QaFlags;
+    let Some(names) = names else {
+        return Ok(QaFlags::default_reject());
+    };
+    let mut bits = 0u16;
+    for name in names {
+        bits |= match name.trim().to_ascii_lowercase().as_str() {
+            "fill" => QaFlags::FILL,
+            "dilated-cloud" | "dilated_cloud" => QaFlags::DILATED_CLOUD,
+            "cirrus" => QaFlags::CIRRUS,
+            "cloud" => QaFlags::CLOUD,
+            "cloud-shadow" | "cloud_shadow" => QaFlags::CLOUD_SHADOW,
+            "snow" => QaFlags::SNOW,
+            "clear" => QaFlags::CLEAR,
+            "water" => QaFlags::WATER,
+            other => return Err(PyValueError::new_err(format!("unknown QA flag '{other}'"))),
+        };
+    }
+    Ok(QaFlags(bits))
+}
+
+#[cfg(feature = "stac")]
+fn parse_confidence(level: Option<&str>) -> PyResult<Option<datacube_io::Confidence>> {
+    use datacube_io::Confidence;
+    match level {
+        None => Ok(None),
+        Some(s) => match s.to_ascii_lowercase().as_str() {
+            "low" => Ok(Some(Confidence::Low)),
+            "medium" => Ok(Some(Confidence::Medium)),
+            "high" => Ok(Some(Confidence::High)),
+            other => Err(PyValueError::new_err(format!(
+                "unknown confidence '{other}'"
+            ))),
+        },
+    }
+}
+
+/// Maps a window string ("same_time" | "monthly" | "yearly" | "period:<w>")
+/// to a [`CompositeWindow`].
+#[cfg(feature = "stac")]
+fn parse_window(window: &str) -> PyResult<CompositeWindow> {
+    match window {
+        "same_time" => Ok(CompositeWindow::SameTime),
+        "monthly" => Ok(CompositeWindow::CalendarMonth),
+        "yearly" => Ok(CompositeWindow::CalendarYear),
+        other => other
+            .strip_prefix("period:")
+            .and_then(|w| w.parse::<f64>().ok())
+            .map(CompositeWindow::Period)
+            .ok_or_else(|| PyValueError::new_err(format!("bad window '{other}'"))),
+    }
 }
 
 #[pymodule]

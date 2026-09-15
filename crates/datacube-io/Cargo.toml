@@ -12,9 +12,21 @@ datacube-core = { workspace = true }
 ndarray = { workspace = true }
 rayon = { workspace = true }
 thiserror = { workspace = true }
-surtgis-core = { workspace = true }
+# `shapefile` enables .shp reading in surtgis-core::vector (GeoJSON needs no
+# feature); `geo`/`geo-types` are re-exported by surtgis-core, so zonal
+# aggregation reuses them via `surtgis_core::{geo, geo_types}` without a
+# direct dependency (keeps a single geo version in the graph).
+surtgis-core = { workspace = true, features = ["shapefile"] }
 surtgis-cloud = { workspace = true, features = ["native"] }
+serde_json = { workspace = true }
+# Parquet output for zonal tables (opt-in). Same pin/features as surtgis-core's
+# geoparquet, so no duplicate `parquet` in the graph; arrow is NOT pulled in.
+parquet = { version = "59", default-features = false, features = ["snap"], optional = true }
+
+[features]
+# `ZonalTable::write_parquet` — Parquet output for zonal tables. Off by
+# default so the default build stays light (no parquet/thrift dependency).
+parquet = ["dep:parquet"]
 
 [dev-dependencies]
 approx = { workspace = true }
-serde_json = { workspace = true }

@@ -164,6 +164,26 @@ pub(crate) fn composite_time_axis(
     Ok(group_means(time, &groups))
 }
 
+/// Groups time-slice indices into the bins [`Cube::composite`] would use for
+/// `window`, in ascending time order (each inner `Vec` holds the indices of
+/// one bin). The paired representative time coordinate of a bin is the mean
+/// of its member times — see [`bin_time`].
+///
+/// Exposed so consumers that aggregate over the *same* temporal windows as
+/// `composite` — e.g. the zonal statistics in `datacube-io`, which pool pixel
+/// values across every slice in a bin — share its binning exactly instead of
+/// re-deriving calendar arithmetic. Requires an ascending time axis, and
+/// (for calendar/period windows) finite time coordinates.
+pub fn time_bins(time: &[f64], window: CompositeWindow) -> Result<Vec<Vec<usize>>, CubeError> {
+    group_times(time, window)
+}
+
+/// The representative time coordinate of a bin (the mean of its member
+/// times), matching the composite time axis. `indices` must be non-empty.
+pub fn bin_time(time: &[f64], indices: &[usize]) -> f64 {
+    indices.iter().map(|&i| time[i]).sum::<f64>() / indices.len() as f64
+}
+
 /// Groups time indices according to the window; groups preserve time order.
 fn group_times(time: &[f64], window: CompositeWindow) -> Result<Vec<Vec<usize>>, CubeError> {
     if time.windows(2).any(|w| w[1] < w[0]) {
@@ -452,6 +472,18 @@ mod tests {
         assert!(d[[0, 0, 0, 4]].is_nan()); // gap of 3.0 > max stays
         assert!(d[[0, 0, 0, 5]].is_nan());
         assert!(d[[0, 0, 0, 7]].is_nan()); // trailing edge untouched
+    }
+
+    #[test]
+    fn time_bins_expose_composite_grouping() {
+        // two obs in 2023, one in 2024 → yearly bins [[0,1],[2]]
+        let times = [fy(2023, 5, 0.0), fy(2023, 200, 0.0), fy(2024, 5, 0.0)];
+        let bins = time_bins(&times, CompositeWindow::CalendarYear).unwrap();
+        assert_eq!(bins, vec![vec![0, 1], vec![2]]);
+        // bin_time is the mean of member times, matching the composite axis
+        let axis = composite_time_axis(&times, CompositeWindow::CalendarYear).unwrap();
+        assert_abs_diff_eq!(bin_time(&times, &bins[0]), axis[0], epsilon = 1e-12);
+        assert_abs_diff_eq!(bin_time(&times, &bins[1]), axis[1], epsilon = 1e-12);
     }
 
     #[test]

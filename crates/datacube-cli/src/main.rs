@@ -7,6 +7,8 @@ use datacube_core::stats;
 
 #[cfg(feature = "stac")]
 mod stack_cmd;
+#[cfg(feature = "stac")]
+mod zonal_cmd;
 
 #[derive(Parser)]
 #[command(
@@ -68,6 +70,11 @@ enum Command {
     /// (requires building with `--features stac`).
     #[cfg(feature = "stac")]
     Stack(Box<stack_cmd::StackArgs>),
+    /// Zonal statistics of a temporal cube by polygon: reduce each polygon of
+    /// a vector layer to a tidy `(polygon_id, time, band, reducer, value,
+    /// n_valid, n_total)` table (requires building with `--features stac`).
+    #[cfg(feature = "stac")]
+    Zonal(Box<zonal_cmd::ZonalArgs>),
 }
 
 fn main() -> Result<()> {
@@ -88,6 +95,8 @@ fn main() -> Result<()> {
         } => breaks(&input, alpha, harmonics, period, min_segment),
         #[cfg(feature = "stac")]
         Command::Stack(args) => stack_cmd::run(&args),
+        #[cfg(feature = "stac")]
+        Command::Zonal(args) => zonal_cmd::run(&args),
     }
 }
 

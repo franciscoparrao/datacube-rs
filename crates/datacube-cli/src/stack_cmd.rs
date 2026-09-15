@@ -7,14 +7,17 @@ use datacube_core::{
     ChunkPipeline, ChunkResult, CompositeMethod, CompositeWindow, Cube, GapfillSpec, GeoRef,
     IndexSpec, StatSpec, TrendMethod, stats::BreakOptions,
 };
-use datacube_io::{GridSpec, MaskConfig, StackConfig, StackedCube, stack};
+use datacube_io::{Confidence, GridSpec, MaskConfig, QaFlags, StackConfig, StackedCube, stack};
 use datacube_zarr::ZarrCubeWriter;
 use ndarray::{Array2, s};
 use surtgis_core::io::write_geotiff;
 use surtgis_core::{CRS, GeoTransform, Raster};
 
+/// Cube-ingestion flags shared by `datacube stack` and `datacube zonal`
+/// (STAC search, masking, target grid, composite/gapfill/index). The
+/// analysis-output flags live on [`StackArgs`].
 #[derive(clap::Args)]
-pub struct StackArgs {
+pub struct StackSourceArgs {
     /// STAC catalog: "pc" (Planetary Computer), "es" (Earth Search) or a URL
     #[arg(long, default_value = "pc")]
     catalog: String,
@@ -29,7 +32,7 @@ pub struct StackArgs {
     bbox: Vec<f64>,
     /// Datetime range, e.g. 2023-01-01/2024-12-31
     #[arg(long)]
-    datetime: String,
+    datetime: Option<String>,
     /// Skip scenes with eo:cloud_cover above this percentage
     #[arg(long)]
     max_cloud: Option<f64>,
@@ -54,16 +57,29 @@ pub struct StackArgs {
     /// stacks, within the catalog's rate limits)
     #[arg(long, default_value_t = 8)]
     concurrency: usize,
-    /// Mask pixels per scene with the S2 SCL band, keeping only clear classes
-    /// (vegetation, bare, water, unclassified, snow); see --mask-asset/--mask-keep
+    /// Per-scene quality masking mode: `scl` (Sentinel-2 SCL classes),
+    /// `qa-pixel` (Landsat C2 QA_PIXEL bitmask) or `auto` (pick by collection:
+    /// Sentinel-2 → SCL, Landsat → QA_PIXEL). Omit for no masking.
+    #[arg(long, value_enum)]
+    mask: Option<MaskKind>,
+    /// Deprecated alias for `--mask scl`.
     #[arg(long)]
     mask_scl: bool,
-    /// Quality-band asset key for --mask-scl
-    #[arg(long, default_value = "SCL")]
-    mask_asset: String,
-    /// Comma-separated class values kept by --mask-scl
+    /// Quality-band asset key (default: SCL for scl, QA_PIXEL for qa-pixel)
+    #[arg(long)]
+    mask_asset: Option<String>,
+    /// Comma-separated SCL class values to keep (scl mode)
     #[arg(long, value_delimiter = ',', default_values_t = [4u16, 5, 6, 7, 11])]
     mask_keep: Vec<u16>,
+    /// Comma-separated QA_PIXEL flags to reject (qa-pixel mode); names:
+    /// fill, dilated-cloud, cirrus, cloud, cloud-shadow, snow, clear, water.
+    /// Default: fill,dilated-cloud,cirrus,cloud,cloud-shadow.
+    #[arg(long, value_delimiter = ',')]
+    qa_reject_bits: Option<Vec<String>>,
+    /// Reject QA_PIXEL pixels whose cloud confidence reaches this level
+    /// (qa-pixel mode): low, medium or high.
+    #[arg(long, value_enum)]
+    qa_min_confidence: Option<ConfidenceArg>,
     /// Explicit target grid EPSG (requires --grid-res); the cube grid then no
     /// longer depends on which scene is read first
     #[arg(long)]
@@ -112,6 +128,14 @@ pub struct StackArgs {
     /// Soil-brightness factor L for --index savi
     #[arg(long, default_value_t = 0.5)]
     savi_l: f64,
+}
+
+/// `datacube stack`: cube ingestion plus per-pixel trend/break analysis and
+/// optional GeoZarr output.
+#[derive(clap::Args)]
+pub struct StackArgs {
+    #[command(flatten)]
+    source: StackSourceArgs,
     /// Band (asset key) for the trend statistic
     #[arg(long)]
     band: Option<String>,
@@ -159,6 +183,33 @@ pub enum TrendStat {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum MaskKind {
+    /// Sentinel-2 SCL scene-classification classes.
+    Scl,
+    /// Landsat Collection-2 QA_PIXEL bitmask.
+    QaPixel,
+    /// Pick by collection (Sentinel-2 → SCL, Landsat → QA_PIXEL).
+    Auto,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ConfidenceArg {
+    Low,
+    Medium,
+    High,
+}
+
+impl From<ConfidenceArg> for Confidence {
+    fn from(c: ConfidenceArg) -> Self {
+        match c {
+            ConfidenceArg::Low => Confidence::Low,
+            ConfidenceArg::Medium => Confidence::Medium,
+            ConfidenceArg::High => Confidence::High,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum IndexKind {
     Ndvi,
     Ndwi,
@@ -186,14 +237,55 @@ pub enum CompositeAgg {
     Max,
 }
 
-pub fn run(args: &StackArgs) -> Result<()> {
+impl StackSourceArgs {
+    /// The collection id (for `--mask auto` and reporting).
+    pub(crate) fn collection(&self) -> &str {
+        &self.collection
+    }
+
+    /// The temporal window for zonal aggregation, from `--composite`
+    /// (`SameTime` when unset — one row per original time slice).
+    pub(crate) fn zonal_window(&self) -> CompositeWindow {
+        match self.composite {
+            None | Some(CompositeKind::SameTime) => CompositeWindow::SameTime,
+            Some(CompositeKind::Monthly) => CompositeWindow::CalendarMonth,
+            Some(CompositeKind::Yearly) => CompositeWindow::CalendarYear,
+        }
+    }
+
+    /// A `composite = None` transform pipeline (gapfill + spectral index) used
+    /// to prepare a cube before zonal aggregation, which does its own temporal
+    /// pooling via [`StackSourceArgs::zonal_window`].
+    pub(crate) fn zonal_transform(&self) -> ChunkPipeline {
+        ChunkPipeline {
+            composite: None,
+            gapfill: self.gapfill.map(|mg| GapfillSpec {
+                max_gap: if mg > 0.0 { Some(mg) } else { None },
+            }),
+            index: self.index.map(|kind| index_spec(kind, self)),
+            stat: StatSpec {
+                band: String::new(),
+                trend: None,
+                breaks: None,
+            },
+        }
+    }
+}
+
+/// Builds a [`StackConfig`] from the shared ingestion flags (used by both
+/// `datacube stack` and `datacube zonal`).
+pub fn build_stack_config(args: &StackSourceArgs) -> Result<StackConfig> {
     if args.bbox.len() != 4 {
         bail!("--bbox needs west,south,east,north");
     }
+    let datetime = args
+        .datetime
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("--datetime is required when stacking"))?;
     let asset_refs: Vec<&str> = args.assets.iter().map(String::as_str).collect();
     let mut cfg = StackConfig::new(&args.catalog, &args.collection, &asset_refs)
         .bbox(args.bbox[0], args.bbox[1], args.bbox[2], args.bbox[3])
-        .datetime(&args.datetime)
+        .datetime(datetime)
         .max_items(args.limit)
         .overview(args.overview)
         .scaling(args.scale, args.offset)
@@ -202,12 +294,8 @@ pub fn run(args: &StackArgs) -> Result<()> {
     if let Some(mc) = args.max_cloud {
         cfg = cfg.max_cloud_cover(mc);
     }
-    if args.mask_scl {
-        cfg = cfg.mask(MaskConfig {
-            asset: args.mask_asset.clone(),
-            keep: args.mask_keep.clone(),
-            ..MaskConfig::scl()
-        });
+    if let Some(mask) = build_mask(args)? {
+        cfg = cfg.mask(mask);
     }
     match (args.grid_epsg, args.grid_res) {
         (Some(epsg), Some(res)) => {
@@ -230,8 +318,85 @@ pub fn run(args: &StackArgs) -> Result<()> {
         }
         _ => bail!("--grid-epsg and --grid-res must be given together"),
     }
+    Ok(cfg)
+}
 
-    eprintln!("searching {} in {} ...", args.collection, args.catalog);
+/// Resolves the masking flags into a [`MaskConfig`], or `None` for no masking.
+/// `--mask` wins; `--mask-scl` is the legacy alias for `--mask scl`.
+fn build_mask(args: &StackSourceArgs) -> Result<Option<MaskConfig>> {
+    let kind = match (args.mask, args.mask_scl) {
+        (Some(k), _) => k,
+        (None, true) => MaskKind::Scl,
+        (None, false) => return Ok(None),
+    };
+    let mask = match kind {
+        MaskKind::Scl => MaskConfig::Scl {
+            asset: args.mask_asset.clone().unwrap_or_else(|| "SCL".to_string()),
+            keep: args.mask_keep.clone(),
+            resample: surtgis_core::ResampleMethod::NearestNeighbor,
+        },
+        MaskKind::QaPixel => MaskConfig::QaBits {
+            asset: args
+                .mask_asset
+                .clone()
+                .unwrap_or_else(|| "QA_PIXEL".to_string()),
+            reject: parse_qa_reject(args.qa_reject_bits.as_deref())?,
+            min_confidence: args.qa_min_confidence.map(Confidence::from),
+            resample: surtgis_core::ResampleMethod::NearestNeighbor,
+        },
+        MaskKind::Auto => {
+            let mut mask = MaskConfig::for_collection(&args.collection).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--mask auto has no default for collection '{}' (use scl or qa-pixel)",
+                    args.collection
+                )
+            })?;
+            // honour an explicit --mask-asset override on top of the auto pick.
+            if let Some(asset) = &args.mask_asset {
+                match &mut mask {
+                    MaskConfig::Scl { asset: a, .. } | MaskConfig::QaBits { asset: a, .. } => {
+                        *a = asset.clone();
+                    }
+                }
+            }
+            mask
+        }
+    };
+    Ok(Some(mask))
+}
+
+/// Parses the `--qa-reject-bits` flag names into a [`QaFlags`] bitmask.
+fn parse_qa_reject(names: Option<&[String]>) -> Result<QaFlags> {
+    let Some(names) = names else {
+        return Ok(QaFlags::default_reject());
+    };
+    let mut bits = 0u16;
+    for name in names {
+        bits |= match name.trim().to_ascii_lowercase().as_str() {
+            "fill" => QaFlags::FILL,
+            "dilated-cloud" | "dilated_cloud" => QaFlags::DILATED_CLOUD,
+            "cirrus" => QaFlags::CIRRUS,
+            "cloud" => QaFlags::CLOUD,
+            "cloud-shadow" | "cloud_shadow" => QaFlags::CLOUD_SHADOW,
+            "snow" => QaFlags::SNOW,
+            "clear" => QaFlags::CLEAR,
+            "water" => QaFlags::WATER,
+            other => bail!(
+                "unknown QA_PIXEL flag '{other}' (valid: fill, dilated-cloud, \
+                 cirrus, cloud, cloud-shadow, snow, clear, water)"
+            ),
+        };
+    }
+    Ok(QaFlags(bits))
+}
+
+pub fn run(args: &StackArgs) -> Result<()> {
+    let cfg = build_stack_config(&args.source)?;
+
+    eprintln!(
+        "searching {} in {} ...",
+        args.source.collection, args.source.catalog
+    );
     // destructure to take ownership of the cube (no full-cube clone); the
     // grid (transform/EPSG) travels with the cube itself as a GeoRef and
     // survives composite/gapfill/index, so it's read back from the cube at
@@ -365,13 +530,14 @@ fn build_pipeline(
     wants_trend: bool,
     wants_breaks: bool,
 ) -> Result<ChunkPipeline> {
-    let composite = args.composite.map(|kind| {
+    let src = &args.source;
+    let composite = src.composite.map(|kind| {
         let window = match kind {
             CompositeKind::SameTime => CompositeWindow::SameTime,
             CompositeKind::Monthly => CompositeWindow::CalendarMonth,
             CompositeKind::Yearly => CompositeWindow::CalendarYear,
         };
-        let method = match args.composite_method {
+        let method = match src.composite_method {
             CompositeAgg::Median => CompositeMethod::Median,
             CompositeAgg::Mean => CompositeMethod::Mean,
             CompositeAgg::Min => CompositeMethod::Min,
@@ -379,13 +545,13 @@ fn build_pipeline(
         };
         (window, method)
     });
-    let gapfill = args.gapfill.map(|mg| GapfillSpec {
+    let gapfill = src.gapfill.map(|mg| GapfillSpec {
         max_gap: if mg > 0.0 { Some(mg) } else { None },
     });
-    let index = args.index.map(|kind| index_spec(kind, args));
+    let index = src.index.map(|kind| index_spec(kind, src));
     let band = match &index {
         Some(spec) => spec.label().to_string(),
-        None => args.band.clone().unwrap_or_else(|| args.assets[0].clone()),
+        None => args.band.clone().unwrap_or_else(|| src.assets[0].clone()),
     };
     let trend = wants_trend.then_some(match args.stat {
         TrendStat::TheilSen => TrendMethod::TheilSenMannKendall,
@@ -412,7 +578,7 @@ fn build_pipeline(
 }
 
 /// Maps `--index` and the `--nir/--red/…` band-role flags to an [`IndexSpec`].
-fn index_spec(kind: IndexKind, args: &StackArgs) -> IndexSpec {
+pub(crate) fn index_spec(kind: IndexKind, args: &StackSourceArgs) -> IndexSpec {
     let (nir, red, green, blue, swir) = (
         args.nir.clone(),
         args.red.clone(),

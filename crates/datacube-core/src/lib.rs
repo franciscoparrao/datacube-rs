@@ -37,4 +37,4 @@ pub use error::CubeError;
 pub use pipeline::{
     ChunkPipeline, ChunkResult, ChunkStat, GapfillSpec, IndexSpec, StatSpec, TrendMethod,
 };
-pub use temporal::{CompositeMethod, CompositeWindow};
+pub use temporal::{CompositeMethod, CompositeWindow, bin_time, time_bins};

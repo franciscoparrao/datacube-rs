@@ -15,6 +15,8 @@ path = "src/main.rs"
 # `datacube stack`: STAC/COG stacking via datacube-io (needs the SurtGIS
 # sibling checkout). Off by default so the CLI builds standalone.
 stac = ["dep:datacube-io", "dep:datacube-zarr", "dep:surtgis-core", "dep:ndarray"]
+# Parquet output for `datacube zonal --format parquet` (implies stac).
+parquet = ["stac", "datacube-io/parquet"]
 
 [dependencies]
 datacube-core = { workspace = true }

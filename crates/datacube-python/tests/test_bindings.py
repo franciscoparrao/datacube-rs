@@ -207,6 +207,63 @@ def test_cube_normalized_difference_generic():
 
 
 @pytest.mark.skipif(
+    not hasattr(dc.Cube, "zonal"),
+    reason="built without the 'stac' feature "
+    "(VIRTUAL_ENV=... maturin develop --release --features stac,extension-module)",
+)
+def test_cube_zonal_over_geojson_square(tmp_path):
+    """Offline zonal: a 4x4 UTM cube + a GeoJSON square → per-polygon mean.
+
+    Values are row*10 + col; a square covering pixel centres of rows/cols 1,2
+    selects {11, 12, 21, 22}, mean 16.5, over 4 pixels.
+    """
+    import json
+
+    ny = nx = 4
+    data = np.zeros((1, ny, nx, 1))
+    for r in range(ny):
+        for c in range(nx):
+            data[0, r, c, 0] = r * 10 + c
+    cube = dc.Cube(data, np.array([2024.0]), ["b1"]).with_georef(
+        epsg=32719, transform=[0.0, 10.0, 0.0, 40.0, 0.0, -10.0]
+    )
+
+    # Square [5,35] x [5,35] in the cube's own CRS (source_epsg overrides the
+    # GeoJSON default of WGS84 so no reprojection is attempted).
+    geojson = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "properties": {"ID": "w1"},
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [
+                        [[5, 5], [35, 5], [35, 35], [5, 35], [5, 5]]
+                    ],
+                },
+            }
+        ],
+    }
+    path = tmp_path / "zones.geojson"
+    path.write_text(json.dumps(geojson))
+
+    table = cube.zonal(
+        str(path),
+        id_field="ID",
+        reducer="mean",
+        inclusion="center",
+        source_epsg=32719,
+    )
+    assert table["polygon_id"] == ["w1"]
+    assert table["band"] == ["b1"]
+    assert table["reducer"] == ["mean"]
+    assert math.isclose(table["value"][0], 16.5, abs_tol=1e-12)
+    assert table["n_valid"] == [4]
+    assert table["n_total"] == [4]
+
+
+@pytest.mark.skipif(
     not hasattr(dc, "stack"),
     reason="built without the 'stac' feature "
     "(VIRTUAL_ENV=... maturin develop --release --features stac,extension-module)",
