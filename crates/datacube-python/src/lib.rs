@@ -115,6 +115,87 @@ fn mann_kendall<'py>(
     Ok(d)
 }
 
+/// Seasonal Mann-Kendall test (Hirsch & Slack 1984), matching
+/// `pymannkendall.seasonal_test` → dict(trend, s, var_s, z, tau, p_value, n).
+#[pyfunction]
+#[pyo3(signature = (y, period=12, alpha=0.05))]
+fn seasonal_mann_kendall<'py>(
+    py: Python<'py>,
+    y: PyReadonlyArray1<'py, f64>,
+    period: usize,
+    alpha: f64,
+) -> PyResult<Bound<'py, PyDict>> {
+    let r = stats::seasonal_mann_kendall(y.as_slice()?, period, alpha).map_err(err)?;
+    mk_dict(py, &r)
+}
+
+/// Modified Mann-Kendall test with the Hamed & Rao (1998) autocorrelation
+/// correction, matching `pymannkendall.hamed_rao_modification_test`. `lag`
+/// limits the number of first lags considered (None = all).
+#[pyfunction]
+#[pyo3(signature = (y, alpha=0.05, lag=None))]
+fn mann_kendall_hamed_rao<'py>(
+    py: Python<'py>,
+    y: PyReadonlyArray1<'py, f64>,
+    alpha: f64,
+    lag: Option<usize>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let r = stats::mann_kendall_hamed_rao(y.as_slice()?, alpha, lag).map_err(err)?;
+    mk_dict(py, &r)
+}
+
+/// Shared dict builder for Mann-Kendall-family results.
+fn mk_dict<'py>(py: Python<'py>, r: &stats::MannKendallResult) -> PyResult<Bound<'py, PyDict>> {
+    let trend = match r.trend {
+        stats::Trend::Increasing => "increasing",
+        stats::Trend::Decreasing => "decreasing",
+        stats::Trend::NoTrend => "no trend",
+    };
+    let d = PyDict::new(py);
+    d.set_item("trend", trend)?;
+    d.set_item("s", r.s)?;
+    d.set_item("var_s", r.var_s)?;
+    d.set_item("z", r.z)?;
+    d.set_item("tau", r.tau)?;
+    d.set_item("p_value", r.p_value)?;
+    d.set_item("n", r.n)?;
+    Ok(d)
+}
+
+/// False-discovery-rate control over a p-value field (Benjamini-Hochberg or
+/// Benjamini-Yekutieli), matching `statsmodels multipletests(method='fdr_bh' |
+/// 'fdr_by')`. `method` is "bh"/"fdr_bh" (default) or "by"/"fdr_by".
+///
+/// Takes a 1-D array of p-values (flatten a map first); non-finite entries are
+/// carried through as `NaN`/not-rejected. Returns dict(rejected: bool array,
+/// adjusted: float array, n_tested, n_significant, threshold).
+#[pyfunction]
+#[pyo3(signature = (pvalues, q=0.05, method="bh"))]
+fn fdr<'py>(
+    py: Python<'py>,
+    pvalues: PyReadonlyArray1<'py, f64>,
+    q: f64,
+    method: &str,
+) -> PyResult<Bound<'py, PyDict>> {
+    let m = match method {
+        "bh" | "fdr_bh" => stats::FdrMethod::BenjaminiHochberg,
+        "by" | "fdr_by" => stats::FdrMethod::BenjaminiYekutieli,
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "unknown FDR method '{other}'"
+            )));
+        }
+    };
+    let r = stats::fdr(pvalues.as_slice()?, q, m).map_err(err)?;
+    let d = PyDict::new(py);
+    d.set_item("rejected", PyArray1::from_vec(py, r.rejected))?;
+    d.set_item("adjusted", PyArray1::from_vec(py, r.adjusted))?;
+    d.set_item("n_tested", r.n_tested)?;
+    d.set_item("n_significant", r.n_significant)?;
+    d.set_item("threshold", r.threshold)?;
+    Ok(d)
+}
+
 /// Harmonic regression with trend → dict(intercept, slope, r_squared, rmse,
 /// n, components=[dict(harmonic, cos_coef, sin_coef, amplitude, phase), ...]).
 #[pyfunction]
@@ -724,6 +805,9 @@ fn datacube_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(linear_trend, m)?)?;
     m.add_function(wrap_pyfunction!(theil_sen, m)?)?;
     m.add_function(wrap_pyfunction!(mann_kendall, m)?)?;
+    m.add_function(wrap_pyfunction!(seasonal_mann_kendall, m)?)?;
+    m.add_function(wrap_pyfunction!(mann_kendall_hamed_rao, m)?)?;
+    m.add_function(wrap_pyfunction!(fdr, m)?)?;
     m.add_function(wrap_pyfunction!(harmonic_regression, m)?)?;
     m.add_function(wrap_pyfunction!(detect_breaks, m)?)?;
     m.add_class::<PyCube>()?;

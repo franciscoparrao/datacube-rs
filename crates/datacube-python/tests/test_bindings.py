@@ -66,6 +66,45 @@ def test_nan_dropped_pairwise():
     assert math.isclose(r["slope"], 2.0, abs_tol=1e-12)
 
 
+def test_seasonal_mann_kendall_removes_cycle():
+    # pure repeating 4-step cycle, no interannual trend → S = 0
+    y = np.tile([1.0, 5.0, 3.0, 8.0], 6)
+    r = dc.seasonal_mann_kendall(y, period=4)
+    assert r["s"] == 0.0
+    assert r["trend"] == "no trend"
+    # period=1 collapses to the plain test
+    y2 = np.array([1.0, 4.0, 2.0, 8.0, 5.0, 7.0, 3.0, 9.0, 6.0, 10.0])
+    assert math.isclose(
+        dc.seasonal_mann_kendall(y2, period=1)["z"], dc.mann_kendall(y2)["z"], abs_tol=1e-12
+    )
+
+
+def test_hamed_rao_inflates_variance_under_autocorrelation():
+    rng = np.random.default_rng(3)
+    ar = np.empty(120)
+    ar[0] = rng.normal()
+    for i in range(1, 120):
+        ar[i] = 0.8 * ar[i - 1] + rng.normal(0, 0.5)
+    plain = dc.mann_kendall(ar)
+    hr = dc.mann_kendall_hamed_rao(ar)
+    assert hr["s"] == plain["s"]
+    assert hr["var_s"] > plain["var_s"]  # correction raises variance
+    # lag=0 → no correction, matches the plain test
+    assert math.isclose(dc.mann_kendall_hamed_rao(ar, lag=0)["var_s"], plain["var_s"], abs_tol=1e-9)
+
+
+def test_fdr_bh_controls_and_carries_nan():
+    p = np.array([0.001, 0.008, 0.02, 0.04, 0.2, 0.5, np.nan, 0.9])
+    r = dc.fdr(p, q=0.05, method="bh")
+    assert r["n_tested"] == 7
+    assert np.isnan(r["adjusted"][6])
+    assert not r["rejected"][6]
+    assert r["n_significant"] == int(np.sum(r["rejected"]))
+    # BY is at least as conservative as BH
+    by = dc.fdr(p, q=0.05, method="by")
+    assert by["n_significant"] <= r["n_significant"]
+
+
 def _ramp_cube():
     # (1 band, 2x2, 5 t); value = t * (1 + y + x), distinct slope per pixel
     nb, ny, nx, nt = 1, 2, 2, 5

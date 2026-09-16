@@ -138,6 +138,13 @@ Documented divergences from the references:
 - `pymannkendall.sens_slope` assumes unit spacing after dropping NaN; we keep
   the true time gaps.
 
+`scripts/validate_mk_corrected.py` cross-checks the seasonal (Hirsch & Slack)
+and autocorrelation-corrected (Hamed & Rao) Mann-Kendall variants against
+`pymannkendall.seasonal_test` / `hamed_rao_modification_test` (90/90 at 1e-9),
+and `scripts/validate_fdr.py` cross-checks the Benjamini-Hochberg / Benjamini-
+Yekutieli false-discovery-rate control against `statsmodels.multipletests`
+(48/48 at 1e-12, including masked-pixel NaN handling).
+
 `scripts/validate_zonal.py` cross-checks zonal aggregation against
 `rasterio.features.geometry_mask` (Center / AllTouched pixel sets, exact) and
 `shapely` intersection areas (AreaFraction weights, `1e-6` relative — geo's
@@ -168,6 +175,12 @@ Needs the `stac`-enabled binding plus `rasterio`/`shapely` in the venv.
   CLI + library + Python)
 - [x] Landsat Collection-2 `QA_PIXEL` bitmask masking, alongside Sentinel-2
   SCL (auto-selected by collection)
+- [x] Autocorrelation-aware trend testing: seasonal Mann-Kendall (Hirsch &
+  Slack) and the Hamed & Rao autocorrelation correction, for the serially
+  correlated, strongly seasonal series satellite records produce
+- [x] False-discovery-rate control (Benjamini-Hochberg / Benjamini-Yekutieli)
+  and Wilks field significance, for interpretable per-pixel / per-polygon
+  significance maps over large fields
 
 ## Performance
 

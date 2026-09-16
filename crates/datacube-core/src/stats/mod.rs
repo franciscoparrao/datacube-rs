@@ -5,6 +5,7 @@
 //! how `pyMannKendall` preprocesses series.
 
 mod breaks;
+mod fdr;
 mod harmonic;
 mod linear;
 mod lstsq;
@@ -13,9 +14,13 @@ pub(crate) mod special;
 mod theil_sen;
 
 pub use breaks::{BreakOptions, BreakPoint, BreakResult, detect_breaks};
+pub use fdr::{FdrMethod, FdrResult, fdr, field_significant};
 pub use harmonic::{HarmonicComponent, HarmonicFit, harmonic_regression};
 pub use linear::{LinearTrend, linear_trend};
-pub use mann_kendall::{MannKendallResult, Trend, mann_kendall, mann_kendall_alpha};
+pub use mann_kendall::{
+    MannKendallResult, Trend, mann_kendall, mann_kendall_alpha, mann_kendall_hamed_rao,
+    seasonal_mann_kendall,
+};
 pub use theil_sen::{TheilSenResult, theil_sen};
 
 use crate::error::CubeError;

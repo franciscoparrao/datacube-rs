@@ -19,3 +19,7 @@ papers/*.pdf
 papers/draft/*.spl
 papers/draft/figures/*.png
 papers/draft/figures/*.npz
+
+# Wetland inventory (MMA) — large input data, not versioned
+inventario-de-humedales_shapefile/
+inventario-de-humedales_shapefile.zip
