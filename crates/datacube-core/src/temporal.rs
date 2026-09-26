@@ -3,7 +3,7 @@
 //! Both operate purely on the public cube API and return new cubes; the
 //! time axis must be sorted ascending (as produced by stacking).
 
-use ndarray::{Array4, Axis};
+use ndarray::{Array4, s};
 use rayon::prelude::*;
 
 use crate::cube::Cube;
@@ -169,16 +169,40 @@ impl Cube {
                 (ob, oy, ox)
             )));
         }
-        // concatenate along the time axis, then reorder slices by ascending time
-        let joined = ndarray::concatenate(Axis(3), &[self.data(), other.data()])
-            .map_err(|e| CubeError::DimensionMismatch(e.to_string()))?;
-        let mut times: Vec<f64> = self.time().to_vec();
-        times.extend_from_slice(other.time());
-        let mut order: Vec<usize> = (0..times.len()).collect();
-        order.sort_by(|&a, &b| times[a].total_cmp(&times[b]));
-        let sorted_times: Vec<f64> = order.iter().map(|&i| times[i]).collect();
-        let data = joined.select(Axis(3), &order);
-        Ok(Cube::new(data, sorted_times, self.bands().to_vec())?.inherit_georef(self))
+        // Single-pass merge: allocate ONE fused array and copy each source time
+        // slice straight into its sorted position. Avoids the intermediate
+        // `concatenate` + `select` (two full-size copies) — peak memory is the
+        // two inputs plus one output, not three arrays. (Bounded ingestion of
+        // the fused record still needs chunked fusion; this only trims the
+        // in-memory join.)
+        let nt_a = self.dims().3;
+        // (time, is_other, source time index), sorted ascending by time
+        let mut plan: Vec<(f64, bool, usize)> = Vec::with_capacity(nt_a + other.dims().3);
+        plan.extend(self.time().iter().map(|&t| (t, false, 0)));
+        plan.extend(other.time().iter().map(|&t| (t, true, 0)));
+        // fill the per-source running index
+        let (mut ia, mut ib) = (0usize, 0usize);
+        for entry in plan.iter_mut() {
+            if entry.1 {
+                entry.2 = ib;
+                ib += 1;
+            } else {
+                entry.2 = ia;
+                ia += 1;
+            }
+        }
+        plan.sort_by(|p, q| p.0.total_cmp(&q.0));
+
+        let nt = plan.len();
+        let times: Vec<f64> = plan.iter().map(|p| p.0).collect();
+        let (a, b) = (self.data(), other.data());
+        let mut out = Array4::<f64>::zeros((nb, ny, nx, nt));
+        for (out_t, &(_, is_other, src_t)) in plan.iter().enumerate() {
+            let src = if is_other { &b } else { &a };
+            out.slice_mut(s![.., .., .., out_t])
+                .assign(&src.slice(s![.., .., .., src_t]));
+        }
+        Ok(Cube::new(out, times, self.bands().to_vec())?.inherit_georef(self))
     }
 }
 
