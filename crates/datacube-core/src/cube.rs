@@ -100,6 +100,24 @@ impl Cube {
         self.georef
     }
 
+    /// Replaces the band labels (consuming, no data copy), keeping data, time
+    /// and georeference. Used to relabel per-sensor asset keys to common role
+    /// names (e.g. Landsat `SR_B3` and Sentinel-2 `B03` both to `green`) so two
+    /// single-sensor cubes can be harmonized and [`concat_time`](Cube::concat_time)-fused.
+    ///
+    /// Errors if `names.len()` differs from the band count.
+    pub fn rename_bands(mut self, names: Vec<String>) -> Result<Self, CubeError> {
+        if names.len() != self.bands.len() {
+            return Err(CubeError::DimensionMismatch(format!(
+                "rename_bands got {} names for {} bands",
+                names.len(),
+                self.bands.len()
+            )));
+        }
+        self.bands = names;
+        Ok(self)
+    }
+
     /// Copies `from`'s georeference onto `self`, if any. Used internally by
     /// operations that preserve the spatial grid (composite, gapfill,
     /// band-math) to propagate it to their output.
@@ -302,6 +320,29 @@ mod tests {
                 index: 2,
                 nbands: 1
             })
+        ));
+    }
+
+    #[test]
+    fn rename_bands_relabels_preserving_data_and_georef() {
+        let geo = GeoRef {
+            epsg: Some(32719),
+            transform: Some([0.0, 10.0, 0.0, 0.0, 0.0, -10.0]),
+        };
+        let cube = ramp_cube(1, 1, 3).with_georef(geo);
+        let orig = cube.data().to_owned();
+        let renamed = cube.rename_bands(vec!["green".into()]).unwrap();
+        assert_eq!(renamed.bands(), ["green"]);
+        assert_eq!(renamed.data().to_owned(), orig);
+        assert_eq!(renamed.georef(), Some(geo));
+    }
+
+    #[test]
+    fn rename_bands_rejects_wrong_count() {
+        let cube = ramp_cube(1, 1, 3);
+        assert!(matches!(
+            cube.rename_bands(vec!["a".into(), "b".into()]),
+            Err(CubeError::DimensionMismatch(_))
         ));
     }
 

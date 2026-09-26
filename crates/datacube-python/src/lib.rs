@@ -519,6 +519,15 @@ impl PyCube {
         })
     }
 
+    /// Relabel the bands (e.g. Landsat `SR_B3` / Sentinel-2 `B03` both to
+    /// `green`) so two single-sensor cubes align for harmonize + concat_time.
+    /// Keeps data, time and georeference.
+    fn rename_bands(&self, names: Vec<String>) -> PyResult<Self> {
+        Ok(Self {
+            inner: self.inner.clone().rename_bands(names).map_err(err)?,
+        })
+    }
+
     /// Reduce each polygon of a vector layer (`.shp`/`.geojson`) to a tidy
     /// table, returned as a dict of equal-length columns (feed straight to
     /// `pandas.DataFrame`): `polygon_id`, `time`, `band`, `reducer`, `value`,
