@@ -349,7 +349,7 @@ impl StackConfig {
         self
     }
 
-    fn validate(&self) -> Result<(), StackError> {
+    pub(crate) fn validate(&self) -> Result<(), StackError> {
         if self.assets.is_empty() {
             return Err(StackError::Config(
                 "at least one asset key is required".into(),
@@ -460,33 +460,9 @@ pub fn stack(cfg: &StackConfig) -> Result<StackedCube, StackError> {
     };
     let client = StacClientBlocking::new(catalog, options)?;
 
-    let [w, s, e, n] = cfg.bbox;
-    let params = StacSearchParams::new()
-        .bbox(w, s, e, n)
-        .datetime(&cfg.datetime)
-        .collections(&[cfg.collection.as_str()]);
-    let mut items = client.search_all(&params)?;
-    if items.is_empty() {
-        return Err(StackError::Empty(format!(
-            "search returned no items for {} in {}",
-            cfg.collection, cfg.datetime
-        )));
-    }
-    // sort by the parsed time coordinate (robust to mixed datetime formats);
-    // items whose datetime cannot be parsed sort first and are skipped below
-    let time_key = |item: &StacItem| {
-        item.properties
-            .datetime
-            .as_deref()
-            .and_then(fractional_year)
-            .unwrap_or(f64::NEG_INFINITY)
-    };
-    items.sort_by(|a, b| time_key(a).total_cmp(&time_key(b)));
-    // some catalogs (Earth Search) repeat items across result pages; a
-    // duplicated scene would otherwise become a duplicated time slice
-    let mut seen_ids = std::collections::HashSet::new();
-    items.retain(|item| seen_ids.insert(item.id.clone()));
+    let items = search_sorted_dedup(&client, cfg)?;
 
+    let [w, s, e, n] = cfg.bbox;
     let wgs_bbox = BBox::new(w, s, e, n);
     let mut skipped = Vec::new();
     // an explicit GridSpec fixes the reference grid up front; otherwise the
@@ -682,7 +658,39 @@ fn compact_time_axis(data: Array4<f64>, slot_ok: &[bool]) -> Array4<f64> {
 /// cross-zone-off EPSG mismatch) decides whether `item` is even worth an I/O
 /// attempt. `Ok` carries the [`SliceMeta`] to use if the read succeeds;
 /// `Err` carries the skip reason (`"<id>: ..."`) to report as-is.
-fn plan_scene(
+/// Searches the catalog and returns items sorted by fractional-year time and
+/// de-duplicated by id (some catalogs repeat items across pages). Shared by
+/// [`stack`] and the chunked stacker.
+pub(crate) fn search_sorted_dedup(
+    client: &StacClientBlocking,
+    cfg: &StackConfig,
+) -> Result<Vec<StacItem>, StackError> {
+    let [w, s, e, n] = cfg.bbox;
+    let params = StacSearchParams::new()
+        .bbox(w, s, e, n)
+        .datetime(&cfg.datetime)
+        .collections(&[cfg.collection.as_str()]);
+    let mut items = client.search_all(&params)?;
+    if items.is_empty() {
+        return Err(StackError::Empty(format!(
+            "search returned no items for {} in {}",
+            cfg.collection, cfg.datetime
+        )));
+    }
+    let time_key = |item: &StacItem| {
+        item.properties
+            .datetime
+            .as_deref()
+            .and_then(fractional_year)
+            .unwrap_or(f64::NEG_INFINITY)
+    };
+    items.sort_by(|a, b| time_key(a).total_cmp(&time_key(b)));
+    let mut seen_ids = std::collections::HashSet::new();
+    items.retain(|item| seen_ids.insert(item.id.clone()));
+    Ok(items)
+}
+
+pub(crate) fn plan_scene(
     item: &StacItem,
     cfg: &StackConfig,
     ref_epsg: Option<u32>,
@@ -719,7 +727,7 @@ fn plan_scene(
 
 /// Reads every requested asset of one item, aligned to the reference grid
 /// (or defining it, for the first scene when no [`GridSpec`] is set).
-fn read_scene(
+pub(crate) fn read_scene(
     client: &StacClientBlocking,
     item: &StacItem,
     cfg: &StackConfig,
@@ -850,7 +858,10 @@ const MAX_GRID_DIM: usize = 100_000;
 
 /// Builds the synthetic reference raster that carries a [`GridSpec`]'s grid
 /// (shape + transform + CRS); its values are never read.
-fn reference_from_grid(spec: &GridSpec, wgs_bbox: &BBox) -> Result<Raster<f64>, StackError> {
+pub(crate) fn reference_from_grid(
+    spec: &GridSpec,
+    wgs_bbox: &BBox,
+) -> Result<Raster<f64>, StackError> {
     let bbox = match spec.bbox {
         Some([min_x, min_y, max_x, max_y]) => BBox::new(min_x, min_y, max_x, max_y),
         None => reproject::reproject_bbox_to_cog(wgs_bbox, spec.epsg),

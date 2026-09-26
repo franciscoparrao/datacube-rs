@@ -28,12 +28,14 @@
 //! ```
 
 mod stack;
+mod stack_chunked;
 mod time;
 mod vector;
 
 pub use stack::{
     Confidence, GridSpec, MaskConfig, QaFlags, SliceMeta, StackConfig, StackedCube, stack,
 };
+pub use stack_chunked::{ChunkPos, ChunkedStack, stack_chunked};
 pub use time::fractional_year;
 pub use vector::{
     PixelInclusion, Reducer, ZonalConfig, ZonalRow, ZonalTable, read_zones, zonal_reduce,
