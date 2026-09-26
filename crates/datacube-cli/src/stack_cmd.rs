@@ -7,9 +7,11 @@ use datacube_core::{
     ChunkPipeline, ChunkResult, CompositeMethod, CompositeWindow, Cube, GapfillSpec, GeoRef,
     IndexSpec, StatSpec, TrendMethod, stats::BreakOptions,
 };
-use datacube_io::{Confidence, GridSpec, MaskConfig, QaFlags, StackConfig, StackedCube, stack};
+use datacube_io::{
+    Confidence, GridSpec, MaskConfig, QaFlags, StackConfig, StackedCube, stack, stack_chunked,
+};
 use datacube_zarr::ZarrCubeWriter;
-use ndarray::{Array2, s};
+use ndarray::{Array2, Array4, s};
 use surtgis_core::io::write_geotiff;
 use surtgis_core::{CRS, GeoTransform, Raster};
 
@@ -128,6 +130,11 @@ pub struct StackSourceArgs {
     /// Soil-brightness factor L for --index savi
     #[arg(long, default_value_t = 0.5)]
     savi_l: f64,
+    /// Bounded-memory chunked ingestion: read the archive one spatial tile at a
+    /// time (peak RAM ~ chunk² × scenes × bands, set by --chunk-size) instead of
+    /// materializing all scenes at once. Requires --grid-epsg/--grid-res.
+    #[arg(long)]
+    chunked_ingest: bool,
 }
 
 /// `datacube stack`: cube ingestion plus per-pixel trend/break analysis and
@@ -391,6 +398,9 @@ fn parse_qa_reject(names: Option<&[String]>) -> Result<QaFlags> {
 }
 
 pub fn run(args: &StackArgs) -> Result<()> {
+    if args.source.chunked_ingest {
+        return run_chunked_ingest(args);
+    }
     let cfg = build_stack_config(&args.source)?;
 
     eprintln!(
@@ -514,6 +524,147 @@ pub fn run(args: &StackArgs) -> Result<()> {
         "bands": out_bands,
         "time_range": [out_time.first(), out_time.last()],
         "epsg": epsg,
+        "maps_written": maps_written,
+    });
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+/// Bounded-memory path: ingest the archive one spatial tile at a time
+/// ([`stack_chunked`]) and run the pipeline per chunk, so peak RAM is one chunk
+/// (not the whole cube). Produces the same trend/break GeoTIFFs and/or GeoZarr
+/// as [`run`], for arbitrarily large areas/records that do not fit in memory.
+fn run_chunked_ingest(args: &StackArgs) -> Result<()> {
+    let cfg = build_stack_config(&args.source)?;
+    if cfg.grid.is_none() {
+        bail!("--chunked-ingest requires an explicit grid (--grid-epsg and --grid-res)");
+    }
+    eprintln!(
+        "searching {} (chunked ingest, chunk {}) ...",
+        args.source.collection, args.chunk_size
+    );
+    let cs = stack_chunked(&cfg, args.chunk_size).context("chunked stacking failed")?;
+    let (nbands, ny, nx, nt) = cs.dims();
+    eprintln!(
+        "planned {} scenes ({} bands, {ny}x{nx} px, {} chunks, ~{:.1} MB/chunk), {} skipped",
+        nt,
+        nbands,
+        cs.chunk_positions().len(),
+        cs.chunk_bytes() as f64 / 1e6,
+        cs.skipped().len(),
+    );
+
+    let wants_trend = args.output.is_some() || args.pvalue_output.is_some();
+    let wants_breaks = args.breaks_output.is_some() || args.first_break_output.is_some();
+    let pipeline = build_pipeline(args, wants_trend, wants_breaks)?;
+
+    // Output shape is known analytically from the fixed grid + time axis.
+    let out_bands: Vec<String> = match &pipeline.index {
+        Some(index) => vec![index.label().to_string()],
+        None => cfg.assets.clone(),
+    };
+    let time_probe = Cube::new(
+        Array4::from_elem((nbands, 1, 1, nt), 0.0),
+        cs.time().to_vec(),
+        cfg.assets.clone(),
+    )?;
+    let out_time = pipeline.output_time(&time_probe)?;
+    let geo = cs.georef();
+    let transform = geo
+        .transform
+        .map(GeoTransform::from_gdal)
+        .unwrap_or_default();
+    let epsg = geo.epsg;
+
+    // Optional per-pixel map accumulators (full extent; small) and Zarr writer.
+    let mut slope = wants_trend.then(|| Array2::from_elem((ny, nx), f64::NAN));
+    let mut pvalue = wants_trend.then(|| Array2::from_elem((ny, nx), f64::NAN));
+    let mut count = wants_breaks.then(|| Array2::from_elem((ny, nx), f64::NAN));
+    let mut first = wants_breaks.then(|| Array2::from_elem((ny, nx), f64::NAN));
+    let writer = args
+        .zarr_output
+        .as_ref()
+        .map(|path| {
+            ZarrCubeWriter::create(
+                path,
+                (out_bands.len(), ny, nx, out_time.len()),
+                &out_bands,
+                &out_time,
+                &geo,
+                Default::default(),
+            )
+            .map_err(|e| anyhow::anyhow!("creating {} failed: {e}", path.display()))
+        })
+        .transpose()?;
+
+    let mut n_read = 0usize;
+    for result in cs.chunks() {
+        let (chunk, pos) = result.context("reading a chunk failed")?;
+        if let Some(writer) = &writer {
+            let processed = pipeline
+                .transform(&chunk)
+                .context("chunk transform failed")?;
+            writer
+                .write_chunk(processed.data(), pos.y0, pos.x0)
+                .map_err(|e| anyhow::anyhow!("writing tile ({},{}) failed: {e}", pos.y0, pos.x0))?;
+        }
+        if wants_trend || wants_breaks {
+            let stat = pipeline.run_on(&chunk).context("chunk statistics failed")?;
+            if let Some((sl, pv)) = stat.trend {
+                slope
+                    .as_mut()
+                    .unwrap()
+                    .slice_mut(s![pos.y0..pos.y0 + pos.height, pos.x0..pos.x0 + pos.width])
+                    .assign(&sl);
+                pvalue
+                    .as_mut()
+                    .unwrap()
+                    .slice_mut(s![pos.y0..pos.y0 + pos.height, pos.x0..pos.x0 + pos.width])
+                    .assign(&pv);
+            }
+            if let Some((c, f)) = stat.breaks {
+                count
+                    .as_mut()
+                    .unwrap()
+                    .slice_mut(s![pos.y0..pos.y0 + pos.height, pos.x0..pos.x0 + pos.width])
+                    .assign(&c);
+                first
+                    .as_mut()
+                    .unwrap()
+                    .slice_mut(s![pos.y0..pos.y0 + pos.height, pos.x0..pos.x0 + pos.width])
+                    .assign(&f);
+            }
+        }
+        n_read += 1;
+        eprint!("\r  chunk {n_read}/{} ", cs.chunk_positions().len());
+    }
+    eprintln!();
+
+    let mut maps_written = Vec::new();
+    for (opt, path) in [
+        (&slope, &args.output),
+        (&pvalue, &args.pvalue_output),
+        (&count, &args.breaks_output),
+        (&first, &args.first_break_output),
+    ] {
+        if let (Some(map), Some(path)) = (opt, path) {
+            write_map(map, transform, epsg, path)?;
+            maps_written.push(path.display().to_string());
+        }
+    }
+
+    let report = serde_json::json!({
+        "scenes": cs.slices().iter().map(|s| serde_json::json!({
+            "id": s.item_id, "datetime": s.datetime, "time": s.time, "cloud_cover": s.cloud_cover,
+        })).collect::<Vec<_>>(),
+        "skipped": cs.skipped(),
+        "dims": { "bands": out_bands.len(), "height": ny, "width": nx, "times": out_time.len() },
+        "bands": out_bands,
+        "time_range": [out_time.first(), out_time.last()],
+        "epsg": epsg,
+        "chunks": cs.chunk_positions().len(),
+        "chunk_bytes": cs.chunk_bytes(),
+        "zarr_output": args.zarr_output.as_ref().map(|p| p.display().to_string()),
         "maps_written": maps_written,
     });
     println!("{}", serde_json::to_string_pretty(&report)?);
