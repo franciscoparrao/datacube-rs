@@ -23,3 +23,14 @@ papers/draft/figures/*.npz
 # Wetland inventory (MMA) — large input data, not versioned
 inventario-de-humedales_shapefile/
 inventario-de-humedales_shapefile.zip
+
+# wetlands paper build artifacts + shared-bib symlink
+papers/wetlands/*.aux
+papers/wetlands/*.bbl
+papers/wetlands/*.blg
+papers/wetlands/*.log
+papers/wetlands/*.out
+papers/wetlands/*.spl
+papers/wetlands/*.synctex.gz
+papers/wetlands/*.pdf
+papers/wetlands/refs.bib

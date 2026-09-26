@@ -1,0 +1,358 @@
+%% ============================================================================
+%% Wetlands paper — Computers & Geosciences (Application Article)
+%% Elsevier elsarticle template. Compile: latexmk -pdf wetlands-megadrought.tex
+%%
+%% This is a SKELETON: section intent + argument scaffolding + figure/table
+%% placeholders. Prose marked %SCAFFOLD is intent for the author to rewrite in
+%% their own words (watermark-era: the manuscript's final sentences are human).
+%% %TODO marks a number/figure to fill from the full central-Chile run.
+%%
+%% DESIGN SPINE (why this is a C&G paper, not the rejected engine paper):
+%%  - It answers a SCIENTIFIC QUESTION (wetland drying under the megadrought),
+%%    not "here is a tool" -> C&G scope criterion 3.
+%%  - The COMPUTER-SCIENCE contribution is real and non-obvious: (i) per-polygon
+%%    cross-sensor Landsat<->S2 harmonization inside a streaming zonal engine,
+%%    (ii) autocorrelation-aware, FDR-field-significance-controlled trajectory
+%%    extraction, (iii) bounded-memory chunked execution over cloud-native cubes
+%%    that makes the multi-decadal, national-scale run feasible offline
+%%    -> C&G scope criteria 1 & 4.
+%%  - The method ENABLES a finding that could not be obtained before at this
+%%    scale/rigor. The engine is the instrument; the wetlands are the point.
+%%
+%% REJECT-REASON MAP (from the blind C&G review of the engine paper — each must
+%% be closed here):
+%%  R-scope3  no scientific question      -> Sec.1 (question), Sec.5 (finding)
+%%  R-scope1  weak CS novelty             -> Sec.3.1/3.4/3.5 (the three novelties)
+%%  R-parity  parity != validation        -> Sec.4.1 (+ real validation 4.3)
+%%  R-autocorr uncorrected serial corr.   -> Sec.3.3 (seasonal/Hamed-Rao)
+%%  R-mult    no multiple-testing control -> Sec.3.4 (FDR/Wilks)
+%%  R-lit     missing field literature    -> Sec.1 related work (LandTrendr, sits,
+%%                                            BFAST Monitor/Lite, CCD/COLD, GSW...)
+%%  R-single  single downsampled case     -> Sec.2/5 (~800 wetlands, native res)
+%%  R-repro   no archived DOI             -> Code/Data availability (Zenodo)
+%%  R-bench   unfair benchmark            -> demoted; only like-with-like if kept
+%% ============================================================================
+\documentclass[review]{elsarticle}
+\usepackage{lineno,hyperref}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\modulolinenumbers[5]
+\journal{Computers \& Geosciences}
+\bibliographystyle{elsarticle-num-names}
+
+\begin{document}
+\begin{frontmatter}
+
+%% TITLE — must signal BOTH the CS method and the geoscience question.
+\title{Significance-controlled surface-water trajectories of central-Chilean
+wetlands under the megadrought from a harmonized, bounded-memory
+Landsat--Sentinel-2 data cube}
+
+\author[usach]{Francisco Parra}
+\ead{francisco.parra.o@usach.cl}
+\address[usach]{Universidad de Santiago de Chile (USACH), Santiago, Chile}
+
+\begin{abstract}
+%SCAFFOLD (150-250 words). One arc, in this order:
+%  (1) Question: are central-Chilean wetlands losing surface water under the
+%      2010- megadrought, where, since when, and which wetland types are most
+%      exposed?  (2) Why it is hard computationally: the answer needs a
+%      multi-decadal, cross-sensor (Landsat+Sentinel-2) record reduced PER
+%      WETLAND POLYGON, with trend/break tests that are valid under seasonality
+%      and serial correlation and controlled for multiple testing across
+%      thousands of wetlands -- at a data volume that does not fit in memory.
+%  (3) What we do: a bounded-memory, cloud-native data-cube method that
+%      harmonizes Landsat OLI and Sentinel-2 MSI into per-wetland index
+%      trajectories and applies seasonal / autocorrelation-corrected
+%      Mann-Kendall, Theil-Sen and OLS-CUSUM with Benjamini-Hochberg field
+%      significance, validated to 1e-9 against reference implementations.
+%  (4) Finding (fill from the full run): X% of N central-Chile wetlands show a
+%      significant surface-water decline, concentrated in [type/zone], with
+%      break timing clustered in [period]; corroborated by DGA groundwater
+%      levels and JRC Global Surface Water. %TODO
+\end{abstract}
+
+\begin{highlights}
+%% 3-5 bullets, <=85 chars each. C&G requires these.
+\item %SCAFFOLD Per-wetland Landsat--Sentinel-2 trajectories, harmonized cross-sensor.
+\item %SCAFFOLD Seasonal/autocorrelation-corrected trend tests with FDR field significance.
+\item %SCAFFOLD Bounded-memory, cloud-native cube run over the full multi-decadal record.
+\item %SCAFFOLD X\% of N central-Chile wetlands significantly losing surface water. %TODO
+\item %SCAFFOLD Decline corroborated by DGA levels and JRC Global Surface Water.
+\end{highlights}
+
+\begin{keyword}
+wetlands \sep megadrought \sep satellite image time series \sep Mann--Kendall
+\sep false discovery rate \sep data cube \sep Landsat \sep Sentinel-2 \sep Chile
+\end{keyword}
+\end{frontmatter}
+
+\linenumbers
+
+% =============================================================================
+\section{Introduction}\label{sec:intro}
+% Closes R-scope3 (scientific question) and frames R-scope1 (CS novelty).
+
+%SCAFFOLD 1.1 The scientific problem.
+%  - Central Chile has endured an uninterrupted megadrought since 2010
+%    (cite Garreaud et al. 2017, 2020). Wetlands are the ecosystems most
+%    exposed to water deficit and the least monitored at scale.
+%  - The scientific question, stated plainly and answerably: across the wetland
+%    inventory of central Chile, WHERE and SINCE WHEN has surface water/greenness
+%    significantly declined, and does exposure differ by wetland type
+%    (e.g. urban vs non-urban) and setting? This is the question the paper
+%    answers; it could not be answered before at this scale with statistical
+%    control.
+
+%SCAFFOLD 1.2 Why it is a computational problem (motivate the CS contribution).
+%  - Answering it requires: (a) a MULTI-DECADAL record -> Landsat back to the
+%    1980s/2000s fused with Sentinel-2 (2015-), because S2 alone spans only the
+%    drought's recovery tail and cannot see its onset (state this as the
+%    motivating limitation the pilot revealed);
+%  - (b) reduction to the UNIT OF ANALYSIS = the wetland POLYGON, not a bbox;
+%  - (c) trend/break statistics VALID under strong seasonality and serial
+%    correlation, and CONTROLLED for multiple testing across thousands of
+%    wetlands;
+%  - (d) all of it at a data volume (decades x two sensors x thousands of
+%    polygons) that exceeds memory -> demands bounded-memory, cloud-native
+%    streaming.
+
+%SCAFFOLD 1.3 Related work and the gap (closes R-lit — engage, do not name-drop).
+%  Cube/ARD engines: gdalcubes, Open Data Cube, openEO, FORCE, xarray, Google
+%    Earth Engine -- expose generic reducers, leave domain estimators to the
+%    user, and (except GEE) are not built for offline significance-controlled
+%    per-polygon trajectories.
+%  Time-series methods: Mann-Kendall family and Theil-Sen (with the seasonal
+%    Hirsch-Slack and autocorrelation-corrected Hamed-Rao variants), harmonic
+%    models / CCDC / CCD-COLD, and the BFAST family incl. BFAST Monitor and
+%    BFAST Lite for streaming; trajectory-based LandTrendr for disturbance and
+%    recovery; the sits R package for SITS-as-first-class-operators.
+%  Field significance: Wilks (2006, 2016) FDR control of spatial test maps.
+%  Wetland/water baselines: JRC Global Surface Water (Pekel et al. 2016).
+%  THE GAP: none combines (i) per-polygon cross-sensor harmonization, (ii)
+%    autocorrelation-aware + FDR-controlled trajectory tests, and (iii)
+%    bounded-memory cloud-native execution, as native operators, to answer a
+%    wetland-scale question over a multi-decadal record offline.
+
+%SCAFFOLD 1.4 Contributions (explicit list). Computer-science first:
+%  C1. A per-polygon CROSS-SENSOR HARMONIZATION (Landsat OLI <-> Sentinel-2 MSI,
+%      bandpass adjustment after Roy et al. 2016) computed inside a streaming
+%      zonal reduction, yielding consistent multi-decadal per-wetland index
+%      trajectories. [Sec.3.1]
+%  C2. AUTOCORRELATION-AWARE, MULTIPLE-TESTING-CONTROLLED trajectory analysis as
+%      native operators: seasonal and Hamed-Rao Mann-Kendall, Theil-Sen,
+%      OLS-CUSUM breaks, with Benjamini-Hochberg/Yekutieli field significance
+%      (Wilks), all validated to 1e-9 numerical parity. [Sec.3.3-3.4, 4.1]
+%  C3. A BOUNDED-MEMORY, CLOUD-NATIVE chunked execution that makes the
+%      multi-decadal, thousands-of-polygons run feasible on commodity hardware
+%      offline. [Sec.3.5]
+%  Scientific contribution: the first significance-controlled, cross-sensor,
+%  per-wetland assessment of surface-water change across central-Chilean
+%  wetlands under the megadrought. [Sec.5]
+
+% =============================================================================
+\section{Study area and data}\label{sec:data}
+% Closes R-single (many wetlands, native resolution) and grounds validation.
+
+%SCAFFOLD 2.1 Study area: central Chile (the megadrought epicentre), the wetland
+%  inventory as the analysis units.
+%  - Inventario Nacional de Humedales (MMA): N_total polygons in the study
+%    region; after a minimum-area / minimum-valid-pixel filter (Sec.3.2), the
+%    analysed set is N_analysed (~800 at ha>=5). %TODO exact N
+%  - Stratification attributes available: tipo_humed (urban vs non-urban),
+%    region, area (ha), classification code.
+
+\begin{table}[t]\centering
+\caption{Wetland inventory and analysed subset by type and size class.}
+\label{tab:inventory}
+\begin{tabular}{lrrr}
+\toprule
+Class & Polygons & With ha$\ge$5 & Analysed \\
+\midrule
+%TODO fill from the full inventory (urban / non-urban / totals)
+\bottomrule
+\end{tabular}
+\end{table}
+
+%SCAFFOLD 2.2 Satellite data: Landsat Collection-2 Level-2 (period, sensors
+%  TM/ETM+/OLI) and Sentinel-2 L2A; the spectral indices used (NDWI McFeeters
+%  for surface water; NDVI as secondary); per-scene quality masking (Landsat
+%  QA_PIXEL, Sentinel-2 SCL). Native resolution (10/30 m) -- no downsampling.
+
+%SCAFFOLD 2.3 Independent reference data for validation:
+%  - DGA hydrometric network (groundwater/well levels and streamflow near
+%    wetlands; CR2 CAMELS-CL curated series) -> TEMPORAL validation of decline
+%    and break timing.
+%  - JRC Global Surface Water 'occurrence' -> SPATIAL water-frequency baseline
+%    per wetland (which wetlands hold appreciable open water).
+
+% =============================================================================
+\section{Methods}\label{sec:methods}
+
+\subsection{Cross-sensor harmonization of per-wetland trajectories}\label{sec:harmonize}
+% C1 -- the central CS novelty. Closes part of R-scope1.
+%SCAFFOLD
+%  - Problem: Landsat OLI and Sentinel-2 MSI differ in bandpass/BRDF, so a naive
+%    concatenation of their indices has a step at 2015. We adjust one sensor to
+%    the other (bandpass transforms following Roy et al. 2016) at the surface-
+%    reflectance / index level, PER WETLAND, inside the streaming zonal step.
+%  - State the exact transform applied and how the overlap period (2015-present,
+%    both sensors) is used to fit/verify the adjustment.
+%  - Emphasise it runs as a native cube operator (no external re-gridding).
+
+\subsection{Per-polygon zonal reduction}\label{sec:zonal}
+%SCAFFOLD
+%  - Polygons reprojected to the cube CRS (pure-Rust WGS84<->UTM); the geometry
+%    is reprojected, never the raster.
+%  - Pixel-inclusion rule: area-fraction weighting (with the QC threshold
+%    below); state why (small/border wetlands).
+%  - Quality control: n_valid / n_total per wetland-month; a MINIMUM valid-pixel
+%    (and minimum-area) threshold below which a wetland is not tested. This is
+%    what the pilot flagged (wetlands as small as 3 pixels).
+
+\subsection{Autocorrelation-aware trend and break estimation}\label{sec:trend}
+% C2 part 1. Closes R-autocorr.
+%SCAFFOLD
+%  - Trend: Theil-Sen slope (magnitude) + Mann-Kendall significance. Because
+%    NDWI/NDVI are strongly seasonal and serially correlated, we use the
+%    SEASONAL Mann-Kendall (Hirsch & Slack 1984) and the autocorrelation-
+%    corrected Hamed & Rao (1998) variant; state which is primary and why.
+%  - Breaks: OLS-CUSUM with recursive binary segmentation for disturbance
+%    timing (relation to BFAST family stated honestly).
+%  - Equations (fill): seasonal-MK summed S/var; Hamed-Rao variance inflation
+%    factor; OLS-CUSUM statistic.
+
+\subsection{Field significance across wetlands}\label{sec:fdr}
+% C2 part 2. Closes R-mult.
+%SCAFFOLD
+%  - Testing thousands of wetlands (and pixels) inflates false positives.
+%  - We control the false discovery rate across the wetland field with
+%    Benjamini-Hochberg (and Benjamini-Yekutieli under dependence), and report
+%    FIELD SIGNIFICANCE following Wilks (2006). A wetland is declared
+%    significantly changing only if it survives FDR at q.
+%  - Pilot demonstration to cite: without correction K wetlands were flagged;
+%    after FDR, K' remained (state the concrete drop). %TODO from full run
+
+\subsection{Bounded-memory cloud-native execution}\label{sec:engine}
+% C3. Closes part of R-scope1 (the enabling CS result).
+%SCAFFOLD
+%  - The multi-decadal x two-sensor x thousands-of-polygons volume exceeds
+%    memory. We stream STAC/COG (and GeoZarr) scene-by-scene / chunk-by-chunk so
+%    the analysis chain (mask -> harmonize -> index -> composite -> zonal ->
+%    trend/break -> FDR) runs at bounded memory, on commodity hardware, offline.
+%  - Report the memory envelope (RSS vs a naive full-cube approach) -- the
+%    quantitative evidence that the run is feasible BECAUSE of the design.
+%  - Single compiled core; the analysis is reproducible without a cloud service.
+
+% =============================================================================
+\section{Validation}\label{sec:validation}
+
+\subsection{Numerical parity and ground-truth simulation}\label{sec:parity}
+% Closes R-parity: parity is necessary but not sufficient; we add ground truth.
+%SCAFFOLD
+%  - Every estimator is cross-validated to 1e-9 relative tolerance against the
+%    reference implementations (pyMannKendall seasonal_test and
+%    hamed_rao_modification_test; statsmodels multipletests fdr_bh/fdr_by;
+%    SciPy/statsmodels for OLS-CUSUM) -- 90/90 and 48/48 checks.
+%  - Ground-truth Monte-Carlo: realised vs nominal false-positive rate of the
+%    trend/break tests UNDER SEASONALITY AND AUTOCORRELATION (AR(1)/AR(2)),
+%    showing the corrected tests hold their level where the plain test does not.
+%    This is the answer to "parity is not validation".
+
+\subsection{Cross-sensor harmonization validation}\label{sec:harmvalid}
+%SCAFFOLD
+%  - Over the 2015-present overlap, agreement of harmonized Landsat vs Sentinel-2
+%    per-wetland index (bias, RMSE, no step at the sensor boundary). %TODO
+
+\subsection{Independent validation of the finding}\label{sec:indval}
+% Closes R-parity (real-world) and R-single.
+%SCAFFOLD
+%  - TEMPORAL: per-wetland decline and break timing vs DGA groundwater/streamflow
+%    levels at nearby stations (CR2 CAMELS-CL). Report correlation / timing
+%    agreement. %TODO
+%  - SPATIAL: significantly-declining wetlands vs JRC GSW 'occurrence'
+%    (do the declining wetlands include the genuinely watery ones?). %TODO
+
+% =============================================================================
+\section{Results}\label{sec:results}
+% The scientific finding. Closes R-scope3 and R-single.
+%SCAFFOLD
+%  5.1 How many of N wetlands show a SIGNIFICANT (FDR-controlled) surface-water
+%      decline over the full record; magnitude distribution (Theil-Sen). %TODO
+%  5.2 WHEN: distribution of break times; clustering relative to the megadrought
+%      and to dry/wet years (2019-2021 trough, 2023 wet winter). %TODO
+%  5.3 WHO: stratified exposure -- urban vs non-urban, by size class / setting;
+%      which wetland types are most vulnerable. %TODO
+%  5.4 Corroboration summary against DGA and GSW (from Sec.4.3).
+
+\begin{figure}[t]\centering
+% \includegraphics[width=\linewidth]{figures/wetland_trend_map.pdf}
+\caption{Per-wetland surface-water trend across central Chile: Theil-Sen slope,
+FDR-significant wetlands highlighted; inset break-time histogram.}
+\label{fig:trendmap}
+\end{figure}
+
+\begin{table}[t]\centering
+\caption{Significantly changing wetlands (FDR $q=0.05$) by type, with decline
+magnitude and break timing; raw vs FDR-controlled counts.}
+\label{tab:results}
+\begin{tabular}{lrrrr}
+\toprule
+Type & Tested & Sig.\ (raw) & Sig.\ (FDR) & Median slope \\
+\midrule
+%TODO
+\bottomrule
+\end{tabular}
+\end{table}
+
+% =============================================================================
+\section{Discussion}\label{sec:discussion}
+%SCAFFOLD
+%  - What the finding means for central-Chile wetland conservation under
+%    sustained water deficit; urban-wetland exposure.
+%  - Method transferability: the operators are generic; the same pipeline
+%    applies to any polygon inventory / region / index.
+%  - Honest limitations: cross-sensor harmonization residual; wetlands below the
+%    pixel/area threshold not assessed; GSW 'change' not used (undocumented byte
+%    encoding) so spatial corroboration rests on 'occurrence'; ingestion memory
+%    floor and how chunking addresses it; attribution (drought vs land-use) is
+%    correlative.
+
+% =============================================================================
+\section{Conclusions}\label{sec:conclusions}
+%SCAFFOLD 3-5 sentences: the question answered, the CS enablers, the number.
+
+% =============================================================================
+\section*{Code and data availability}
+%SCAFFOLD Closes R-repro.
+%  - Engine: datacube-rs, open source (MIT OR Apache-2.0), GitHub URL, and an
+%    ARCHIVED Zenodo DOI (v0.18.x). %TODO Zenodo DOI (must exist at submission).
+%  - Analysis scripts and the wetland-inventory / DGA / GSW access recipes,
+%    deposited with a DOI. MMA inventory and DGA/CR2 data are public (cite).
+
+\section*{Declaration of generative AI use}
+%SCAFFOLD Elsevier-mandatory. Calibrate to the real footprint (see /paper-prose
+%  disclose): tooling/engine development assisted; manuscript prose is the
+%  author's. State tools and scope honestly.
+
+\section*{CRediT authorship contribution statement}
+%SCAFFOLD Francisco Parra: conceptualization, methodology, software,
+%  formal analysis, writing.
+
+\section*{Funding}
+%SCAFFOLD If applicable (DICYT postdoc code) -- see /firma-postdoc.
+
+\section*{Acknowledgements}
+% %TODO
+
+\bibliography{refs}
+%% NOTE: refs.bib must add the field literature the review flagged as missing:
+%%  Garreaud 2017/2020 (megadrought), Roy 2016 (OLI-MSI harmonization),
+%%  Hirsch&Slack 1984, Hamed&Rao 1998, Wilks 2006/2016, Benjamini&Hochberg 1995,
+%%  Benjamini&Yekutieli 2001, Pekel 2016 (GSW), Kennedy 2010 (LandTrendr),
+%%  Simoes 2021 (sits), Verbesselt 2012 (BFAST Monitor), Masiliunas 2021 (BFAST
+%%  Lite), Zhu 2020 (CCD/COLD), Alvarez-Garreton 2018 (CAMELS-CL).
+
+\end{document}
