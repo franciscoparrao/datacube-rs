@@ -45,12 +45,13 @@ S2_BANDS = {"green": "B03", "nir": "B08"}
 
 
 def stack_sensor(collection, assets, bbox, datetime, grid_epsg, grid_res, grid_bbox,
-                 scale, offset, mask, limit, overview):
+                 scale, offset, mask, mask_asset, limit, overview):
     return dc.stack(
         catalog="pc", collection=collection, assets=assets,
         bbox=bbox, datetime=datetime,
         grid_epsg=grid_epsg, grid_res=grid_res, grid_bbox=grid_bbox,
-        scale=scale, offset=offset, mask=mask, max_items=limit, overview=overview,
+        scale=scale, offset=offset, mask=mask, mask_asset=mask_asset,
+        max_items=limit, overview=overview,
     )
 
 
@@ -61,7 +62,9 @@ def main():
     ap.add_argument("--bbox", required=True, help="WGS84 west,south,east,north")
     ap.add_argument("--grid-epsg", type=int, default=32719)
     ap.add_argument("--grid-res", type=float, default=30.0)
-    ap.add_argument("--grid-bbox", required=True, help="target-CRS minx,miny,maxx,maxy")
+    ap.add_argument("--grid-bbox", default=None,
+                    help="target-CRS minx,miny,maxx,maxy; if omitted both sensors "
+                         "derive the same grid from --bbox (still aligned)")
     ap.add_argument("--landsat-datetime", default="2000-01-01/2024-12-31")
     ap.add_argument("--s2-datetime", default="2015-06-01/2024-12-31")
     ap.add_argument("--limit", type=int, default=4000)
@@ -76,7 +79,7 @@ def main():
         return 2
 
     bbox = tuple(float(x) for x in args.bbox.split(","))
-    grid_bbox = tuple(float(x) for x in args.grid_bbox.split(","))
+    grid_bbox = tuple(float(x) for x in args.grid_bbox.split(",")) if args.grid_bbox else None
     coeffs = json.load(open(args.coeffs)) if args.coeffs else {}
     if not coeffs:
         print("WARNING: no --coeffs given; harmonization is IDENTITY (no bandpass "
@@ -89,13 +92,15 @@ def main():
     print("stacking Landsat C2 L2 ...", file=sys.stderr)
     ls = stack_sensor("landsat-c2-l2", list(LANDSAT_BANDS.values()),
                       datetime=args.landsat_datetime, scale=LANDSAT_C2_SCALE,
-                      offset=LANDSAT_C2_OFFSET, mask="qa_pixel", **common)["cube"]
+                      offset=LANDSAT_C2_OFFSET, mask="qa_pixel", mask_asset="qa_pixel",
+                      **common)["cube"]
     ls = ls.rename_bands(list(LANDSAT_BANDS.keys()))  # -> [green, nir]
 
     print("stacking Sentinel-2 L2A ...", file=sys.stderr)
     s2 = stack_sensor("sentinel-2-l2a", list(S2_BANDS.values()),
                       datetime=args.s2_datetime, scale=S2_L2A_SCALE,
-                      offset=S2_L2A_OFFSET, mask="scl", **common)["cube"]
+                      offset=S2_L2A_OFFSET, mask="scl", mask_asset="SCL",
+                      **common)["cube"]
     s2 = s2.rename_bands(list(S2_BANDS.keys()))  # -> [green, nir]
     if coeffs:
         s2 = s2.harmonize({b: tuple(v) for b, v in coeffs.items()})  # S2 -> OLI
