@@ -3,7 +3,7 @@
 //! Both operate purely on the public cube API and return new cubes; the
 //! time axis must be sorted ascending (as produced by stacking).
 
-use ndarray::Array4;
+use ndarray::{Array4, Axis};
 use rayon::prelude::*;
 
 use crate::cube::Cube;
@@ -139,6 +139,46 @@ impl Cube {
         });
 
         Ok(Cube::new(data, time.to_vec(), self.bands().to_vec())?.inherit_georef(self))
+    }
+}
+
+impl Cube {
+    /// Concatenates another cube along the time axis and returns the result
+    /// sorted by ascending time — the temporal **fusion** step for a
+    /// multi-sensor record.
+    ///
+    /// After [`harmonize`](Cube::harmonize)ing one sensor into the other's
+    /// spectral space, the two single-sensor cubes (same bands, same spatial
+    /// grid) are fused into one interleaved, time-ordered trajectory ready for
+    /// composite / trend / break analysis. Requires identical band labels and
+    /// spatial dimensions; the georeference is inherited from `self`.
+    pub fn concat_time(&self, other: &Cube) -> Result<Cube, CubeError> {
+        if self.bands() != other.bands() {
+            return Err(CubeError::DimensionMismatch(format!(
+                "concat_time needs identical bands, got {:?} vs {:?}",
+                self.bands(),
+                other.bands()
+            )));
+        }
+        let (nb, ny, nx, _) = self.dims();
+        let (ob, oy, ox, _) = other.dims();
+        if (nb, ny, nx) != (ob, oy, ox) {
+            return Err(CubeError::DimensionMismatch(format!(
+                "concat_time needs identical (band,y,x) dims, got {:?} vs {:?}",
+                (nb, ny, nx),
+                (ob, oy, ox)
+            )));
+        }
+        // concatenate along the time axis, then reorder slices by ascending time
+        let joined = ndarray::concatenate(Axis(3), &[self.data(), other.data()])
+            .map_err(|e| CubeError::DimensionMismatch(e.to_string()))?;
+        let mut times: Vec<f64> = self.time().to_vec();
+        times.extend_from_slice(other.time());
+        let mut order: Vec<usize> = (0..times.len()).collect();
+        order.sort_by(|&a, &b| times[a].total_cmp(&times[b]));
+        let sorted_times: Vec<f64> = order.iter().map(|&i| times[i]).collect();
+        let data = joined.select(Axis(3), &order);
+        Ok(Cube::new(data, sorted_times, self.bands().to_vec())?.inherit_georef(self))
     }
 }
 
@@ -472,6 +512,42 @@ mod tests {
         assert!(d[[0, 0, 0, 4]].is_nan()); // gap of 3.0 > max stays
         assert!(d[[0, 0, 0, 5]].is_nan());
         assert!(d[[0, 0, 0, 7]].is_nan()); // trailing edge untouched
+    }
+
+    #[test]
+    fn concat_time_fuses_and_sorts() {
+        // sensor A at 2020.1, 2021.1 ; sensor B at 2020.6, 2019.9 (out of order)
+        let a = cube_1px(&[10.0, 30.0], &[2020.1, 2021.1]);
+        let b = cube_1px(&[25.0, 5.0], &[2020.6, 2019.9]);
+        let fused = a.concat_time(&b).unwrap();
+        assert_eq!(fused.dims().3, 4);
+        // ascending time order: 2019.9(5), 2020.1(10), 2020.6(25), 2021.1(30)
+        assert_eq!(fused.time(), &[2019.9, 2020.1, 2020.6, 2021.1]);
+        let d: Vec<f64> = fused.data().iter().copied().collect();
+        assert_eq!(d, vec![5.0, 10.0, 25.0, 30.0]);
+    }
+
+    #[test]
+    fn concat_time_rejects_mismatched_bands() {
+        let a = cube_1px(&[1.0], &[0.0]);
+        let mut data = Array4::zeros((1, 1, 1, 1));
+        data[[0, 0, 0, 0]] = 2.0;
+        let b = Cube::new(data, vec![1.0], vec!["other".into()]).unwrap();
+        assert!(matches!(
+            a.concat_time(&b),
+            Err(CubeError::DimensionMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn concat_time_preserves_georef() {
+        let geo = GeoRef {
+            epsg: Some(32719),
+            transform: Some([0.0, 10.0, 0.0, 0.0, 0.0, -10.0]),
+        };
+        let a = cube_1px(&[1.0], &[0.0]).with_georef(geo);
+        let b = cube_1px(&[2.0], &[1.0]);
+        assert_eq!(a.concat_time(&b).unwrap().georef(), Some(geo));
     }
 
     #[test]

@@ -490,6 +490,35 @@ impl PyCube {
         })
     }
 
+    /// Cross-sensor harmonization: apply a per-band linear transform
+    /// `v' = slope*v + offset` to the named bands (others unchanged), preserving
+    /// NaN. `coeffs` is a dict `{band: (slope, offset)}` — the published
+    /// bandpass-adjustment coefficients (e.g. Claverie et al. 2018 HLS, Roy et
+    /// al. 2016) that bring one sensor into another's spectral space before
+    /// temporal fusion.
+    fn harmonize(
+        &self,
+        py: Python<'_>,
+        coeffs: std::collections::HashMap<String, (f64, f64)>,
+    ) -> PyResult<Self> {
+        let pairs: Vec<(String, f64, f64)> =
+            coeffs.into_iter().map(|(b, (s, o))| (b, s, o)).collect();
+        let inner = &self.inner;
+        Ok(Self {
+            inner: py.detach(|| inner.harmonize(&pairs)).map_err(err)?,
+        })
+    }
+
+    /// Fuse another cube along the time axis (same bands and spatial grid),
+    /// returned sorted by ascending time — the temporal join for a multi-sensor
+    /// record (e.g. harmonized Sentinel-2 concatenated with Landsat).
+    fn concat_time(&self, py: Python<'_>, other: &PyCube) -> PyResult<Self> {
+        let (inner, oth) = (&self.inner, &other.inner);
+        Ok(Self {
+            inner: py.detach(|| inner.concat_time(oth)).map_err(err)?,
+        })
+    }
+
     /// Reduce each polygon of a vector layer (`.shp`/`.geojson`) to a tidy
     /// table, returned as a dict of equal-length columns (feed straight to
     /// `pandas.DataFrame`): `polygon_id`, `time`, `band`, `reducer`, `value`,

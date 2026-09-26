@@ -181,6 +181,13 @@ Needs the `stac`-enabled binding plus `rasterio`/`shapely` in the venv.
 - [x] False-discovery-rate control (Benjamini-Hochberg / Benjamini-Yekutieli)
   and Wilks field significance, for interpretable per-pixel / per-polygon
   significance maps over large fields
+- [x] Bounded-memory chunked STAC/COG ingestion (`stack_chunked`,
+  `datacube stack --chunked-ingest`): read the archive one spatial tile at a
+  time so multi-decadal, multi-sensor runs fit in memory
+- [x] Cross-sensor harmonization (`Cube::harmonize`, per-band linear bandpass
+  adjustment) and temporal fusion (`Cube::concat_time`), to fuse Landsat and
+  Sentinel-2 into one consistent per-pixel trajectory (coefficients supplied
+  per band, e.g. Claverie et al. 2018 / Roy et al. 2016)
 
 ## Performance
 

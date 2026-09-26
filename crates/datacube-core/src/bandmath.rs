@@ -7,7 +7,7 @@
 //! denominator). The named indices in [`indices`] are thin wrappers over
 //! [`Cube::normalized_difference`] and [`Cube::combine_bands`].
 
-use ndarray::Array4;
+use ndarray::{Array4, s};
 use rayon::prelude::*;
 
 use crate::cube::Cube;
@@ -60,6 +60,47 @@ impl Cube {
     /// A cell is `NaN` if either input is `NaN` or the denominator is zero.
     pub fn band_ratio(&self, a: usize, b: usize, label: &str) -> Result<Cube, CubeError> {
         self.binary_band(a, b, label, |x, y| if y == 0.0 { f64::NAN } else { x / y })
+    }
+
+    /// Applies a per-band linear transform `v' = slope·v + offset` to the named
+    /// bands (bands not listed are copied unchanged), returning a new cube on
+    /// the same grid. `NaN` (masked observations) is preserved.
+    ///
+    /// This is the cross-sensor **harmonization** operator: to fuse a
+    /// multi-decadal Landsat + Sentinel-2 record into one consistent per-pixel
+    /// trajectory, the bandpass difference between sensors must be removed
+    /// before the two are concatenated in time. Harmonize the single-sensor
+    /// cube of one sensor (e.g. Sentinel-2 MSI) into the other's spectral space
+    /// (e.g. Landsat OLI) band by band, then concatenate. The engine supplies
+    /// the *mechanism*; the coefficients are cited external data — published
+    /// OLS bandpass-adjustment slopes/offsets (e.g. Claverie et al. 2018, HLS
+    /// Table 5; Roy et al. 2016) — passed in per band, so the transform is
+    /// reproducible and auditable rather than hard-coded.
+    ///
+    /// Errors if a listed band name is not present. Coefficients must be finite.
+    pub fn harmonize(&self, coeffs: &[(String, f64, f64)]) -> Result<Cube, CubeError> {
+        // resolve band names up front (fail before mutating anything)
+        let resolved: Vec<(usize, f64, f64)> = coeffs
+            .iter()
+            .map(|(name, slope, offset)| {
+                if !slope.is_finite() || !offset.is_finite() {
+                    return Err(CubeError::InvalidParameter(format!(
+                        "harmonize coefficients for band '{name}' must be finite \
+                         (slope={slope}, offset={offset})"
+                    )));
+                }
+                Ok((self.band(name)?, *slope, *offset))
+            })
+            .collect::<Result<_, _>>()?;
+
+        let mut data = self.data().to_owned();
+        for (bi, slope, offset) in resolved {
+            // band is the outermost axis, so each band volume is contiguous;
+            // a NaN stays NaN under the affine map.
+            data.slice_mut(s![bi, .., .., ..])
+                .mapv_inplace(|v| slope * v + offset);
+        }
+        Ok(Cube::new(data, self.time().to_vec(), self.bands().to_vec())?.inherit_georef(self))
     }
 
     /// Combines all bands at every `(y, x, time)` cell with `f`, producing a
@@ -247,6 +288,69 @@ mod tests {
         let c = rgbn_cube();
         assert_eq!(c.band("nir").unwrap(), 1);
         assert!(matches!(c.band("swir"), Err(CubeError::BandNotFound(_))));
+    }
+
+    #[test]
+    fn harmonize_applies_per_band_and_preserves_nan_and_others() {
+        let c = rgbn_cube();
+        // adjust only red: red' = 0.98*red - 0.01 ; nir/blue unchanged
+        let h = c.harmonize(&[("red".into(), 0.98, -0.01)]).unwrap();
+        assert_eq!(h.dims(), c.dims());
+        assert!((h.data()[[0, 0, 0, 0]] - (0.98 * 0.1 - 0.01)).abs() < 1e-12);
+        assert!((h.data()[[0, 0, 0, 1]] - (0.98 * 0.2 - 0.01)).abs() < 1e-12);
+        // nir unchanged (and its NaN preserved)
+        assert_eq!(h.data()[[1, 0, 0, 0]], 0.5);
+        assert!(h.data()[[1, 0, 0, 1]].is_nan());
+        // blue unchanged
+        assert_eq!(h.data()[[2, 0, 0, 0]], 0.05);
+    }
+
+    #[test]
+    fn harmonize_removes_cross_sensor_step() {
+        // "true" reflectance identical at both dates; sensor B (t=1) records it
+        // through a bandpass difference v_B = a*v_true + b. Harmonizing band by
+        // the inverse (1/a, -b/a) must recover v_true → no step between dates.
+        let (a, b) = (0.95_f64, 0.02_f64);
+        let v_true = 0.4_f64;
+        let mut data = Array4::zeros((1, 1, 1, 2));
+        data[[0, 0, 0, 0]] = v_true; // sensor A (already OLI space)
+        data[[0, 0, 0, 1]] = a * v_true + b; // sensor B (MSI space)
+        let cube = Cube::new(data, vec![0.0, 1.0], vec!["green".into()]).unwrap();
+        // NB: in the real pipeline B is a separate single-sensor sub-cube; here
+        // both dates share the band, so harmonize would touch both — instead we
+        // verify the inverse recovers v_true on a B-only cube.
+        let mut b_only = Array4::zeros((1, 1, 1, 1));
+        b_only[[0, 0, 0, 0]] = a * v_true + b;
+        let b_cube = Cube::new(b_only, vec![1.0], vec!["green".into()]).unwrap();
+        let harmonized = b_cube
+            .harmonize(&[("green".into(), 1.0 / a, -b / a)])
+            .unwrap();
+        assert!((harmonized.data()[[0, 0, 0, 0]] - v_true).abs() < 1e-12);
+        let _ = cube; // documents the two-sensor setup
+    }
+
+    #[test]
+    fn harmonize_rejects_unknown_band_and_nonfinite() {
+        let c = rgbn_cube();
+        assert!(matches!(
+            c.harmonize(&[("swir".into(), 1.0, 0.0)]),
+            Err(CubeError::BandNotFound(_))
+        ));
+        assert!(matches!(
+            c.harmonize(&[("red".into(), f64::NAN, 0.0)]),
+            Err(CubeError::InvalidParameter(_))
+        ));
+    }
+
+    #[test]
+    fn harmonize_preserves_georef() {
+        let geo = GeoRef {
+            epsg: Some(32719),
+            transform: Some([300_000.0, 10.0, 0.0, 6_200_000.0, 0.0, -10.0]),
+        };
+        let c = rgbn_cube().with_georef(geo);
+        let h = c.harmonize(&[("nir".into(), 1.0, 0.0)]).unwrap();
+        assert_eq!(h.georef(), Some(geo));
     }
 
     #[test]

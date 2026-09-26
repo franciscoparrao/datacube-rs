@@ -192,6 +192,31 @@ def test_cube_gapfill_interpolates():
     assert math.isclose(filled[0, 0, 0, 2], 5.0, abs_tol=1e-12)
 
 
+def test_harmonize_per_band_and_concat_time():
+    # 1 band "green", 1 px, 2 times; harmonize applies v' = slope*v + offset
+    data = np.array([0.40, 0.50]).reshape(1, 1, 1, 2)
+    cube = dc.Cube(data, np.array([2020.0, 2021.0]), ["green"])
+    h = cube.harmonize({"green": (0.95, 0.02)})
+    out = h.to_numpy()[0, 0, 0, :]
+    assert np.allclose(out, 0.95 * np.array([0.40, 0.50]) + 0.02, atol=1e-12)
+    # unknown band raises
+    try:
+        cube.harmonize({"nope": (1.0, 0.0)})
+    except Exception:
+        pass
+    else:
+        raise AssertionError("expected harmonize on unknown band to raise")
+
+
+def test_concat_time_fuses_sorted():
+    a = dc.Cube(np.array([10.0, 30.0]).reshape(1, 1, 1, 2), np.array([2020.1, 2021.1]), ["g"])
+    b = dc.Cube(np.array([25.0, 5.0]).reshape(1, 1, 1, 2), np.array([2020.6, 2019.9]), ["g"])
+    fused = a.concat_time(b)
+    assert fused.dims == (1, 1, 1, 4)
+    assert np.allclose(fused.time, [2019.9, 2020.1, 2020.6, 2021.1])
+    assert np.allclose(fused.to_numpy().ravel(), [5.0, 10.0, 25.0, 30.0])
+
+
 def _rgbn_cube():
     # red, nir, blue; 2x2 px, 1 time; second pixel column has a masked NIR
     nb, ny, nx, nt = 3, 2, 2, 1
