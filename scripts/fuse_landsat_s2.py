@@ -66,6 +66,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--vector", required=True, help="wetland polygons (.shp/.geojson)")
     ap.add_argument("--id-field", default="objectid")
+    ap.add_argument("--source-epsg", type=int, default=None,
+                    help="CRS of the vector (overrides auto-detection). Use e.g. "
+                         "4326 for a WGS84 shapefile whose .prj may not resolve.")
     ap.add_argument("--bbox", required=True, help="WGS84 west,south,east,north")
     ap.add_argument("--grid-epsg", type=int, default=32719)
     ap.add_argument("--grid-res", type=float, default=30.0)
@@ -123,7 +126,9 @@ def main():
         print(f"harmonizing S2->OLI with {args.coeffs}: "
               + ", ".join(f"{b}={tuple(v)}" for b, v in coeffs.items()), file=sys.stderr)
 
-    src_epsg = 4326 if args.vector.endswith((".geojson", ".json")) else None
+    src_epsg = args.source_epsg
+    if src_epsg is None and args.vector.endswith((".geojson", ".json")):
+        src_epsg = 4326
 
     if args.chunked:
         if not hasattr(dc, "fused_zonal"):
@@ -198,17 +203,25 @@ def main():
             continue
         smk = dc.seasonal_mann_kendall(y, period=12)
         res.append((pid, smk["p_value"], smk["trend"]))
-    pv = np.array([r[1] for r in res])
-    fdr = dc.fdr(pv, q=args.fdr_q, method="bh")
+    n_sig = 0
     with open(args.out, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["polygon_id", "smk_p", "smk_trend", "fdr_adj", "fdr_sig"])
-        for (pid, p, trend), adj, rej in zip(res, fdr["adjusted"], fdr["rejected"]):
-            w.writerow([pid, p, trend, adj, bool(rej)])
-    n_sig = int(fdr["n_significant"])
-    print(f"fused span {fused.time[0]:.2f}..{fused.time[-1]:.2f}, "
-          f"{fused.dims[3]} obs; {len(res)} wetlands; {n_sig} significant (FDR q={args.fdr_q})")
-    print(f"wrote {args.out}")
+        if res:
+            pv = np.array([r[1] for r in res])
+            fdr = dc.fdr(pv, q=args.fdr_q, method="bh")
+            for (pid, p, trend), adj, rej in zip(res, fdr["adjusted"], fdr["rejected"]):
+                w.writerow([pid, p, trend, adj, bool(rej)])
+            n_sig = int(fdr["n_significant"])
+
+    # span/obs from the zonal table (works for both the in-memory and the
+    # chunked/streaming paths, which never build a `fused` cube object).
+    bin_times = sorted(set(tbl["time"]))
+    span = f"{bin_times[0]:.2f}..{bin_times[-1]:.2f}" if bin_times else "empty"
+    print(f"fused span {span}, {len(bin_times)} temporal bins; "
+          f"{len(res)} wetlands tested; {n_sig} significant (FDR q={args.fdr_q})",
+          file=sys.stderr)
+    print(f"wrote {args.out}", file=sys.stderr)
     return 0
 
 
