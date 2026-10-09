@@ -193,14 +193,37 @@ Class & Polygons & With ha$\ge$5 & Analysed \\
 
 \subsection{Cross-sensor harmonization of per-wetland trajectories}\label{sec:harmonize}
 % C1 -- the central CS novelty. Closes part of R-scope1.
-%SCAFFOLD
-%  - Problem: Landsat OLI and Sentinel-2 MSI differ in bandpass/BRDF, so a naive
-%    concatenation of their indices has a step at 2015. We adjust one sensor to
-%    the other (bandpass transforms following Roy et al. 2016) at the surface-
-%    reflectance / index level, PER WETLAND, inside the streaming zonal step.
-%  - State the exact transform applied and how the overlap period (2015-present,
-%    both sensors) is used to fit/verify the adjustment.
-%  - Emphasise it runs as a native cube operator (no external re-gridding).
+Landsat OLI and Sentinel-2 MSI sample slightly different bandpasses for their
+nominally equivalent spectral bands, so a na\"ive concatenation of the two
+records introduces a spurious step at the sensor transition that would be
+indistinguishable from a real hydrological change. We remove it by adjusting
+the Sentinel-2 reflectances into the OLI spectral reference before any index is
+formed. Each sensor is first stacked onto a common fixed grid
+(Sec.~\ref{sec:data}) with its own surface-reflectance scaling and quality mask
+(Landsat \texttt{QA\_PIXEL}, Sentinel-2 \texttt{SCL}), and its bands relabelled
+to the shared roles used by the water index. Taking OLI as the reference, each
+Sentinel-2 band is mapped by the per-band linear bandpass transform
+\begin{equation}\label{eq:bandpass}
+  \rho_{\mathrm{OLI}} = a\,\rho_{\mathrm{MSI}} + b ,
+\end{equation}
+with the globally derived coefficients of the Harmonized Landsat and Sentinel-2
+(HLS) product \citep{claverie2018}, itself built on the Landsat reflective-band
+continuity analysis of \citet{roy2016}. Rather than fit $a$ and $b$ to the local
+2015--present overlap---which would risk absorbing genuine wetland change into
+the adjustment---we adopt the published HLS coefficients and reserve the overlap
+period to \emph{verify} the harmonization (Sec.~\ref{sec:harmvalid}). Because the
+catalogue pools Sentinel-2A and -2B scenes while a single coefficient is applied
+per band, we use the mean of the published per-platform values: for the green
+band (OLI~3, MSI~3) $a=1.0064$, $b=-0.00085$; for the near-infrared band
+$a=0.99745$, $b=-0.00005$. The near-infrared role deliberately pairs Landsat
+\texttt{nir08} (OLI band~5, ${\sim}865$~nm) with MSI band~8A (${\sim}865$~nm),
+not the broader B08 (${\sim}842$~nm), because band~8A is the spectral match for
+which the HLS near-infrared coefficient was derived. The adjusted and reference
+cubes are then concatenated along time into a single ascending series from which
+the McFeeters NDWI is computed. The entire adjustment is a native cube operator
+applied in surface-reflectance space---no external re-gridding or per-wetland
+refitting---so it composes directly with the masking, indexing, and streaming
+zonal reduction that follow.
 
 \subsection{Per-polygon zonal reduction}\label{sec:zonal}
 %SCAFFOLD
