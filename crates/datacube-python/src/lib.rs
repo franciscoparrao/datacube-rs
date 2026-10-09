@@ -740,6 +740,288 @@ fn stack<'py>(
     Ok(d)
 }
 
+/// Builds a [`datacube_io::FusedSensor`] from one sensor dict plus the shared
+/// ingestion params. Dict keys: `collection`, `assets`, `datetime` (required);
+/// `rename`, `scale`, `offset`, `mask`, `mask_asset`, `mask_keep`, `harmonize`
+/// (`{band: [slope, offset]}`) optional. The grid is always set (chunked
+/// ingestion requires it).
+#[cfg(feature = "stac")]
+#[allow(clippy::too_many_arguments)]
+fn fused_sensor_from_dict(
+    d: &Bound<'_, PyDict>,
+    catalog: &str,
+    bbox: [f64; 4],
+    max_items: usize,
+    concurrency: usize,
+    overview: Option<usize>,
+    cross_zone_mosaic: bool,
+    grid_epsg: u32,
+    grid_res: f64,
+    grid_bbox: Option<[f64; 4]>,
+    grid_align: Option<f64>,
+) -> PyResult<datacube_io::FusedSensor> {
+    let req_str = |k: &str| -> PyResult<String> {
+        d.get_item(k)?
+            .ok_or_else(|| PyValueError::new_err(format!("sensor dict missing '{k}'")))?
+            .extract()
+    };
+    let opt = |k: &str| -> PyResult<Option<Bound<'_, PyAny>>> { d.get_item(k) };
+
+    let collection = req_str("collection")?;
+    let assets: Vec<String> = d
+        .get_item("assets")?
+        .ok_or_else(|| PyValueError::new_err("sensor dict missing 'assets'"))?
+        .extract()?;
+    let datetime = req_str("datetime")?;
+    let rename: Vec<String> = match opt("rename")? {
+        Some(v) => v.extract()?,
+        None => Vec::new(),
+    };
+    let scale: f64 = match opt("scale")? {
+        Some(v) => v.extract()?,
+        None => 1.0,
+    };
+    let offset: f64 = match opt("offset")? {
+        Some(v) => v.extract()?,
+        None => 0.0,
+    };
+    let mask: Option<String> = match opt("mask")? {
+        Some(v) => Some(v.extract()?),
+        None => None,
+    };
+    let mask_asset: Option<String> = match opt("mask_asset")? {
+        Some(v) => Some(v.extract()?),
+        None => None,
+    };
+    let mask_keep: Vec<u16> = match opt("mask_keep")? {
+        Some(v) => v.extract()?,
+        None => vec![4, 5, 6, 7, 11],
+    };
+    let harmonize_map: Option<std::collections::HashMap<String, Vec<f64>>> =
+        match opt("harmonize")? {
+            Some(v) => Some(v.extract()?),
+            None => None,
+        };
+
+    let asset_refs: Vec<&str> = assets.iter().map(String::as_str).collect();
+    let [w, s, e, n] = bbox;
+    let mut cfg = datacube_io::StackConfig::new(catalog, &collection, &asset_refs)
+        .bbox(w, s, e, n)
+        .datetime(&datetime)
+        .max_items(max_items)
+        .overview(overview)
+        .scaling(scale, offset)
+        .cross_zone_mosaic(cross_zone_mosaic)
+        .concurrency(concurrency);
+    if let Some(kind) = mask {
+        let mc = build_mask_py(&kind, &collection, mask_asset.as_deref(), mask_keep, None, None)?;
+        cfg = cfg.mask(mc);
+    }
+    let mut grid = datacube_io::GridSpec::new(grid_epsg, grid_res);
+    if let Some([gw, gs, ge, gn]) = grid_bbox {
+        grid = grid.bbox(gw, gs, ge, gn);
+    }
+    if let Some(step) = grid_align {
+        grid = grid.align(step);
+    }
+    cfg = cfg.grid(grid);
+
+    let mut harmonize = Vec::new();
+    if let Some(m) = harmonize_map {
+        for (band, v) in m {
+            if v.len() != 2 {
+                return Err(PyValueError::new_err(format!(
+                    "harmonize['{band}'] must be [slope, offset]"
+                )));
+            }
+            harmonize.push((band, v[0], v[1]));
+        }
+    }
+
+    Ok(datacube_io::FusedSensor {
+        cfg,
+        rename,
+        harmonize,
+    })
+}
+
+/// Serializes a [`datacube_io::ZonalTable`] into the column-dict shape shared by
+/// `Cube.zonal` and `fused_zonal`.
+#[cfg(feature = "stac")]
+fn zonal_table_to_pydict<'py>(
+    py: Python<'py>,
+    table: &datacube_io::ZonalTable,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item(
+        "polygon_id",
+        table
+            .rows
+            .iter()
+            .map(|r| r.polygon_id.clone())
+            .collect::<Vec<_>>(),
+    )?;
+    d.set_item(
+        "time",
+        table.rows.iter().map(|r| r.time).collect::<Vec<f64>>(),
+    )?;
+    d.set_item(
+        "band",
+        table.rows.iter().map(|r| r.band.clone()).collect::<Vec<_>>(),
+    )?;
+    d.set_item(
+        "reducer",
+        table
+            .rows
+            .iter()
+            .map(|r| r.reducer.to_string())
+            .collect::<Vec<_>>(),
+    )?;
+    d.set_item(
+        "value",
+        table.rows.iter().map(|r| r.value).collect::<Vec<f64>>(),
+    )?;
+    d.set_item(
+        "n_valid",
+        table.rows.iter().map(|r| r.n_valid).collect::<Vec<u64>>(),
+    )?;
+    d.set_item(
+        "n_total",
+        table.rows.iter().map(|r| r.n_total).collect::<Vec<u64>>(),
+    )?;
+    Ok(d)
+}
+
+/// Bounded-memory cross-sensor fusion → per-polygon index trajectories, in one
+/// call (`datacube_io::fused_zonal_chunked`). Both sensors are ingested chunked
+/// on the shared grid, the secondary is harmonized into the reference spectral
+/// space, fused in time, reduced to `index`, and zonally aggregated — never
+/// materializing the full fused cube.
+///
+/// `sensor_a` (reference) and `sensor_b` (harmonized into A) are dicts; see
+/// [`fused_sensor_from_dict`]. Returns the same column-dict shape as
+/// `Cube.zonal`. (Only built with the `stac` feature.)
+#[cfg(feature = "stac")]
+#[pyfunction]
+#[pyo3(signature = (
+    sensor_a, sensor_b, bbox, grid_epsg, grid_res, vector, id_field,
+    catalog="pc", grid_bbox=None, grid_align=None,
+    max_items=4000, concurrency=8, overview=None, cross_zone_mosaic=true,
+    index="ndwi", green="green", nir="nir", red="red",
+    reducer="mean", inclusion="center", window="monthly",
+    source_epsg=None, threshold=None, chunk_size=512,
+))]
+#[allow(clippy::too_many_arguments)]
+fn fused_zonal<'py>(
+    py: Python<'py>,
+    sensor_a: Bound<'py, PyDict>,
+    sensor_b: Bound<'py, PyDict>,
+    bbox: [f64; 4],
+    grid_epsg: u32,
+    grid_res: f64,
+    vector: &str,
+    id_field: &str,
+    catalog: &str,
+    grid_bbox: Option<[f64; 4]>,
+    grid_align: Option<f64>,
+    max_items: usize,
+    concurrency: usize,
+    overview: Option<usize>,
+    cross_zone_mosaic: bool,
+    index: &str,
+    green: &str,
+    nir: &str,
+    red: &str,
+    reducer: &str,
+    inclusion: &str,
+    window: &str,
+    source_epsg: Option<u32>,
+    threshold: Option<f64>,
+    chunk_size: usize,
+) -> PyResult<Bound<'py, PyDict>> {
+    use datacube_core::IndexSpec;
+    use datacube_io::{PixelInclusion, Reducer, ZonalConfig, fused_zonal_chunked, read_zones};
+
+    let reference = fused_sensor_from_dict(
+        &sensor_a,
+        catalog,
+        bbox,
+        max_items,
+        concurrency,
+        overview,
+        cross_zone_mosaic,
+        grid_epsg,
+        grid_res,
+        grid_bbox,
+        grid_align,
+    )?;
+    let secondary = fused_sensor_from_dict(
+        &sensor_b,
+        catalog,
+        bbox,
+        max_items,
+        concurrency,
+        overview,
+        cross_zone_mosaic,
+        grid_epsg,
+        grid_res,
+        grid_bbox,
+        grid_align,
+    )?;
+
+    let index_spec = match index {
+        "ndwi" => IndexSpec::Ndwi {
+            green: green.to_string(),
+            nir: nir.to_string(),
+        },
+        "ndvi" => IndexSpec::Ndvi {
+            nir: nir.to_string(),
+            red: red.to_string(),
+        },
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "unsupported index '{other}' (ndwi|ndvi)"
+            )));
+        }
+    };
+
+    let incl = match inclusion {
+        "center" => PixelInclusion::Center,
+        "all_touched" => PixelInclusion::AllTouched,
+        "area_fraction" => PixelInclusion::AreaFraction,
+        other => return Err(PyValueError::new_err(format!("bad inclusion '{other}'"))),
+    };
+    let red_ = match reducer {
+        "mean" => Reducer::Mean,
+        "min" => Reducer::Min,
+        "max" => Reducer::Max,
+        "std" => Reducer::Std,
+        "sum" => Reducer::Sum,
+        "count" => Reducer::Count,
+        "fraction_above" => Reducer::FractionAbove(threshold.ok_or_else(|| {
+            PyValueError::new_err("reducer 'fraction_above' needs a threshold")
+        })?),
+        "median" => {
+            return Err(PyValueError::new_err(
+                "fused_zonal cannot combine 'median' across tiles",
+            ));
+        }
+        other => return Err(PyValueError::new_err(format!("bad reducer '{other}'"))),
+    };
+    let cfg = ZonalConfig::new(id_field, incl, red_)
+        .window(parse_window(window)?)
+        .source_epsg(source_epsg);
+
+    let features = read_zones(std::path::Path::new(vector)).map_err(err)?;
+    let table = py
+        .detach(|| {
+            fused_zonal_chunked(&reference, &secondary, index_spec, &features, &cfg, chunk_size)
+        })
+        .map_err(err)?;
+
+    zonal_table_to_pydict(py, &table)
+}
+
 /// Resolves the Python masking kwargs into a [`datacube_io::MaskConfig`].
 #[cfg(feature = "stac")]
 fn build_mask_py(
@@ -851,5 +1133,7 @@ fn datacube_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyCube>()?;
     #[cfg(feature = "stac")]
     m.add_function(wrap_pyfunction!(stack, m)?)?;
+    #[cfg(feature = "stac")]
+    m.add_function(wrap_pyfunction!(fused_zonal, m)?)?;
     Ok(())
 }

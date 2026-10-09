@@ -361,3 +361,77 @@ def test_stack_against_planetary_computer():
     slope, pvalue = ndvi.trend_map(0, method="theil_sen")
     assert slope.shape == cube.dims[1:3]
     assert np.isfinite(slope).any()
+
+
+@pytest.mark.skipif(
+    not hasattr(dc, "fused_zonal"),
+    reason="built without the 'stac' feature "
+    "(VIRTUAL_ENV=... maturin develop --release --features stac,extension-module)",
+)
+def test_fused_zonal_offline_validation(tmp_path):
+    """Argument validation that fires before any network/read (no PC needed)."""
+    a = dict(collection="landsat-c2-l2", assets=["green", "nir08"],
+             rename=["green", "nir"], datetime="2020-01-01/2020-12-31")
+    b = dict(collection="sentinel-2-l2a", assets=["B03", "B8A"],
+             rename=["green", "nir"], datetime="2020-01-01/2020-12-31",
+             harmonize={"green": [1.0064, -0.00085], "nir": [0.99745, -5e-05]})
+    bbox = (-71.0, -33.1, -70.9, -33.0)
+    # Median cannot be combined across tiles -> rejected up front.
+    with pytest.raises(ValueError, match="median"):
+        dc.fused_zonal(a, b, bbox=bbox, grid_epsg=32719, grid_res=30.0,
+                       vector="unused.shp", id_field="objectid", reducer="median")
+    # Harmonize coefficients must be [slope, offset].
+    bad = dict(b, harmonize={"green": [1.0]})
+    with pytest.raises(ValueError, match="slope"):
+        dc.fused_zonal(a, bad, bbox=bbox, grid_epsg=32719, grid_res=30.0,
+                       vector="unused.shp", id_field="objectid")
+
+
+@pytest.mark.skipif(
+    not hasattr(dc, "fused_zonal"),
+    reason="built without the 'stac' feature "
+    "(VIRTUAL_ENV=... maturin develop --release --features stac,extension-module)",
+)
+def test_fused_zonal_against_planetary_computer(tmp_path):
+    """Network e2e: bounded-memory Landsat+S2 fusion over a multi-tile grid.
+
+    Mirrors the manual-run convention of the other PC tests. A tiny square
+    wetland over a ~5 km bbox at 30 m is tiled into several chunks
+    (chunk_size=128), so the per-polygon NDWI is accumulated across tiles.
+    """
+    import json
+
+    geojson = {
+        "type": "FeatureCollection",
+        "features": [{
+            "type": "Feature",
+            "properties": {"objectid": "w1"},
+            "geometry": {"type": "Polygon", "coordinates": [[
+                [-70.70, -33.50], [-70.68, -33.50],
+                [-70.68, -33.48], [-70.70, -33.48], [-70.70, -33.50],
+            ]]},
+        }],
+    }
+    path = tmp_path / "wetland.geojson"
+    path.write_text(json.dumps(geojson))
+
+    a = dict(collection="landsat-c2-l2", assets=["green", "nir08"],
+             rename=["green", "nir"], datetime="2023-01-01/2023-12-31",
+             scale=2.75e-5, offset=-0.2, mask="qa_pixel", mask_asset="qa_pixel")
+    b = dict(collection="sentinel-2-l2a", assets=["B03", "B8A"],
+             rename=["green", "nir"], datetime="2023-01-01/2023-12-31",
+             scale=1e-4, offset=-0.1, mask="scl", mask_asset="SCL",
+             harmonize={"green": [1.0064, -0.00085], "nir": [0.99745, -5e-05]})
+    tbl = dc.fused_zonal(
+        a, b, bbox=(-70.71, -33.51, -70.67, -33.47),
+        grid_epsg=32719, grid_res=30.0,
+        vector=str(path), id_field="objectid",
+        index="ndwi", green="green", nir="nir",
+        reducer="mean", inclusion="center", window="monthly",
+        source_epsg=4326, max_items=400, chunk_size=128,
+    )
+    assert set(tbl["polygon_id"]) == {"w1"}
+    assert tbl["band"][0] == "ndwi"
+    finite = [v for v in tbl["value"] if v == v]
+    assert finite, "no finite NDWI month returned"
+    assert all(-1.0 <= v <= 1.0 for v in finite)

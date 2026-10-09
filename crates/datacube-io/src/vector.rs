@@ -27,13 +27,15 @@
 use std::io::Write;
 use std::path::Path;
 
-use datacube_core::{CompositeWindow, Cube, bin_time, time_bins};
+use datacube_core::{CompositeWindow, Cube, IndexSpec, bin_time, time_bins};
 use surtgis_cloud::reproject;
 use surtgis_core::geo::{Area, BooleanOps, Contains, Intersects};
 use surtgis_core::geo_types::{Coord, Geometry, LineString, Polygon, Rect};
 use surtgis_core::vector::{AttributeValue, FeatureCollection, read_vector};
 
 use crate::StackError;
+use crate::stack::StackConfig;
+use crate::stack_chunked::stack_chunked;
 
 /// How a polygon selects the cube pixels it covers.
 ///
@@ -478,20 +480,18 @@ pub fn zonal_reduce(
     for zone in &zones {
         // Rasterize the zone once (shared by every band and time bin).
         let mask = rasterize_zone(&zone.polygons, &grid, cfg.inclusion);
-        let mask_pixels = mask.len() as u64;
 
         for (bin, &t) in bins.iter().zip(&bin_times) {
-            let n_total = mask_pixels * bin.len() as u64;
             for (bi, band) in bands.iter().enumerate() {
-                let (value, n_valid) = reduce_bin(&data, bi, &mask, bin, cfg.reducer);
+                let acc = accumulate_bin(&data, bi, &mask, bin, cfg.reducer);
                 rows.push(ZonalRow {
                     polygon_id: zone.id.clone(),
                     time: t,
                     band: band.clone(),
                     reducer: cfg.reducer.name(),
-                    value,
-                    n_valid,
-                    n_total,
+                    value: acc.finalize(cfg.reducer),
+                    n_valid: acc.n_valid,
+                    n_total: acc.n_total,
                 });
             }
         }
@@ -688,34 +688,107 @@ fn rasterize_zone(
     mask
 }
 
-/// Reduces one band over one temporal bin, pooling every covered pixel across
-/// every slice in the bin. Returns `(value, n_valid)`.
-fn reduce_bin(
+/// Combinable weighted accumulators for one `(zone, bin, band)` cell.
+///
+/// Every field is additive over disjoint pixel sets, so partial reductions of
+/// the same cell computed over separate spatial tiles merge exactly with
+/// [`BinAccum::merge`] — this is what lets [`fused_zonal_chunked`] reduce a
+/// polygon that straddles several chunks without ever holding the full cube.
+/// The sole exception is [`Reducer::Median`], which keeps every raw value
+/// (`values`) because a median cannot be recovered from summary statistics;
+/// the chunked driver therefore rejects it.
+#[derive(Clone)]
+struct BinAccum {
+    sum_w: f64,
+    sum_wv: f64,
+    sum_wv2: f64,
+    sum_w_above: f64,
+    min_v: f64,
+    max_v: f64,
+    n_valid: u64,
+    /// Covered pixels × slices in this cell (independent of finiteness);
+    /// additive across tiles.
+    n_total: u64,
+    /// Only populated for [`Reducer::Median`].
+    values: Vec<f64>,
+}
+
+impl BinAccum {
+    fn empty() -> Self {
+        BinAccum {
+            sum_w: 0.0,
+            sum_wv: 0.0,
+            sum_wv2: 0.0,
+            sum_w_above: 0.0,
+            min_v: f64::INFINITY,
+            max_v: f64::NEG_INFINITY,
+            n_valid: 0,
+            n_total: 0,
+            values: Vec::new(),
+        }
+    }
+
+    /// Folds another cell's accumulators into this one (same reducer assumed).
+    fn merge(&mut self, o: &BinAccum) {
+        self.sum_w += o.sum_w;
+        self.sum_wv += o.sum_wv;
+        self.sum_wv2 += o.sum_wv2;
+        self.sum_w_above += o.sum_w_above;
+        if o.min_v < self.min_v {
+            self.min_v = o.min_v;
+        }
+        if o.max_v > self.max_v {
+            self.max_v = o.max_v;
+        }
+        self.n_valid += o.n_valid;
+        self.n_total += o.n_total;
+        self.values.extend_from_slice(&o.values);
+    }
+
+    /// Finalizes the reducer's value (`NaN` when no finite pixel contributed).
+    fn finalize(&self, reducer: Reducer) -> f64 {
+        if self.n_valid == 0 {
+            return f64::NAN;
+        }
+        match reducer {
+            Reducer::Mean => self.sum_wv / self.sum_w,
+            Reducer::Sum => self.sum_wv,
+            Reducer::Count => self.sum_w,
+            Reducer::Min => self.min_v,
+            Reducer::Max => self.max_v,
+            Reducer::Std => {
+                let mean = self.sum_wv / self.sum_w;
+                let var = (self.sum_wv2 / self.sum_w) - mean * mean;
+                var.max(0.0).sqrt()
+            }
+            Reducer::FractionAbove(_) => self.sum_w_above / self.sum_w,
+            Reducer::Median => {
+                let mut values = self.values.clone();
+                median(&mut values)
+            }
+        }
+    }
+}
+
+/// Accumulates one band over one temporal bin, pooling every covered pixel
+/// across every slice in the bin into a combinable [`BinAccum`].
+fn accumulate_bin(
     data: &ndarray::ArrayView4<'_, f64>,
     band: usize,
     mask: &[(usize, usize, f64)],
     bin: &[usize],
     reducer: Reducer,
-) -> (f64, u64) {
-    // Accumulators for the weighted statistics.
-    let mut sum_w = 0.0;
-    let mut sum_wv = 0.0;
-    let mut sum_wv2 = 0.0;
-    let mut sum_w_above = 0.0;
-    let mut min_v = f64::INFINITY;
-    let mut max_v = f64::NEG_INFINITY;
-    let mut n_valid: u64 = 0;
-    // Only Median needs the raw values.
-    let mut values: Vec<f64> = if matches!(reducer, Reducer::Median) {
-        Vec::with_capacity(mask.len() * bin.len())
-    } else {
-        Vec::new()
-    };
+) -> BinAccum {
+    let mut acc = BinAccum::empty();
+    acc.n_total = (mask.len() as u64) * (bin.len() as u64);
+    // `v > threshold` with a NaN threshold is always false, so non-FractionAbove
+    // reducers leave `sum_w_above` at zero (it is simply never finalized).
     let threshold = if let Reducer::FractionAbove(t) = reducer {
         t
     } else {
         f64::NAN
     };
+    let keep_values = matches!(reducer, Reducer::Median);
 
     for &(row, col, w) in mask {
         for &t in bin {
@@ -723,44 +796,25 @@ fn reduce_bin(
             if !v.is_finite() {
                 continue;
             }
-            n_valid += 1;
-            sum_w += w;
-            sum_wv += w * v;
-            sum_wv2 += w * v * v;
+            acc.n_valid += 1;
+            acc.sum_w += w;
+            acc.sum_wv += w * v;
+            acc.sum_wv2 += w * v * v;
             if v > threshold {
-                sum_w_above += w;
+                acc.sum_w_above += w;
             }
-            if v < min_v {
-                min_v = v;
+            if v < acc.min_v {
+                acc.min_v = v;
             }
-            if v > max_v {
-                max_v = v;
+            if v > acc.max_v {
+                acc.max_v = v;
             }
-            if matches!(reducer, Reducer::Median) {
-                values.push(v);
+            if keep_values {
+                acc.values.push(v);
             }
         }
     }
-
-    if n_valid == 0 {
-        return (f64::NAN, 0);
-    }
-
-    let value = match reducer {
-        Reducer::Mean => sum_wv / sum_w,
-        Reducer::Sum => sum_wv,
-        Reducer::Count => sum_w,
-        Reducer::Min => min_v,
-        Reducer::Max => max_v,
-        Reducer::Std => {
-            let mean = sum_wv / sum_w;
-            let var = (sum_wv2 / sum_w) - mean * mean;
-            var.max(0.0).sqrt()
-        }
-        Reducer::FractionAbove(_) => sum_w_above / sum_w,
-        Reducer::Median => median(&mut values),
-    };
-    (value, n_valid)
+    acc
 }
 
 /// Median of finite values (input reordered). Empty → NaN.
@@ -775,6 +829,199 @@ fn median(values: &mut [f64]) -> f64 {
     } else {
         0.5 * (values[n / 2 - 1] + values[n / 2])
     }
+}
+
+/// One sensor's contribution to a fused chunked zonal reduction.
+pub struct FusedSensor {
+    /// Ingestion config; must carry a [`GridSpec`](crate::GridSpec) shared with
+    /// the other sensor (chunked ingestion requires a fixed grid).
+    pub cfg: StackConfig,
+    /// Role labels to rename the ingested bands to, applied right after each
+    /// tile is read (empty keeps the asset-key names). Both sensors must end up
+    /// with identical band names so the tiles can be concatenated in time.
+    pub rename: Vec<String>,
+    /// Per-band bandpass coefficients `(band, slope, offset)` applied as
+    /// `v' = slope·v + offset` after renaming (empty = identity). The reference
+    /// sensor normally leaves this empty; the secondary carries the transform
+    /// into the reference spectral space.
+    pub harmonize: Vec<(String, f64, f64)>,
+}
+
+/// Renames and harmonizes one freshly read tile into the shared band roles.
+fn prepare_tile(
+    cube: Cube,
+    rename: &[String],
+    harmonize: &[(String, f64, f64)],
+) -> Result<Cube, StackError> {
+    let cube = if rename.is_empty() {
+        cube
+    } else {
+        cube.rename_bands(rename.to_vec())?
+    };
+    let cube = if harmonize.is_empty() {
+        cube
+    } else {
+        cube.harmonize(harmonize)?
+    };
+    Ok(cube)
+}
+
+/// World-space bounding box of a zone (its polygons' exterior rings).
+fn zone_bbox(zone: &Zone) -> Option<(f64, f64, f64, f64)> {
+    let (mut min_x, mut min_y, mut max_x, mut max_y) =
+        (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for poly in &zone.polygons {
+        for c in poly.exterior().coords() {
+            min_x = min_x.min(c.x);
+            min_y = min_y.min(c.y);
+            max_x = max_x.max(c.x);
+            max_y = max_y.max(c.y);
+        }
+    }
+    min_x.is_finite().then_some((min_x, min_y, max_x, max_y))
+}
+
+/// Bounded-memory fusion of two sensors into per-polygon index trajectories.
+///
+/// Both sensors are ingested [chunked](crate::stack_chunked) on the **same**
+/// fixed grid (their configs' [`GridSpec`](crate::GridSpec)s must agree). Tile
+/// by tile, the secondary is renamed and harmonized into the reference spectral
+/// space, concatenated in time with the reference, reduced to a single spectral
+/// `index`, and zonally aggregated per polygon and temporal bin. Only the
+/// per-`(polygon, bin)` [`BinAccum`]s cross tiles, so peak memory is one tile of
+/// each sensor — never the whole fused cube. The result is identical, row for
+/// row, to building the full fused cube and calling [`zonal_reduce`] once.
+///
+/// The time axis of each sensor is fixed across tiles, so `concat_time`'s stable
+/// sort yields the identical fused time axis (and therefore the identical
+/// calendar bins) on every tile; the bins are computed once from the sorted
+/// union. [`Reducer::Median`] is rejected: it is the one reduction whose value
+/// cannot be combined from disjoint tiles.
+#[allow(clippy::too_many_arguments)]
+pub fn fused_zonal_chunked(
+    reference: &FusedSensor,
+    secondary: &FusedSensor,
+    index: IndexSpec,
+    features: &FeatureCollection,
+    cfg: &ZonalConfig,
+    chunk_size: usize,
+) -> Result<ZonalTable, StackError> {
+    if matches!(cfg.reducer, Reducer::Median) {
+        return Err(StackError::Zonal(
+            "fused_zonal_chunked cannot combine a median across tiles; use \
+             mean/sum/count/std/min/max/fraction_above"
+                .into(),
+        ));
+    }
+
+    let a = stack_chunked(&reference.cfg, chunk_size)?;
+    let b = stack_chunked(&secondary.cfg, chunk_size)?;
+    let (_, nya, nxa, _) = a.dims();
+    let (_, nyb, nxb, _) = b.dims();
+    if (nya, nxa) != (nyb, nxb) || a.epsg() != b.epsg() {
+        return Err(StackError::Config(format!(
+            "fused sensors must share the exact grid: {:?}@EPSG:{} vs {:?}@EPSG:{}",
+            (nya, nxa),
+            a.epsg(),
+            (nyb, nxb),
+            b.epsg()
+        )));
+    }
+
+    // Reproject the zones once — shared by every tile.
+    let dst_epsg = Some(a.epsg());
+    let src_epsg = cfg
+        .source_epsg
+        .or_else(|| features.crs().and_then(|c| c.epsg()));
+    let zones = build_zones(features, cfg, src_epsg, dst_epsg)?;
+
+    // The fused time axis is the sorted union of both sensors' (tile-invariant)
+    // axes, so the bins are identical on every tile and can be computed once.
+    let mut fused_times: Vec<f64> = a.time().iter().chain(b.time()).copied().collect();
+    fused_times.sort_by(f64::total_cmp);
+    let bins = time_bins(&fused_times, cfg.window)?;
+    let bin_times: Vec<f64> = bins.iter().map(|g| bin_time(&fused_times, g)).collect();
+    let nbins = bins.len();
+
+    let mut acc: Vec<BinAccum> = std::iter::repeat_with(BinAccum::empty)
+        .take(zones.len() * nbins)
+        .collect();
+    let index_label = index.label().to_string();
+
+    for pos in a.chunk_positions() {
+        let ca = prepare_tile(a.read_chunk(pos)?, &reference.rename, &reference.harmonize)?;
+        let cb = prepare_tile(b.read_chunk(pos)?, &secondary.rename, &secondary.harmonize)?;
+        let fused = ca.concat_time(&cb)?;
+        if fused.time().len() != fused_times.len() {
+            return Err(StackError::Zonal(format!(
+                "fused tile time axis ({}) disagrees with the precomputed axis ({})",
+                fused.time().len(),
+                fused_times.len()
+            )));
+        }
+        let idx_cube = index.apply(&fused)?;
+
+        let georef = idx_cube
+            .georef()
+            .ok_or_else(|| StackError::Zonal("index tile lost its georeference".into()))?;
+        let transform = georef
+            .transform
+            .ok_or_else(|| StackError::Zonal("index tile has no affine transform".into()))?;
+        let [ox, px_w, c, oy, e, px_h] = transform;
+        if c != 0.0 || e != 0.0 {
+            return Err(StackError::Zonal(
+                "fused zonal requires an axis-aligned (non-rotated) grid".into(),
+            ));
+        }
+        let (_, ny, nx, _) = idx_cube.dims();
+        let grid = Grid {
+            origin_x: ox,
+            origin_y: oy,
+            px_w,
+            px_h,
+            ny,
+            nx,
+        };
+        // Tile extent in grid CRS, to skip zones that cannot intersect it.
+        let tile_x0 = ox.min(ox + px_w * nx as f64);
+        let tile_x1 = ox.max(ox + px_w * nx as f64);
+        let tile_y0 = oy.min(oy + px_h * ny as f64);
+        let tile_y1 = oy.max(oy + px_h * ny as f64);
+        let data = idx_cube.data();
+
+        for (zi, zone) in zones.iter().enumerate() {
+            match zone_bbox(zone) {
+                Some((zx0, zy0, zx1, zy1))
+                    if zx0 <= tile_x1 && zx1 >= tile_x0 && zy0 <= tile_y1 && zy1 >= tile_y0 => {}
+                _ => continue, // zone outside this tile (or empty) — nothing to add
+            }
+            let mask = rasterize_zone(&zone.polygons, &grid, cfg.inclusion);
+            if mask.is_empty() {
+                continue;
+            }
+            for (bi, bin) in bins.iter().enumerate() {
+                let part = accumulate_bin(&data, 0, &mask, bin, cfg.reducer);
+                acc[zi * nbins + bi].merge(&part);
+            }
+        }
+    }
+
+    let mut rows = Vec::with_capacity(zones.len() * nbins);
+    for (zi, zone) in zones.iter().enumerate() {
+        for (bi, &t) in bin_times.iter().enumerate() {
+            let cell = &acc[zi * nbins + bi];
+            rows.push(ZonalRow {
+                polygon_id: zone.id.clone(),
+                time: t,
+                band: index_label.clone(),
+                reducer: cfg.reducer.name(),
+                value: cell.finalize(cfg.reducer),
+                n_valid: cell.n_valid,
+                n_total: cell.n_total,
+            });
+        }
+    }
+    Ok(ZonalTable { rows })
 }
 
 #[cfg(test)]
@@ -1082,5 +1329,114 @@ mod tests {
         assert_eq!(first.get_long(6).unwrap(), 4); // n_total
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A column sub-cube `cols[c0..c1]` of `grid_cube`, with its georef origin
+    /// shifted — the shape `read_chunk` produces for one spatial tile.
+    fn column_tile(nt: usize, c0: usize, c1: usize) -> Cube {
+        let ny = 4;
+        let w = c1 - c0;
+        let mut data = Array4::from_elem((1, ny, w, nt), f64::NAN);
+        for row in 0..ny {
+            for (j, col) in (c0..c1).enumerate() {
+                for t in 0..nt {
+                    data[[0, row, j, t]] = (row * 10 + col) as f64;
+                }
+            }
+        }
+        let time: Vec<f64> = (0..nt).map(|t| 2024.0 + t as f64).collect();
+        Cube::new(data, time, vec!["b1".into()])
+            .unwrap()
+            .with_georef(GeoRef {
+                epsg: Some(32719),
+                transform: Some([c0 as f64 * 10.0, 10.0, 0.0, 40.0, 0.0, -10.0]),
+            })
+    }
+
+    /// Accumulating a zonal reduction over spatial tiles and merging the
+    /// per-cell [`BinAccum`]s is identical to reducing the whole cube at once —
+    /// the exact invariant `fused_zonal_chunked` relies on. The zone's 2×2
+    /// centre block straddles the tile boundary (one column in each tile), so
+    /// this exercises the cross-tile merge, not just independent tiles.
+    #[test]
+    fn tiled_accumulation_matches_whole_reduction() {
+        let fc = square_zone("w1", 5.0, 5.0, 35.0, 35.0);
+        let whole = grid_cube(1);
+        let want = zonal_reduce(&whole, &fc, &cfg(PixelInclusion::Center, Reducer::Mean)).unwrap();
+        assert_eq!(want.rows.len(), 1);
+
+        let mut merged = BinAccum::empty();
+        for (c0, c1) in [(0usize, 2usize), (2usize, 4usize)] {
+            let tile = column_tile(1, c0, c1);
+            let [ox, pw, _, oy, _, ph] = tile.georef().unwrap().transform.unwrap();
+            let (_, ny, nx, _) = tile.dims();
+            let grid = Grid {
+                origin_x: ox,
+                origin_y: oy,
+                px_w: pw,
+                px_h: ph,
+                ny,
+                nx,
+            };
+            let zones = build_zones(
+                &fc,
+                &cfg(PixelInclusion::Center, Reducer::Mean),
+                Some(32719),
+                Some(32719),
+            )
+            .unwrap();
+            let mask = rasterize_zone(&zones[0].polygons, &grid, PixelInclusion::Center);
+            let d = tile.data();
+            merged.merge(&accumulate_bin(&d, 0, &mask, &[0], Reducer::Mean));
+        }
+        assert_eq!(merged.n_valid, 4);
+        assert_eq!(merged.n_total, want.rows[0].n_total);
+        assert!((merged.finalize(Reducer::Mean) - want.rows[0].value).abs() < 1e-12);
+        assert!((merged.finalize(Reducer::Mean) - 16.5).abs() < 1e-12);
+    }
+
+    /// Every combinable reducer (all but Median) finalizes to the same value
+    /// whether computed over the whole cube or merged from the two tiles.
+    #[test]
+    fn tiled_merge_matches_whole_for_each_reducer() {
+        let fc = square_zone("w1", 5.0, 5.0, 35.0, 35.0);
+        let whole = grid_cube(1);
+        for reducer in [
+            Reducer::Sum,
+            Reducer::Count,
+            Reducer::Std,
+            Reducer::Min,
+            Reducer::Max,
+            Reducer::FractionAbove(15.0),
+        ] {
+            let want = zonal_reduce(&whole, &fc, &cfg(PixelInclusion::Center, reducer)).unwrap();
+            let mut merged = BinAccum::empty();
+            for (c0, c1) in [(0usize, 2usize), (2usize, 4usize)] {
+                let tile = column_tile(1, c0, c1);
+                let [ox, pw, _, oy, _, ph] = tile.georef().unwrap().transform.unwrap();
+                let (_, ny, nx, _) = tile.dims();
+                let grid = Grid {
+                    origin_x: ox,
+                    origin_y: oy,
+                    px_w: pw,
+                    px_h: ph,
+                    ny,
+                    nx,
+                };
+                let zones =
+                    build_zones(&fc, &cfg(PixelInclusion::Center, reducer), Some(32719), Some(32719))
+                        .unwrap();
+                let mask = rasterize_zone(&zones[0].polygons, &grid, PixelInclusion::Center);
+                let d = tile.data();
+                merged.merge(&accumulate_bin(&d, 0, &mask, &[0], reducer));
+            }
+            assert!(
+                (merged.finalize(reducer) - want.rows[0].value).abs() < 1e-12,
+                "reducer {:?}: tiled {} vs whole {}",
+                reducer,
+                merged.finalize(reducer),
+                want.rows[0].value
+            );
+        }
     }
 }

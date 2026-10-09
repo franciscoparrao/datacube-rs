@@ -23,6 +23,7 @@
 
 use datacube_core::{Cube, GeoRef};
 use ndarray::{Array2, Array4, s};
+use rayon::prelude::*;
 use surtgis_cloud::blocking::StacClientBlocking;
 use surtgis_cloud::stac_models::StacItem;
 use surtgis_cloud::{BBox, StacCatalog, StacClientOptions, reproject};
@@ -70,6 +71,11 @@ pub struct ChunkedStack {
     candidates: Vec<(StacItem, SliceMeta)>,
     skipped: Vec<String>,
     times: Vec<f64>,
+    // Dedicated read pool (sized by `cfg.concurrency`), reused across chunks so
+    // each tile's per-scene COG reads run in parallel — the same I/O-bound
+    // speed-up `stack()` gets, applied per tile. Kept separate from Rayon's
+    // global pool (which core uses for per-pixel compute).
+    pool: rayon::ThreadPool,
 }
 
 /// Prepares a bounded-memory chunked ingestion. Requires an explicit
@@ -119,6 +125,14 @@ pub fn stack_chunked(cfg: &StackConfig, chunk_size: usize) -> Result<ChunkedStac
     }
     let times = candidates.iter().map(|(_, m)| m.time).collect();
 
+    if cfg.concurrency == 0 {
+        return Err(StackError::Config("concurrency must be > 0".into()));
+    }
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(cfg.concurrency)
+        .build()
+        .map_err(|e| StackError::Config(format!("failed to build chunk read pool: {e}")))?;
+
     Ok(ChunkedStack {
         client,
         needs_signing,
@@ -134,6 +148,7 @@ pub fn stack_chunked(cfg: &StackConfig, chunk_size: usize) -> Result<ChunkedStac
         candidates,
         skipped,
         times,
+        pool,
     })
 }
 
@@ -217,28 +232,32 @@ impl ChunkedStack {
         let nb = self.cfg.assets.len();
         let nt = self.candidates.len();
         let mut data = Array4::from_elem((nb, height, width, nt), f64::NAN);
-        for (t, (item, meta)) in self.candidates.iter().enumerate() {
-            match read_scene(
-                &self.client,
-                item,
-                &self.cfg,
-                &read_wgs,
-                self.needs_signing,
-                Some(&subref),
-                Some(self.ref_epsg),
-            ) {
-                Ok(rasters) => {
-                    for (bi, raster) in rasters.iter().enumerate() {
-                        data.slice_mut(s![bi, .., .., t]).assign(raster.data());
+        // Read every scene's window for this tile in parallel into its own
+        // (disjoint) time slot — the same bounded-pool, disjoint-slot pattern
+        // `stack()` uses (no `unsafe`: `ArrayViewMut: Send` and the slots don't
+        // overlap). A read failure (or a scene that does not cover this chunk)
+        // leaves NaN in its slot; other chunks may still have that scene.
+        let slots: Vec<_> = data.axis_iter_mut(ndarray::Axis(3)).collect();
+        self.pool.install(|| {
+            self.candidates
+                .par_iter()
+                .zip(slots)
+                .for_each(|((item, _meta), mut slot)| {
+                    if let Ok(rasters) = read_scene(
+                        &self.client,
+                        item,
+                        &self.cfg,
+                        &read_wgs,
+                        self.needs_signing,
+                        Some(&subref),
+                        Some(self.ref_epsg),
+                    ) {
+                        for (bi, raster) in rasters.iter().enumerate() {
+                            slot.slice_mut(s![bi, .., ..]).assign(raster.data());
+                        }
                     }
-                }
-                // A read failure (or a scene that does not cover this chunk)
-                // leaves NaN in this slot; other chunks may still have it.
-                Err(_) => {
-                    let _ = meta;
-                }
-            }
-        }
+                });
+        });
 
         let cube =
             Cube::new(data, self.times.clone(), self.cfg.assets.clone())?.with_georef(GeoRef {

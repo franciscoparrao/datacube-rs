@@ -83,6 +83,14 @@ def main():
                          "Table 5 coefficients. Pass --coeffs '' for identity.")
     ap.add_argument("--out", default="fused_wetland_trends.csv")
     ap.add_argument("--fdr-q", type=float, default=0.05)
+    ap.add_argument("--chunked", action="store_true",
+                    help="bounded-memory native path (dc.fused_zonal): ingest both "
+                         "sensors chunked on the shared grid and zonal-reduce tile by "
+                         "tile, never materializing the full fused cube. Required for "
+                         "large extents the in-memory path cannot hold.")
+    ap.add_argument("--chunk-size", type=int, default=512,
+                    help="spatial tile size (px) for --chunked; trades memory for "
+                         "COG round-trips.")
     args = ap.parse_args()
 
     if not hasattr(dc, "stack"):
@@ -104,33 +112,61 @@ def main():
         print(f"harmonizing S2->OLI with {args.coeffs}: "
               + ", ".join(f"{b}={tuple(v)}" for b, v in coeffs.items()), file=sys.stderr)
 
-    common = dict(bbox=bbox, grid_epsg=args.grid_epsg, grid_res=args.grid_res,
-                  grid_bbox=grid_bbox, limit=args.limit, overview=args.overview)
+    src_epsg = 4326 if args.vector.endswith((".geojson", ".json")) else None
 
-    print("stacking Landsat C2 L2 ...", file=sys.stderr)
-    ls = stack_sensor("landsat-c2-l2", list(LANDSAT_BANDS.values()),
-                      datetime=args.landsat_datetime, scale=LANDSAT_C2_SCALE,
-                      offset=LANDSAT_C2_OFFSET, mask="qa_pixel", mask_asset="qa_pixel",
-                      **common)["cube"]
-    ls = ls.rename_bands(list(LANDSAT_BANDS.keys()))  # -> [green, nir]
+    if args.chunked:
+        if not hasattr(dc, "fused_zonal"):
+            print("datacube_rs built without 'stac' (no fused_zonal); rebuild.",
+                  file=sys.stderr)
+            return 2
+        sensor_a = dict(collection="landsat-c2-l2",
+                        assets=list(LANDSAT_BANDS.values()),
+                        rename=list(LANDSAT_BANDS.keys()),  # -> [green, nir]
+                        datetime=args.landsat_datetime,
+                        scale=LANDSAT_C2_SCALE, offset=LANDSAT_C2_OFFSET,
+                        mask="qa_pixel", mask_asset="qa_pixel")  # reference (identity)
+        sensor_b = dict(collection="sentinel-2-l2a",
+                        assets=list(S2_BANDS.values()),
+                        rename=list(S2_BANDS.keys()),  # -> [green, nir]
+                        datetime=args.s2_datetime,
+                        scale=S2_L2A_SCALE, offset=S2_L2A_OFFSET,
+                        mask="scl", mask_asset="SCL",
+                        harmonize=coeffs)  # S2 -> OLI (empty => identity)
+        print(f"fused chunked ingest+zonal (chunk={args.chunk_size}) ...", file=sys.stderr)
+        tbl = dc.fused_zonal(
+            sensor_a, sensor_b, bbox=bbox,
+            grid_epsg=args.grid_epsg, grid_res=args.grid_res, grid_bbox=grid_bbox,
+            vector=args.vector, id_field=args.id_field,
+            index="ndwi", green="green", nir="nir",
+            reducer="mean", inclusion="center", window="monthly",
+            source_epsg=src_epsg, max_items=args.limit, chunk_size=args.chunk_size,
+        )
+    else:
+        print("stacking Landsat C2 L2 ...", file=sys.stderr)
+        ls = stack_sensor("landsat-c2-l2", list(LANDSAT_BANDS.values()),
+                          datetime=args.landsat_datetime, scale=LANDSAT_C2_SCALE,
+                          offset=LANDSAT_C2_OFFSET, mask="qa_pixel", mask_asset="qa_pixel",
+                          bbox=bbox, grid_epsg=args.grid_epsg, grid_res=args.grid_res,
+                          grid_bbox=grid_bbox, limit=args.limit, overview=args.overview)["cube"]
+        ls = ls.rename_bands(list(LANDSAT_BANDS.keys()))  # -> [green, nir]
 
-    print("stacking Sentinel-2 L2A ...", file=sys.stderr)
-    s2 = stack_sensor("sentinel-2-l2a", list(S2_BANDS.values()),
-                      datetime=args.s2_datetime, scale=S2_L2A_SCALE,
-                      offset=S2_L2A_OFFSET, mask="scl", mask_asset="SCL",
-                      **common)["cube"]
-    s2 = s2.rename_bands(list(S2_BANDS.keys()))  # -> [green, nir]
-    if coeffs:
-        s2 = s2.harmonize({b: tuple(v) for b, v in coeffs.items()})  # S2 -> OLI
+        print("stacking Sentinel-2 L2A ...", file=sys.stderr)
+        s2 = stack_sensor("sentinel-2-l2a", list(S2_BANDS.values()),
+                          datetime=args.s2_datetime, scale=S2_L2A_SCALE,
+                          offset=S2_L2A_OFFSET, mask="scl", mask_asset="SCL",
+                          bbox=bbox, grid_epsg=args.grid_epsg, grid_res=args.grid_res,
+                          grid_bbox=grid_bbox, limit=args.limit, overview=args.overview)["cube"]
+        s2 = s2.rename_bands(list(S2_BANDS.keys()))  # -> [green, nir]
+        if coeffs:
+            s2 = s2.harmonize({b: tuple(v) for b, v in coeffs.items()})  # S2 -> OLI
 
-    print("fusing (concat_time) and computing NDWI ...", file=sys.stderr)
-    fused = ls.concat_time(s2)
-    ndwi = fused.ndwi("green", "nir")  # McFeeters NDWI
+        print("fusing (concat_time) and computing NDWI ...", file=sys.stderr)
+        fused = ls.concat_time(s2)
+        ndwi = fused.ndwi("green", "nir")  # McFeeters NDWI
 
-    print("zonal reduction per wetland (monthly) ...", file=sys.stderr)
-    tbl = ndwi.zonal(args.vector, id_field=args.id_field, reducer="mean",
-                     inclusion="center", window="monthly",
-                     source_epsg=4326 if args.vector.endswith((".geojson", ".json")) else None)
+        print("zonal reduction per wetland (monthly) ...", file=sys.stderr)
+        tbl = ndwi.zonal(args.vector, id_field=args.id_field, reducer="mean",
+                         inclusion="center", window="monthly", source_epsg=src_epsg)
 
     # per-wetland seasonal MK + FDR across wetlands
     import collections as _c

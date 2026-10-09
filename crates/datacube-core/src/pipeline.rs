@@ -73,7 +73,10 @@ impl IndexSpec {
         }
     }
 
-    fn apply(&self, cube: &Cube) -> Result<Cube, CubeError> {
+    /// Computes the index on `cube`, returning a single-band cube labelled
+    /// [`IndexSpec::label`]. Public so bounded-memory drivers in other crates
+    /// (e.g. `datacube-io`'s chunked fusion) can apply the index per tile.
+    pub fn apply(&self, cube: &Cube) -> Result<Cube, CubeError> {
         match self {
             IndexSpec::Ndvi { nir, red } => indices::ndvi(cube, nir, red),
             IndexSpec::Ndwi { green, nir } => indices::ndwi(cube, green, nir),
