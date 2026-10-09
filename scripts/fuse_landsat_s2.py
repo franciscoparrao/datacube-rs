@@ -85,6 +85,11 @@ def main():
                          "are provenance and ignored); defaults to the bundled HLS "
                          "Table 5 coefficients. Pass --coeffs '' for identity.")
     ap.add_argument("--out", default="fused_wetland_trends.csv")
+    ap.add_argument("--zonal-table-out", default=None,
+                    help="write the raw per-(wetland, month) NDWI table here and "
+                         "skip MK/FDR (for per-year/per-shard runs; merge the shard "
+                         "tables with merge_fused_trends.py). Columns: polygon_id, "
+                         "time, value, n_valid, n_total.")
     ap.add_argument("--fdr-q", type=float, default=0.05)
     ap.add_argument("--chunked", action="store_true",
                     help="bounded-memory native path (dc.fused_zonal): ingest both "
@@ -189,6 +194,24 @@ def main():
         print("zonal reduction per wetland (monthly) ...", file=sys.stderr)
         tbl = ndwi.zonal(args.vector, id_field=args.id_field, reducer="mean",
                          inclusion="center", window="monthly", source_epsg=src_epsg)
+
+    # Table-only mode (per-year/per-shard runs): dump the raw zonal table and
+    # stop — the seasonal MK + FDR is run once by merge_fused_trends.py over the
+    # concatenation of all shard tables (months are disjoint across years).
+    if args.zonal_table_out:
+        with open(args.zonal_table_out, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["polygon_id", "time", "value", "n_valid", "n_total"])
+            for row in zip(tbl["polygon_id"], tbl["time"], tbl["value"],
+                           tbl["n_valid"], tbl["n_total"]):
+                pid, t, v, nv, nt = row
+                w.writerow([pid, t, "" if v != v else v, nv, nt])
+        bins = sorted(set(tbl["time"]))
+        span = f"{bins[0]:.2f}..{bins[-1]:.2f}" if bins else "empty"
+        print(f"wrote zonal table {args.zonal_table_out}: span {span}, "
+              f"{len(bins)} bins, {len(set(tbl['polygon_id']))} polygons",
+              file=sys.stderr)
+        return 0
 
     # per-wetland seasonal MK + FDR across wetlands
     import collections as _c
