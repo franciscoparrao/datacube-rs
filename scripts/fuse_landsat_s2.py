@@ -14,8 +14,11 @@ Recipe:
      each with its own bands, quality mask and reflectance scaling.
   2. Relabel both to common role names (green, nir).
   3. Harmonize Sentinel-2 into Landsat OLI spectral space (per-band bandpass
-     adjustment; coefficients from --coeffs, e.g. Claverie et al. 2018 HLS
-     Table 5 / Roy et al. 2016). Landsat is the reference (identity).
+     adjustment rho_OLI = a*rho_MSI + b; coefficients default to the bundled
+     scripts/coeffs_s2_to_oli.json, i.e. HLS User Guide v1.5 Table 5 / Claverie
+     et al. 2018, mean of the S2A/S2B values). Landsat is the reference (identity).
+     The S2 NIR band is B8A (~865 nm), the spectral match of OLI nir08 that the
+     NIR coefficient was derived for.
   4. Fuse in time (concat_time → ascending), compute NDWI.
   5. Zonal-reduce per wetland (monthly), then per-wetland seasonal Mann-Kendall
      + FDR across wetlands.
@@ -30,6 +33,7 @@ Requires the stac-enabled binding:
 import argparse
 import csv
 import json
+import os
 import sys
 
 import numpy as np
@@ -40,8 +44,11 @@ LANDSAT_C2_SCALE, LANDSAT_C2_OFFSET = 2.75e-5, -0.2  # USGS C2 L2 SR
 S2_L2A_SCALE, S2_L2A_OFFSET = 1e-4, -0.1  # baseline >= 04.00
 
 # Role -> asset key per sensor.
+# NIR: Landsat nir08 is OLI band 5 (~865 nm); its MSI spectral equivalent is B8A
+# (~865 nm), NOT B08 (~842 nm). B8A is the band the HLS NIR bandpass coefficient
+# (Table 5, MSI band 8A) was derived for, so the harmonization is only valid for it.
 LANDSAT_BANDS = {"green": "green", "nir": "nir08"}  # PC landsat-c2-l2 common names
-S2_BANDS = {"green": "B03", "nir": "B08"}
+S2_BANDS = {"green": "B03", "nir": "B8A"}
 
 
 def stack_sensor(collection, assets, bbox, datetime, grid_epsg, grid_res, grid_bbox,
@@ -69,7 +76,11 @@ def main():
     ap.add_argument("--s2-datetime", default="2015-06-01/2024-12-31")
     ap.add_argument("--limit", type=int, default=4000)
     ap.add_argument("--overview", type=int, default=None)
-    ap.add_argument("--coeffs", help="JSON {band:[slope,offset]} S2->OLI; identity if omitted")
+    ap.add_argument("--coeffs", default=os.path.join(os.path.dirname(__file__),
+                    "coeffs_s2_to_oli.json"),
+                    help="JSON {band:[slope,offset]} S2->OLI (keys starting with '_' "
+                         "are provenance and ignored); defaults to the bundled HLS "
+                         "Table 5 coefficients. Pass --coeffs '' for identity.")
     ap.add_argument("--out", default="fused_wetland_trends.csv")
     ap.add_argument("--fdr-q", type=float, default=0.05)
     args = ap.parse_args()
@@ -80,11 +91,18 @@ def main():
 
     bbox = tuple(float(x) for x in args.bbox.split(","))
     grid_bbox = tuple(float(x) for x in args.grid_bbox.split(",")) if args.grid_bbox else None
-    coeffs = json.load(open(args.coeffs)) if args.coeffs else {}
+    coeffs = {}
+    if args.coeffs:
+        raw = json.load(open(args.coeffs))
+        coeffs = {b: v for b, v in raw.items() if not b.startswith("_")}
     if not coeffs:
-        print("WARNING: no --coeffs given; harmonization is IDENTITY (no bandpass "
-              "adjustment). Supply Claverie 2018 / Roy 2016 S2->OLI coefficients "
-              "for a scientifically valid fusion.", file=sys.stderr)
+        print("WARNING: harmonization is IDENTITY (no bandpass adjustment). Supply "
+              "HLS Table 5 / Claverie 2018 S2->OLI coefficients (scripts/"
+              "coeffs_s2_to_oli.json) for a scientifically valid fusion.",
+              file=sys.stderr)
+    else:
+        print(f"harmonizing S2->OLI with {args.coeffs}: "
+              + ", ".join(f"{b}={tuple(v)}" for b, v in coeffs.items()), file=sys.stderr)
 
     common = dict(bbox=bbox, grid_epsg=args.grid_epsg, grid_res=args.grid_res,
                   grid_bbox=grid_bbox, limit=args.limit, overview=args.overview)

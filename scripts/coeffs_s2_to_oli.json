@@ -1,0 +1,7 @@
+{
+  "_source": "HLS User Guide v1.5, Table 5 (bandpass adjustment; Claverie et al. 2018, RSE 219). Model: rho_OLI = a*rho_MSI + b (Eq. 5). OLI is the reference; Sentinel-2 MSI is adjusted into OLI spectral space.",
+  "_platforms": "Coefficients are the arithmetic mean of the published Sentinel-2A and Sentinel-2B values, because the STAC stack pools both platforms and the engine applies one coefficient per band. Published pairs -- GREEN (OLI3/MSI3): S2A 1.0053/-0.0009, S2B 1.0075/-0.0008. NIR (OLI5/MSI8A): S2A 0.9983/-0.0001, S2B 0.9966/0.0000.",
+  "_bands": "Role 'nir' pairs OLI band 5 (Landsat nir08, ~865 nm) with MSI band 8A (~865 nm) -- NOT B08 (~842 nm), which is the band the NIR1 coefficient was derived for. Reflectance units (offsets in surface-reflectance [0,1]); apply AFTER scale/offset.",
+  "green": [1.0064, -0.00085],
+  "nir": [0.99745, -0.00005]
+}
