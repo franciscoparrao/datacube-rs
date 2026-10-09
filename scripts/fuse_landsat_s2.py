@@ -91,6 +91,17 @@ def main():
     ap.add_argument("--chunk-size", type=int, default=512,
                     help="spatial tile size (px) for --chunked; trades memory for "
                          "COG round-trips.")
+    ap.add_argument("--streaming", action="store_true",
+                    help="with --chunked: use the scene-streaming driver (each "
+                         "scene read ONCE -> I/O = n_scenes, not n_tiles*n_scenes). "
+                         "The feasible path for the full multi-decadal extent.")
+    ap.add_argument("--concurrency", type=int, default=4,
+                    help="parallel scene reads for --streaming (each holds a "
+                         "full-extent grid in RAM; lower it if memory is tight).")
+    ap.add_argument("--max-cloud-cover", type=float, default=90.0,
+                    help="scene-level cloud-cover cap (%%); drops near-fully-clouded "
+                         "scenes before reading (per-pixel masking still applies). "
+                         "Pass a high value to keep all scenes.")
     args = ap.parse_args()
 
     if not hasattr(dc, "stack"):
@@ -124,22 +135,28 @@ def main():
                         rename=list(LANDSAT_BANDS.keys()),  # -> [green, nir]
                         datetime=args.landsat_datetime,
                         scale=LANDSAT_C2_SCALE, offset=LANDSAT_C2_OFFSET,
-                        mask="qa_pixel", mask_asset="qa_pixel")  # reference (identity)
+                        mask="qa_pixel", mask_asset="qa_pixel",
+                        max_cloud_cover=args.max_cloud_cover)  # reference (identity)
         sensor_b = dict(collection="sentinel-2-l2a",
                         assets=list(S2_BANDS.values()),
                         rename=list(S2_BANDS.keys()),  # -> [green, nir]
                         datetime=args.s2_datetime,
                         scale=S2_L2A_SCALE, offset=S2_L2A_OFFSET,
                         mask="scl", mask_asset="SCL",
+                        max_cloud_cover=args.max_cloud_cover,
                         harmonize=coeffs)  # S2 -> OLI (empty => identity)
-        print(f"fused chunked ingest+zonal (chunk={args.chunk_size}) ...", file=sys.stderr)
+        mode = ("scene-streaming (I/O = n_scenes)" if args.streaming
+                else f"tile-chunked (chunk={args.chunk_size})")
+        print(f"fused native ingest+zonal, {mode} ...", file=sys.stderr)
         tbl = dc.fused_zonal(
             sensor_a, sensor_b, bbox=bbox,
             grid_epsg=args.grid_epsg, grid_res=args.grid_res, grid_bbox=grid_bbox,
             vector=args.vector, id_field=args.id_field,
             index="ndwi", green="green", nir="nir",
             reducer="mean", inclusion="center", window="monthly",
-            source_epsg=src_epsg, max_items=args.limit, chunk_size=args.chunk_size,
+            source_epsg=src_epsg, max_items=args.limit,
+            chunk_size=args.chunk_size, streaming=args.streaming,
+            concurrency=args.concurrency,
         )
     else:
         print("stacking Landsat C2 L2 ...", file=sys.stderr)

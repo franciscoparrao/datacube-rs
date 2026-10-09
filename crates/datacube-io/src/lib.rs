@@ -39,7 +39,7 @@ pub use stack_chunked::{ChunkPos, ChunkedStack, stack_chunked};
 pub use time::fractional_year;
 pub use vector::{
     FusedSensor, PixelInclusion, Reducer, ZonalConfig, ZonalRow, ZonalTable, fused_zonal_chunked,
-    read_zones, zonal_reduce,
+    fused_zonal_streaming, read_zones, zonal_reduce,
 };
 
 /// The vector feature collection type ([`surtgis_core::vector::FeatureCollection`]),

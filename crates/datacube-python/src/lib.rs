@@ -802,6 +802,10 @@ fn fused_sensor_from_dict(
             Some(v) => Some(v.extract()?),
             None => None,
         };
+    let max_cloud_cover: Option<f64> = match opt("max_cloud_cover")? {
+        Some(v) => Some(v.extract()?),
+        None => None,
+    };
 
     let asset_refs: Vec<&str> = assets.iter().map(String::as_str).collect();
     let [w, s, e, n] = bbox;
@@ -813,6 +817,9 @@ fn fused_sensor_from_dict(
         .scaling(scale, offset)
         .cross_zone_mosaic(cross_zone_mosaic)
         .concurrency(concurrency);
+    if let Some(cc) = max_cloud_cover {
+        cfg = cfg.max_cloud_cover(cc);
+    }
     if let Some(kind) = mask {
         let mc = build_mask_py(&kind, &collection, mask_asset.as_deref(), mask_keep, None, None)?;
         cfg = cfg.mask(mc);
@@ -906,10 +913,11 @@ fn zonal_table_to_pydict<'py>(
 #[pyo3(signature = (
     sensor_a, sensor_b, bbox, grid_epsg, grid_res, vector, id_field,
     catalog="pc", grid_bbox=None, grid_align=None,
-    max_items=4000, concurrency=8, overview=None, cross_zone_mosaic=true,
+    max_items=4000, overview=None, cross_zone_mosaic=true,
     index="ndwi", green="green", nir="nir", red="red",
     reducer="mean", inclusion="center", window="monthly",
     source_epsg=None, threshold=None, chunk_size=512,
+    streaming=false, concurrency=4,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn fused_zonal<'py>(
@@ -925,7 +933,6 @@ fn fused_zonal<'py>(
     grid_bbox: Option<[f64; 4]>,
     grid_align: Option<f64>,
     max_items: usize,
-    concurrency: usize,
     overview: Option<usize>,
     cross_zone_mosaic: bool,
     index: &str,
@@ -938,9 +945,14 @@ fn fused_zonal<'py>(
     source_epsg: Option<u32>,
     threshold: Option<f64>,
     chunk_size: usize,
+    streaming: bool,
+    concurrency: usize,
 ) -> PyResult<Bound<'py, PyDict>> {
     use datacube_core::IndexSpec;
-    use datacube_io::{PixelInclusion, Reducer, ZonalConfig, fused_zonal_chunked, read_zones};
+    use datacube_io::{
+        PixelInclusion, Reducer, ZonalConfig, fused_zonal_chunked, fused_zonal_streaming,
+        read_zones,
+    };
 
     let reference = fused_sensor_from_dict(
         &sensor_a,
@@ -1015,7 +1027,20 @@ fn fused_zonal<'py>(
     let features = read_zones(std::path::Path::new(vector)).map_err(err)?;
     let table = py
         .detach(|| {
-            fused_zonal_chunked(&reference, &secondary, index_spec, &features, &cfg, chunk_size)
+            if streaming {
+                // scene-streaming: each scene read once, bounded I/O (n_scenes)
+                fused_zonal_streaming(
+                    &reference,
+                    &secondary,
+                    index_spec,
+                    &features,
+                    &cfg,
+                    concurrency,
+                )
+            } else {
+                // tile-chunked: bounded memory, I/O ~ n_tiles * n_scenes
+                fused_zonal_chunked(&reference, &secondary, index_spec, &features, &cfg, chunk_size)
+            }
         })
         .map_err(err)?;
 

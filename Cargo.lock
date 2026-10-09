@@ -584,7 +584,7 @@ dependencies = [
 
 [[package]]
 name = "datacube-cli"
-version = "0.22.0"
+version = "0.23.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -598,7 +598,7 @@ dependencies = [
 
 [[package]]
 name = "datacube-core"
-version = "0.22.0"
+version = "0.23.0"
 dependencies = [
  "approx",
  "criterion",
@@ -610,7 +610,7 @@ dependencies = [
 
 [[package]]
 name = "datacube-io"
-version = "0.22.0"
+version = "0.23.0"
 dependencies = [
  "approx",
  "datacube-core",
@@ -625,7 +625,7 @@ dependencies = [
 
 [[package]]
 name = "datacube-python"
-version = "0.22.0"
+version = "0.23.0"
 dependencies = [
  "datacube-core",
  "datacube-io",
@@ -637,7 +637,7 @@ dependencies = [
 
 [[package]]
 name = "datacube-wasm"
-version = "0.22.0"
+version = "0.23.0"
 dependencies = [
  "datacube-core",
  "js-sys",
@@ -650,7 +650,7 @@ dependencies = [
 
 [[package]]
 name = "datacube-zarr"
-version = "0.22.0"
+version = "0.23.0"
 dependencies = [
  "approx",
  "crs-definitions",

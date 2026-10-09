@@ -27,14 +27,20 @@
 use std::io::Write;
 use std::path::Path;
 
-use datacube_core::{CompositeWindow, Cube, IndexSpec, bin_time, time_bins};
-use surtgis_cloud::reproject;
+use datacube_core::{CompositeWindow, Cube, GeoRef, IndexSpec, bin_time, time_bins};
+use ndarray::{Array4, s};
+use rayon::prelude::*;
+use surtgis_cloud::blocking::StacClientBlocking;
+use surtgis_cloud::stac_models::StacItem;
+use surtgis_cloud::{BBox, StacCatalog, StacClientOptions, reproject};
 use surtgis_core::geo::{Area, BooleanOps, Contains, Intersects};
 use surtgis_core::geo_types::{Coord, Geometry, LineString, Polygon, Rect};
 use surtgis_core::vector::{AttributeValue, FeatureCollection, read_vector};
 
 use crate::StackError;
-use crate::stack::StackConfig;
+use crate::stack::{
+    SliceMeta, StackConfig, plan_scene, read_scene, reference_from_grid, search_sorted_dedup,
+};
 use crate::stack_chunked::stack_chunked;
 
 /// How a polygon selects the cube pixels it covers.
@@ -1006,6 +1012,222 @@ pub fn fused_zonal_chunked(
         }
     }
 
+    let mut rows = Vec::with_capacity(zones.len() * nbins);
+    for (zi, zone) in zones.iter().enumerate() {
+        for (bi, &t) in bin_times.iter().enumerate() {
+            let cell = &acc[zi * nbins + bi];
+            rows.push(ZonalRow {
+                polygon_id: zone.id.clone(),
+                time: t,
+                band: index_label.clone(),
+                reducer: cfg.reducer.name(),
+                value: cell.finalize(cfg.reducer),
+                n_valid: cell.n_valid,
+                n_total: cell.n_total,
+            });
+        }
+    }
+    Ok(ZonalTable { rows })
+}
+
+/// Client + filtered candidate scenes for one sensor (no pixels read yet).
+struct SensorPrep {
+    client: StacClientBlocking,
+    needs_signing: bool,
+    cfg: StackConfig,
+    candidates: Vec<(StacItem, SliceMeta)>,
+}
+
+/// Searches one sensor and runs the network-free per-scene pre-filter against
+/// the shared reference grid, reading no pixels.
+fn prepare_sensor(cfg: &StackConfig, ref_epsg: u32) -> Result<SensorPrep, StackError> {
+    cfg.validate()?;
+    let catalog = StacCatalog::from_str_or_url(&cfg.catalog);
+    let needs_signing = catalog.needs_signing();
+    let options = StacClientOptions {
+        max_items: cfg.max_items,
+        ..StacClientOptions::default()
+    };
+    let client = StacClientBlocking::new(catalog, options)?;
+    let items = search_sorted_dedup(&client, cfg)?;
+    let candidates = items
+        .into_iter()
+        .filter_map(|item| plan_scene(&item, cfg, Some(ref_epsg)).ok().map(|m| (item, m)))
+        .collect();
+    Ok(SensorPrep {
+        client,
+        needs_signing,
+        cfg: cfg.clone(),
+        candidates,
+    })
+}
+
+/// Bounded-memory, bounded-I/O fusion of two sensors into per-polygon index
+/// trajectories — the scene-streaming counterpart of [`fused_zonal_chunked`].
+///
+/// Where the tile-chunked driver re-reads every scene once per spatial tile
+/// (`n_tiles × n_scenes` windowed reads — prohibitive for a deep archive of
+/// large scenes over many small polygons), this reads **each scene exactly
+/// once** (resampled to the shared reference grid), computes the index, and
+/// accumulates it straight into the per-`(polygon, calendar-bin)` [`BinAccum`]s.
+/// The polygons are rasterized against the fixed grid **once** and the masks are
+/// reused for every scene. Peak memory is the per-scene grids held by the
+/// bounded read pool plus the (small) accumulators; total I/O is `n_scenes`.
+///
+/// Both sensors' configs must carry the same [`GridSpec`](crate::GridSpec).
+/// `reference`'s scenes are the identity spectral reference; `secondary`'s are
+/// harmonized into it. [`Reducer::Median`] is rejected (not tile/scene
+/// combinable). Rows are identical to a full-cube [`zonal_reduce`] over the
+/// fused record.
+pub fn fused_zonal_streaming(
+    reference: &FusedSensor,
+    secondary: &FusedSensor,
+    index: IndexSpec,
+    features: &FeatureCollection,
+    cfg: &ZonalConfig,
+    concurrency: usize,
+) -> Result<ZonalTable, StackError> {
+    if matches!(cfg.reducer, Reducer::Median) {
+        return Err(StackError::Zonal(
+            "fused_zonal_streaming cannot combine a median; use \
+             mean/sum/count/std/min/max/fraction_above"
+                .into(),
+        ));
+    }
+    if concurrency == 0 {
+        return Err(StackError::Config("concurrency must be > 0".into()));
+    }
+
+    let spec_a = reference.cfg.grid.as_ref().ok_or_else(|| {
+        StackError::Config("streaming fusion requires an explicit grid on the reference".into())
+    })?;
+    let spec_b = secondary.cfg.grid.as_ref().ok_or_else(|| {
+        StackError::Config("streaming fusion requires an explicit grid on the secondary".into())
+    })?;
+    if spec_b.epsg != spec_a.epsg
+        || spec_b.resolution != spec_a.resolution
+        || spec_b.bbox != spec_a.bbox
+        || spec_b.align != spec_a.align
+    {
+        return Err(StackError::Config(
+            "fused streaming sensors must share the exact grid".into(),
+        ));
+    }
+    let ref_epsg = spec_a.epsg;
+    let [w, s, e, n] = reference.cfg.bbox;
+    let reference_raster = reference_from_grid(spec_a, &BBox::new(w, s, e, n))?;
+    let (ny, nx) = reference_raster.shape();
+    let gt = reference_raster.transform().to_gdal();
+
+    // Rasterize every zone once against the fixed grid; reuse for all scenes.
+    let src_epsg = cfg
+        .source_epsg
+        .or_else(|| features.crs().and_then(|c| c.epsg()));
+    let zones = build_zones(features, cfg, src_epsg, Some(ref_epsg))?;
+    let grid = Grid {
+        origin_x: gt[0],
+        origin_y: gt[3],
+        px_w: gt[1],
+        px_h: gt[5],
+        ny,
+        nx,
+    };
+    let zone_masks: Vec<Vec<(usize, usize, f64)>> = zones
+        .iter()
+        .map(|z| rasterize_zone(&z.polygons, &grid, cfg.inclusion))
+        .collect();
+
+    let prep_a = prepare_sensor(&reference.cfg, ref_epsg)?;
+    let prep_b = prepare_sensor(&secondary.cfg, ref_epsg)?;
+    if prep_a.candidates.is_empty() && prep_b.candidates.is_empty() {
+        return Err(StackError::Empty(
+            "no scene from either sensor survived the pre-filter".into(),
+        ));
+    }
+
+    // One job per scene (both sensors), tagged by which sensor it belongs to.
+    struct Job<'a> {
+        secondary: bool,
+        item: &'a StacItem,
+        time: f64,
+    }
+    let mut jobs: Vec<Job> = Vec::with_capacity(prep_a.candidates.len() + prep_b.candidates.len());
+    for (item, m) in &prep_a.candidates {
+        jobs.push(Job { secondary: false, item, time: m.time });
+    }
+    for (item, m) in &prep_b.candidates {
+        jobs.push(Job { secondary: true, item, time: m.time });
+    }
+
+    // Calendar bins over the sorted union of scene times; each scene maps to one
+    // bin via its time (bins are contiguous in ascending time).
+    let mut sorted_times: Vec<f64> = jobs.iter().map(|j| j.time).collect();
+    sorted_times.sort_by(f64::total_cmp);
+    let bins = time_bins(&sorted_times, cfg.window)?;
+    let bin_times: Vec<f64> = bins.iter().map(|g| bin_time(&sorted_times, g)).collect();
+    let nbins = bins.len();
+    let bin_lo: Vec<f64> = bins.iter().map(|g| sorted_times[g[0]]).collect();
+    let bin_of = |t: f64| bin_lo.partition_point(|&l| l <= t).saturating_sub(1);
+
+    let acc = std::sync::Mutex::new(vec![BinAccum::empty(); zones.len() * nbins]);
+    let georef = GeoRef {
+        epsg: Some(ref_epsg),
+        transform: Some(gt),
+    };
+    let reference_raster = &reference_raster;
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(concurrency)
+        .build()
+        .map_err(|e| StackError::Config(format!("failed to build stream pool: {e}")))?;
+    pool.install(|| {
+        jobs.par_iter().try_for_each(|job| -> Result<(), StackError> {
+            let (prep, sensor) = if job.secondary {
+                (&prep_b, secondary)
+            } else {
+                (&prep_a, reference)
+            };
+            let [bw, bs, be, bn] = prep.cfg.bbox;
+            let rasters = match read_scene(
+                &prep.client,
+                job.item,
+                &prep.cfg,
+                &BBox::new(bw, bs, be, bn),
+                prep.needs_signing,
+                Some(reference_raster),
+                Some(ref_epsg),
+            ) {
+                Ok(r) => r,
+                // A scene that fails to read (or does not cover the grid) simply
+                // contributes nothing — the same tolerance as the batch path.
+                Err(_) => return Ok(()),
+            };
+            let mut data = Array4::<f64>::from_elem((rasters.len(), ny, nx, 1), f64::NAN);
+            for (bi, r) in rasters.iter().enumerate() {
+                data.slice_mut(s![bi, .., .., 0]).assign(r.data());
+            }
+            let cube = Cube::new(data, vec![job.time], prep.cfg.assets.clone())?.with_georef(georef);
+            let cube = prepare_tile(cube, &sensor.rename, &sensor.harmonize)?;
+            let idx_cube = index.apply(&cube)?;
+            let d = idx_cube.data();
+
+            let bi = bin_of(job.time);
+            let locals: Vec<(usize, BinAccum)> = zone_masks
+                .iter()
+                .enumerate()
+                .filter(|(_, m)| !m.is_empty())
+                .map(|(zi, mask)| (zi, accumulate_bin(&d, 0, mask, &[0], cfg.reducer)))
+                .collect();
+            let mut guard = acc.lock().expect("accumulator mutex poisoned");
+            for (zi, part) in locals {
+                guard[zi * nbins + bi].merge(&part);
+            }
+            Ok(())
+        })
+    })?;
+
+    let acc = acc.into_inner().expect("accumulator mutex poisoned");
+    let index_label = index.label().to_string();
     let mut rows = Vec::with_capacity(zones.len() * nbins);
     for (zi, zone) in zones.iter().enumerate() {
         for (bi, &t) in bin_times.iter().enumerate() {
